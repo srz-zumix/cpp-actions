@@ -9,6 +9,10 @@ add_library(cpa_core STATIC
   expr/expression.cpp
   expr/template.cpp
   expr/value.cpp
+  workflow/events.cpp
+  workflow/matrix.cpp
+  workflow/parser.cpp
+  workflow/scopes.cpp
   workflow/yaml.cpp
 )
 target_include_directories(cpa_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
