@@ -130,7 +130,15 @@ ProcessResult run_process(const ProcessSpec& spec) {
   posix_spawn_file_actions_addopen(&actions, 0, "/dev/null", O_RDONLY, 0);
   posix_spawn_file_actions_adddup2(&actions, out_pipe[1], 1);
   posix_spawn_file_actions_adddup2(&actions, err_pipe[1], 2);
-  if (!spec.cwd.empty()) posix_spawn_file_actions_addchdir_np(&actions, spec.cwd.c_str());
+  if (!spec.cwd.empty()) {
+#if defined(__MAC_OS_X_VERSION_MIN_REQUIRED) && __MAC_OS_X_VERSION_MIN_REQUIRED >= 260000
+    // macOS 26 deprecates the _np variant in favor of the POSIX.1-2024 function
+    // (which is only available from macOS 26).
+    posix_spawn_file_actions_addchdir(&actions, spec.cwd.c_str());
+#else
+    posix_spawn_file_actions_addchdir_np(&actions, spec.cwd.c_str());
+#endif
+  }
 
   posix_spawnattr_t attr;
   posix_spawnattr_init(&attr);
