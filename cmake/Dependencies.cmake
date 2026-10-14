@@ -51,9 +51,15 @@ endif()
 #
 # iutest is not available in the vcpkg registry, so it is taken from
 # IUTEST_ROOT (environment or cache variable) when set, otherwise downloaded.
-# The download is pinned to a commit on the develop branch, because the latest
-# release (v1.17.1) lacks many fixes. When updating the commit, update URL_HASH
-# too (e.g. `curl -sSfL <URL> | shasum -a 256`).
+# Until the next iutest release, the head of the develop branch is downloaded
+# (without URL_HASH), because the latest release (v1.17.1) lacks many fixes
+# (e.g. it fails to compile with Apple libc++). An existing build tree keeps
+# the snapshot it downloaded first; remove <build>/_deps/iutest-* (or use a
+# fresh build directory) to pick up a newer develop. After the release, pin
+# the release tarball with URL_HASH like the other dependencies.
+#
+# The include directory is intentionally not SYSTEM: warnings in iutest
+# headers are reported (and fixed in iutest) instead of being suppressed.
 if(CPA_BUILD_TESTS)
   set(IUTEST_ROOT "$ENV{IUTEST_ROOT}" CACHE PATH "Path to an iutest checkout (optional)")
   if(IUTEST_ROOT AND EXISTS "${IUTEST_ROOT}/include/iutest.hpp")
@@ -63,14 +69,13 @@ if(CPA_BUILD_TESTS)
     # the sources are populated (iutest's own CMake project would also build
     # its tests and samples).
     FetchContent_Declare(iutest
-      URL https://github.com/srz-zumix/iutest/archive/65136ff60eb21d335b7cf610008f454118e8e82a.tar.gz
-      URL_HASH SHA256=3194174c3f4404096eb642695ebd6ec4a370779b4f6dddd00e39590ed19eb1e5
+      URL https://github.com/srz-zumix/iutest/archive/refs/heads/develop.tar.gz
       DOWNLOAD_EXTRACT_TIMESTAMP ON
       SOURCE_SUBDIR include)
     FetchContent_MakeAvailable(iutest)
     set(CPA_IUTEST_INCLUDE_DIR "${iutest_SOURCE_DIR}/include")
   endif()
   add_library(cpa_iutest INTERFACE)
-  target_include_directories(cpa_iutest SYSTEM INTERFACE "${CPA_IUTEST_INCLUDE_DIR}")
+  target_include_directories(cpa_iutest INTERFACE "${CPA_IUTEST_INCLUDE_DIR}")
   message(STATUS "iutest: ${CPA_IUTEST_INCLUDE_DIR}")
 endif()
