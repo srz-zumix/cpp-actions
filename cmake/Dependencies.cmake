@@ -51,17 +51,20 @@ endif()
 #
 # iutest is not available in the vcpkg registry, so it is taken from
 # IUTEST_ROOT (environment or cache variable) when set, otherwise downloaded.
+# The download is pinned to a commit on the develop branch, because the latest
+# release (v1.17.1) lacks many fixes. When updating the commit, update URL_HASH
+# too (e.g. `curl -sSfL <URL> | shasum -a 256`).
 if(CPA_BUILD_TESTS)
   set(IUTEST_ROOT "$ENV{IUTEST_ROOT}" CACHE PATH "Path to an iutest checkout (optional)")
   if(IUTEST_ROOT AND EXISTS "${IUTEST_ROOT}/include/iutest.hpp")
     set(CPA_IUTEST_INCLUDE_DIR "${IUTEST_ROOT}/include")
   else()
     # SOURCE_SUBDIR points to a directory without CMakeLists.txt so that only
-    # the sources are populated (iutest's own CMake project builds its tests
-    # and samples and requires an old cmake_minimum_required()).
+    # the sources are populated (iutest's own CMake project would also build
+    # its tests and samples).
     FetchContent_Declare(iutest
-      URL https://github.com/srz-zumix/iutest/archive/refs/tags/v1.17.1.tar.gz
-      URL_HASH SHA256=8e2cb3548282cf4ea33e4ac68f981c904fc77405e9ec5715e22596c145a490a7
+      URL https://github.com/srz-zumix/iutest/archive/65136ff60eb21d335b7cf610008f454118e8e82a.tar.gz
+      URL_HASH SHA256=3194174c3f4404096eb642695ebd6ec4a370779b4f6dddd00e39590ed19eb1e5
       DOWNLOAD_EXTRACT_TIMESTAMP ON
       SOURCE_SUBDIR include)
     FetchContent_MakeAvailable(iutest)
