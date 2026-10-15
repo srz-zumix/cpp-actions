@@ -234,8 +234,6 @@ class JobRunner {
   std::string status_ = "success";
   bool timed_out_ = false;
   std::unique_ptr<sandbox::Sandbox> sandbox_;
-  std::mutex pgid_mutex_;
-  std::vector<pid_t> pgids_;
   std::vector<PostStep> post_steps_;
   std::vector<std::unique_ptr<actions::Action>> loaded_actions_;
   bool echo_ = false;
@@ -247,7 +245,7 @@ class JobRunner {
 
 void JobRunner::create_directories() {
   const auto key = sanitize_key(inst_.key);
-  job_dir_ = run_.options.run_dir / "jobs" / key;
+  job_dir_ = run_.options.run_dir / "jobs" / wr_.run_id / key;
   const std::string repo_name = run_.repository.substr(run_.repository.find('/') + 1);
   work_root_ = job_dir_ / "work";
   workspace_ = work_root_ / repo_name / repo_name;
@@ -402,7 +400,7 @@ void JobRunner::prefetch_actions() {
 bool JobRunner::setup() {
   create_directories();
   build_base_environment();
-  report_.log_file = (run_.options.run_dir / "logs" / (sanitize_key(inst_.key) + ".log")).string();
+  report_.log_file = (run_.options.run_dir / "logs" / wr_.run_id / (sanitize_key(inst_.key) + ".log")).string();
   log_ = std::make_unique<JobLog>(run_.console, run_.masker, inst_.name, report_.log_file, run_.options.debug);
   log_->info("Set up job", Color::Bold);
 
@@ -1018,11 +1016,14 @@ StepResult JobRunner::execute(std::vector<std::string> argv, util::Environment e
   spec.timeout = timeout;
   spec.cancel = after_cancel ? &inst_.force : &inst_.cancel;
   spec.on_line = [&](std::string_view line, bool) { handle_line(line, cs); };
-  spec.on_spawn = [this](pid_t pgid) {
-    std::lock_guard lock(pgid_mutex_);
-    pgids_.push_back(pgid);
-  };
+  struct ProcessGroupGuard {
+    pid_t pgid = 0;
+    ~ProcessGroupGuard() { util::kill_process_group(pgid); }
+  } process_group;
+  spec.on_spawn = [&](pid_t pgid) { process_group.pgid = pgid; };
   const auto pr = util::run_process(spec);
+  util::kill_process_group(process_group.pgid);
+  process_group.pgid = 0;
   stop_token_.clear();
   echo_ = false;
   if (pr.spawn_failed) {
@@ -1213,12 +1214,6 @@ void JobRunner::evaluate_outputs() {
 }
 
 void JobRunner::finish() {
-  {
-    std::lock_guard lock(pgid_mutex_);
-    for (const auto pgid : pgids_) {
-      if (util::process_group_alive(pgid)) util::kill_process_group(pgid);
-    }
-  }
   sandbox_.reset();
   if (!run_.options.keep_workdir && !job_dir_.empty()) {
     try {
@@ -1367,8 +1362,7 @@ std::string sanitize_key(std::string_view key) {
   }
   while (!out.empty() && (out.back() == '_' || out.back() == '.')) out.pop_back();
   if (out.empty()) out = "job";
-  if (out.size() > 100) out = out.substr(0, 80) + "-" + util::sha256_hex(key).substr(0, 16);
-  return out;
+  return out.substr(0, 32) + "-" + util::sha256_hex(key);
 }
 
 std::string hash_files(const fs::path& root, const std::vector<std::string>& patterns) {

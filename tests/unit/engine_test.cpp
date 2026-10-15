@@ -153,7 +153,7 @@ jobs:
   const auto& run = job(report, "run");
   IUTEST_EXPECT_EQ("42", run.outputs.at("answer"));
   IUTEST_EXPECT_EQ("first\nsecond", step(run, "prepare").outputs.at("multi"));
-  IUTEST_EXPECT_FALSE(fs::exists(test.options.run_dir / "jobs" / sanitize_key(run.key)));
+  IUTEST_EXPECT_FALSE(fs::exists(test.options.run_dir / "jobs"));
   IUTEST_EXPECT_TRUE(fs::exists(run.log_file));
   const auto saved = expr::Value::parse_json(util::read_file(test.options.run_dir / "report.json"));
   IUTEST_EXPECT_EQ("success", saved.get("result").to_string());
@@ -427,6 +427,34 @@ jobs:
   IUTEST_EXPECT_EQ("The action has timed out.", step(run, "timeout").error);
   IUTEST_EXPECT_EQ("skipped", step(run, "skipped").outcome);
   IUTEST_EXPECT_EQ("success", step(run, "cleanup").outcome) << test.output.str();
+}
+
+IUTEST(EngineTest, StepExitKillsBackgroundProcessesBeforeNextStep) {
+  for (const auto* exit_code : {"0", "1"}) {
+    EngineRun test;
+    const auto marker = test.dir / "background-write";
+    test.options.pass_env = {"MARKER=" + marker.string()};
+    test.options.vars = {{"EXIT", exit_code}};
+    const auto report = test.run(R"(
+on: push
+jobs:
+  run:
+    runs-on: test-host
+    steps:
+      - id: background
+        continue-on-error: true
+        run: |
+          (sleep 0.15; echo poisoned > "$MARKER") >/dev/null 2>&1 &
+          exit ${{ vars.EXIT }}
+      - id: next
+        run: |
+          sleep 0.3
+          test ! -e "$MARKER"
+)");
+    IUTEST_EXPECT_EQ("success", report.result) << test.output.str();
+    IUTEST_EXPECT_EQ("success", step(job(report, "run"), "next").outcome);
+    IUTEST_EXPECT_FALSE(fs::exists(marker));
+  }
 }
 
 IUTEST(EngineTest, JobTimeoutOverridesLongerStepTimeout) {
@@ -872,6 +900,71 @@ jobs:
   IUTEST_EXPECT_EQ(2u, report.workflows[0].jobs.size());
 }
 
+IUTEST(EngineTest, MatrixKeysWithEquivalentSanitizedNamesHaveSeparateWorkspaces) {
+  EngineRun test;
+  test.options.keep_workdir = true;
+  const auto report = test.run(R"yaml(
+on: push
+jobs:
+  run:
+    runs-on: test-host
+    strategy:
+      matrix: {value: ["a/b", "a?b"]}
+    steps:
+      - run: |
+          printf '%s' '${{ matrix.value }}' > value.txt
+          sleep 0.03
+          test "$(cat value.txt)" = '${{ matrix.value }}'
+)yaml");
+  IUTEST_EXPECT_EQ("success", report.result) << test.output.str();
+  const auto& jobs = report.workflows[0].jobs;
+  IUTEST_ASSERT_EQ(2u, jobs.size());
+  IUTEST_EXPECT_NE(jobs[0].log_file, jobs[1].log_file);
+}
+
+IUTEST(EngineTest, IdenticalJobIdsAcrossWorkflowsHaveSeparateWorkspacesAndLogs) {
+  EngineRun test;
+  test.options.keep_workdir = true;
+  test.load(R"yaml(
+name: First
+on: push
+jobs:
+  same:
+    runs-on: test-host
+    steps:
+      - run: |
+          echo first > value.txt
+          sleep 0.03
+          test "$(cat value.txt)" = first
+)yaml");
+  WorkflowFile other;
+  other.display = ".github/workflows/other.yml";
+  other.workflow = std::make_shared<workflow::Workflow>(workflow::parse_workflow(yaml::load(R"yaml(
+name: Other
+on: push
+jobs:
+  same:
+    runs-on: test-host
+    steps:
+      - run: |
+          echo other > value.txt
+          sleep 0.03
+          test "$(cat value.txt)" = other
+)yaml", other.display), other.display));
+  auto selection = test.selection();
+  selection.push_back({&other, {true, "test"}});
+  Runner runner(test.options, test.console);
+  const auto report = runner.run(selection, test.event, test.git);
+  IUTEST_EXPECT_EQ("success", report.result) << test.output.str();
+  IUTEST_ASSERT_EQ(2u, report.workflows.size());
+  const auto& first = report.workflows[0].jobs.at(0);
+  const auto& second = report.workflows[1].jobs.at(0);
+  IUTEST_EXPECT_NE(first.log_file, second.log_file);
+  IUTEST_EXPECT_NE(std::string::npos, util::read_file(first.log_file).find("echo first"));
+  IUTEST_EXPECT_EQ(std::string::npos, util::read_file(first.log_file).find("echo other"));
+  IUTEST_EXPECT_NE(std::string::npos, util::read_file(second.log_file).find("echo other"));
+}
+
 IUTEST(EngineTest, DynamicMasksAndRetainedIsolatedWorkspace) {
   EngineRun test;
   test.options.keep_workdir = true;
@@ -902,7 +995,8 @@ jobs:
   IUTEST_EXPECT_EQ(std::string::npos, util::read_file(test.options.run_dir / "report.json").find("dynamic-token"));
   IUTEST_EXPECT_FALSE(fs::exists(test.git.root / "created.txt"));
   IUTEST_EXPECT_EQ("host", util::read_file(test.git.root / "original.txt"));
-  IUTEST_EXPECT_EQ("isolated\n", util::read_file(test.options.run_dir / "jobs" / sanitize_key(run.key) /
+  IUTEST_EXPECT_EQ("isolated\n", util::read_file(test.options.run_dir / "jobs" / report.workflows[0].run_id /
+                                               sanitize_key(run.key) /
                                                "work" / "hello" / "hello" / "created.txt"));
 }
 
@@ -1152,6 +1246,20 @@ IUTEST(EngineHelpersTest, RunnerLabelsAndHostOverrides) {
   IUTEST_EXPECT_FALSE(match_runner({"ubuntu-latest"}, {}, true).host);
   IUTEST_EXPECT_TRUE(match_runner({"ubuntu-latest"}, {"UBUNTU-LATEST"}, false).host);
   IUTEST_EXPECT_FALSE(match_runner({}, {"test-host"}, false).host);
+}
+
+IUTEST(EngineHelpersTest, SanitizedJobKeysRemainSafeBoundedAndDistinct) {
+  const std::vector<std::string> keys = {
+      "", ".", "..", "/", "a/b", "a?b", "a_b", "a b", std::string(200, 'x'), std::string(199, 'x') + "y"};
+  for (std::size_t i = 0; i < keys.size(); ++i) {
+    const auto sanitized = sanitize_key(keys[i]);
+    IUTEST_EXPECT_LE(sanitized.size(), 100u);
+    IUTEST_EXPECT_EQ(std::string::npos, sanitized.find('/'));
+    IUTEST_EXPECT_NE(".", sanitized);
+    IUTEST_EXPECT_NE("..", sanitized);
+    IUTEST_EXPECT_EQ(sanitized, sanitize_key(keys[i]));
+    for (std::size_t j = 0; j < i; ++j) IUTEST_EXPECT_NE(sanitize_key(keys[j]), sanitized);
+  }
 }
 
 IUTEST(EngineHelpersTest, ShellResolutionAndSubstitution) {
