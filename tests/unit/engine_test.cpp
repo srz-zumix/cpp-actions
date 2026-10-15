@@ -1145,6 +1145,26 @@ jobs:
   IUTEST_EXPECT_EQ(std::string::npos, util::read_file(test.options.run_dir / "summary.md").find("late-token"));
 }
 
+IUTEST(EngineTest, SecretValuesMatchingSchemaKeysDoNotCorruptReportStructure) {
+  EngineRun test;
+  test.options.secrets = {{"TOKEN", "outputs"}, {"OTHER", "result"}};
+  const auto report = test.run(R"(
+on: push
+jobs:
+  run:
+    runs-on: test-host
+    steps:
+      - id: emit
+        run: echo 'public=${{ secrets.TOKEN }}' >> "$GITHUB_OUTPUT"
+)");
+  IUTEST_EXPECT_EQ("success", report.result) << test.output.str();
+  const auto saved = expr::Value::parse_json(util::read_file(test.options.run_dir / "report.json"));
+  IUTEST_EXPECT_EQ("success", saved.get("result").to_string());
+  const auto saved_job = saved.get("workflows").items()[0].get("jobs").items()[0];
+  IUTEST_EXPECT_EQ("success", saved_job.get("result").to_string());
+  IUTEST_EXPECT_EQ("***", saved_job.get("steps").items()[0].get("outputs").get("public").to_string());
+}
+
 IUTEST(EngineTest, InvalidTimeoutsAreNotSilentlyDisabled) {
   for (const auto* value : {"0", "-1", "1e100", "${{ 'not-a-number' }}"}) {
     for (bool job_timeout : {true, false}) {
