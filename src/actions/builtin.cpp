@@ -6,6 +6,7 @@
 #include <chrono>
 #include <mutex>
 #include <nlohmann/json.hpp>
+#include <stdexcept>
 
 #include "actions/fetch.hpp"
 #include "util/fs.hpp"
@@ -63,9 +64,21 @@ fs::path resolve_existing(const fs::path& path) {
 bool within(const fs::path& path, const std::vector<fs::path>& roots) {
   const auto real = resolve_existing(path);
   for (const auto& root : roots) {
-    if (util::is_subpath(real, root)) return true;
+    if (util::is_subpath(real, resolve_existing(root))) return true;
   }
   return false;
+}
+
+void require_readable(const fs::path& path, const BuiltinContext& ctx) {
+  if (!ctx.readable.empty() && !within(path, ctx.readable)) {
+    throw std::runtime_error("Read denied: path is outside of the readable directories: " + path.string());
+  }
+}
+
+void require_readable_tree(const fs::path& path, const BuiltinContext& ctx) {
+  require_readable(path, ctx);
+  if (ctx.readable.empty() || !fs::is_directory(fs::symlink_status(path))) return;
+  for (const auto& entry : fs::recursive_directory_iterator(path)) require_readable(entry.path(), ctx);
 }
 
 fs::path expand_path(std::string_view raw, const BuiltinContext& ctx) {
@@ -118,7 +131,9 @@ void safe_copy_tree(const fs::path& from, const fs::path& to) {
   if (fs::is_symlink(top) || (fs::exists(top) && !fs::is_directory(top))) fs::remove(to);
   fs::create_directories(to);
   for (auto it = fs::recursive_directory_iterator(from); it != fs::recursive_directory_iterator(); ++it) {
-    const auto dest = to / fs::relative(it->path(), from);
+    // Canonicalizing a source symlink here can turn its name into "../..."
+    // and redirect the destination outside the tree.
+    const auto dest = to / it->path().lexically_relative(from);
     const auto dest_status = fs::symlink_status(dest, ec);
     if (it->is_directory() && !it->is_symlink()) {
       if (fs::is_symlink(dest_status) || (fs::exists(dest_status) && !fs::is_directory(dest_status))) {
@@ -339,9 +354,14 @@ std::vector<fs::path> resolve_paths(const std::vector<std::string>& lines, const
     std::error_code ec;
     if (has_glob(path.string())) {
       const auto [base, rest] = split_glob(path);
+      require_readable(base, ctx);
       if (search_roots != nullptr) search_roots->push_back(base);
-      for (const auto& f : util::glob_files(base, {rest})) result.push_back(f);
+      for (const auto& f : util::glob_files(base, {rest})) {
+        require_readable(f, ctx);
+        result.push_back(f);
+      }
     } else {
+      require_readable(path, ctx);
       if (search_roots != nullptr) {
         search_roots->push_back(fs::is_directory(fs::symlink_status(path, ec)) ? path : path.parent_path());
       }
@@ -359,6 +379,7 @@ std::vector<fs::path> resolve_paths(const std::vector<std::string>& lines, const
   }
   std::sort(result.begin(), result.end());
   result.erase(std::unique(result.begin(), result.end()), result.end());
+  for (const auto& path : result) require_readable_tree(path, ctx);
   return result;
 }
 
@@ -411,10 +432,6 @@ BuiltinResult save_cache(const std::string& key, const std::vector<std::string>&
     meta["paths"] = nlohmann::json::array();
     std::size_t i = 0;
     for (const auto& p : paths) {
-      if (!within(p, ctx.writable)) {
-        if (ctx.warning) ctx.warning("Skipping path outside of the writable directories: " + p.string());
-        continue;
-      }
       const auto cp = cache_path_of(p, ctx);
       safe_copy(p, tmp / "data" / std::to_string(i++));
       meta["paths"].push_back({{"base", cp.base}, {"rel", cp.rel}});
@@ -490,7 +507,7 @@ BuiltinResult cache_post(const Inputs& in, const std::map<std::string, std::stri
 // ---------------------------------------------------------------- artifacts
 
 bool valid_artifact_name(std::string_view name) {
-  if (name.empty()) return false;
+  if (name.empty() || name == "." || name == "..") return false;
   return name.find_first_of("\":<>|*?\r\n\\/") == std::string_view::npos;
 }
 
@@ -510,7 +527,6 @@ BuiltinResult upload_artifact(const Inputs& in, const BuiltinContext& ctx) {
   const auto root = artifact_root(roots);
   std::vector<std::pair<fs::path, fs::path>> files;  // source, relative destination
   for (const auto& p : matched) {
-    if (!within(p, ctx.writable)) return fail("Path is outside of the writable directories: " + p.string());
     std::error_code ec;
     if (fs::is_directory(fs::symlink_status(p, ec))) {
       for (auto it = fs::recursive_directory_iterator(p); it != fs::recursive_directory_iterator(); ++it) {
@@ -585,7 +601,7 @@ BuiltinResult download_artifact(const Inputs& in, const BuiltinContext& ctx) {
   std::error_code ec;
   if (!name.empty()) {
     const auto src = ctx.artifact_store / name;
-    if (!valid_artifact_name(name) || !fs::is_directory(src, ec)) {
+    if (!valid_artifact_name(name) || !fs::is_directory(fs::symlink_status(src, ec))) {
       return fail("Unable to download artifact(s): Artifact not found for name: " + name);
     }
     safe_copy_tree(src, dest);
@@ -594,6 +610,7 @@ BuiltinResult download_artifact(const Inputs& in, const BuiltinContext& ctx) {
     std::vector<std::string> names;
     for (const auto& entry : fs::directory_iterator(ctx.artifact_store, ec)) {
       const auto n = entry.path().filename().string();
+      if (!fs::is_directory(entry.symlink_status())) continue;
       if (pattern.empty() || util::glob_match(pattern, n)) names.push_back(n);
     }
     std::sort(names.begin(), names.end());

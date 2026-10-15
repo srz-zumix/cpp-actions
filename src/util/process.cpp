@@ -219,6 +219,11 @@ ProcessResult run_process(const ProcessSpec& spec) {
 
     if (!exited) {
       bool want_kill = false;
+      if (spec.force_cancel && spec.force_cancel->load()) {
+        if (!result.timed_out) result.cancelled = true;
+        ::killpg(pid, SIGKILL);
+        kill_stage = 3;
+      }
       if (spec.cancel && spec.cancel->load()) {
         if (!result.timed_out) result.cancelled = true;
         want_kill = true;

@@ -15,6 +15,7 @@
 #include "engine/evaluate.hpp"
 #include "engine/job.hpp"
 #include "expr/template.hpp"
+#include "sandbox/sandbox.hpp"
 #include "util/fs.hpp"
 #include "util/strings.hpp"
 #include "workflow/matrix.hpp"
@@ -577,6 +578,10 @@ void Runner::cancel() {
 RunReport Runner::run(const std::vector<Selection>& selection, const Event& event, const workspace::GitInfo& git) {
   const auto started = Clock::now();
   auto options = impl_->options;
+  if (options.sandbox.enabled) {
+    std::string reason;
+    if (!sandbox::supported(&reason)) throw std::runtime_error("sandbox unavailable: " + reason);
+  }
   if (options.cache_dir.empty()) options.cache_dir = default_cache_dir();
   fs::create_directories(options.cache_dir);
   options.cache_dir = util::real_path(options.cache_dir);
@@ -592,6 +597,13 @@ RunReport Runner::run(const std::vector<Selection>& selection, const Event& even
   }
 
   RunState state(options, impl_->console, event, git);
+  struct ActiveState {
+    Impl& impl;
+    ~ActiveState() {
+      std::lock_guard lock(impl.mutex);
+      impl.state = nullptr;
+    }
+  } active{*impl_};
   {
     std::lock_guard lock(impl_->mutex);
     impl_->state = &state;
@@ -704,10 +716,6 @@ RunReport Runner::run(const std::vector<Selection>& selection, const Event& even
   if (state.cancelled && report.result != "failure") report.result = "cancelled";
   report.duration_ms = elapsed_ms(started);
 
-  {
-    std::lock_guard lock(impl_->mutex);
-    impl_->state = nullptr;
-  }
   util::write_file(options.run_dir / "report.json", report_to_json(report));
   const auto summary = render_summary(report);
   if (!summary.empty()) util::write_file(options.run_dir / "summary.md", summary);

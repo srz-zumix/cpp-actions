@@ -16,7 +16,9 @@ namespace cpa::sandbox {
 const std::vector<std::string>& default_allowed_hosts();
 
 // Matches a host name against patterns ("example.com" or "*.example.com"),
-// case-insensitively. "*" allows every host.
+// case-insensitively. "*" allows every host. Private resolved addresses require
+// an exact non-default host allowance; wildcard/default allowances never grant
+// private access.
 bool host_allowed(std::string_view host, const std::vector<std::string>& patterns);
 
 // Splits "host:port" / "[v6]:port" (port defaults to `default_port`).
@@ -45,6 +47,7 @@ class NetworkProxy {
   void handle(int client);
   void register_fd(int fd);
   void unregister_fd(int fd);
+  int connect_to(const std::string& host, int port, bool& denied);
 
   std::vector<std::string> allowed_;
   DenyFn on_deny_;

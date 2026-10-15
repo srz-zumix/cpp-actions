@@ -250,11 +250,12 @@ void JobRunner::create_directories() {
   temp_ = work_root_ / "_temp";
   home_ = job_dir_ / "home";
   tmp_ = job_dir_ / "tmp";
-  file_commands_dir_ = temp_ / "_runner_file_commands";
+  file_commands_dir_ = job_dir_ / "file_commands";
   event_path_ = temp_ / "_github_workflow" / "event.json";
   tool_cache_ = run_.options.cache_dir / "toolcache";
   util::remove_tree(job_dir_);
-  for (const auto& d : {workspace_, temp_, home_, tmp_, file_commands_dir_, event_path_.parent_path(), tool_cache_}) {
+  for (const auto& d : {workspace_, temp_, home_, tmp_, file_commands_dir_, event_path_.parent_path(), tool_cache_,
+                        job_dir_ / "scripts"}) {
     fs::create_directories(d);
   }
   // Canonical paths (e.g. /var -> /private/var on macOS) for the sandbox rules.
@@ -264,7 +265,7 @@ void JobRunner::create_directories() {
   temp_ = work_root_ / "_temp";
   home_ = job_dir_ / "home";
   tmp_ = job_dir_ / "tmp";
-  file_commands_dir_ = temp_ / "_runner_file_commands";
+  file_commands_dir_ = job_dir_ / "file_commands";
   event_path_ = temp_ / "_github_workflow" / "event.json";
   tool_cache_ = util::real_path(tool_cache_);
   util::write_file(event_path_, wr_.payload.to_json_string(true));
@@ -280,9 +281,8 @@ void JobRunner::build_base_environment() {
 #else
   base_env_["LANG"] = "C.UTF-8";
 #endif
-  for (const char* name : {"USER", "LOGNAME"}) {
-    if (auto it = host.find(name); it != host.end()) base_env_[name] = it->second;
-  }
+  base_env_["USER"] = "runner";
+  base_env_["LOGNAME"] = "runner";
   base_env_["SHELL"] = "/bin/bash";
   base_env_["CI"] = "true";
   for (const auto& entry : run_.options.pass_env) {
@@ -364,14 +364,13 @@ void JobRunner::start_sandbox() {
     return;
   }
   sandbox::SandboxConfig config;
-  config.write = {job_dir_, tool_cache_};
-  for (const auto& d : sandbox::darwin_user_dirs()) config.write.push_back(d);
+  config.write = {work_root_, home_, tmp_, file_commands_dir_, tool_cache_};
   for (const auto& d : run_.options.sandbox.allow_write) config.write.push_back(d);
   const auto actions_dir = run_.options.cache_dir / "actions";
   const auto node_dir = run_.options.cache_dir / "node";
   fs::create_directories(actions_dir);
   fs::create_directories(node_dir);
-  config.read = {actions_dir, node_dir};
+  config.read = {actions_dir, node_dir, job_dir_ / "scripts"};
   for (const auto& d : run_.options.sandbox.allow_read) config.read.push_back(d);
   config.allow_hosts = run_.options.sandbox.allow_hosts;
   config.allow_localhost = run_.options.sandbox.allow_localhost;
@@ -622,7 +621,7 @@ StepResult JobRunner::run_script(StepScope& scope, const workflow::Step& step, e
     log_->error(r.error);
     return r;
   }
-  const auto script = temp_ / (util::random_uuid() + shell.extension);
+  const auto script = job_dir_ / "scripts" / (util::random_uuid() + shell.extension);
   util::write_file(script, shell.script(body));
   return execute(shell.argv(script), std::move(process_env), cwd, timeout, after_cancel, files, nullptr);
 }
@@ -681,8 +680,12 @@ actions::BuiltinContext JobRunner::builtin_context() {
   actions::BuiltinContext bc;
   bc.workspace = workspace_;
   bc.home = home_;
-  bc.writable = {job_dir_, tool_cache_};
+  bc.writable = {work_root_, home_, tmp_, tool_cache_};
   for (const auto& d : run_.options.sandbox.allow_write) bc.writable.push_back(util::real_path(d));
+  if (run_.options.sandbox.enabled) {
+    bc.readable = bc.writable;
+    for (const auto& d : run_.options.sandbox.allow_read) bc.readable.push_back(util::real_path(d));
+  }
   bc.cache_store = run_.options.cache_dir / "cache" / run_.repository;
   bc.artifact_store = wr_.artifacts;
   bc.repository = run_.repository;
@@ -980,6 +983,8 @@ util::Environment JobRunner::step_environment(const StringMap& env, const FileCo
   if (run_.options.debug) out["RUNNER_DEBUG"] = "1";
   if (scope.composite || !scope.action_path.empty()) out["GITHUB_ACTION_PATH"] = scope.action_path.string();
   if (sandbox_) {
+    out["HOME"] = home_.string();
+    out["TMPDIR"] = tmp_.string();
     for (const auto& [k, v] : sandbox_->environment()) out[k] = v;
   }
   return out;
@@ -1007,12 +1012,20 @@ StepResult JobRunner::execute(std::vector<std::string> argv, util::Environment e
   spec.cwd = cwd;
   spec.timeout = timeout;
   spec.cancel = after_cancel ? &inst_.force : &inst_.cancel;
+  spec.force_cancel = &inst_.force;
   spec.on_line = [&](std::string_view line, bool) { handle_line(line, cs); };
-  spec.on_spawn = [this](pid_t pgid) {
+  pid_t step_pgid = 0;
+  spec.on_spawn = [this, &step_pgid](pid_t pgid) {
     std::lock_guard lock(pgid_mutex_);
+    step_pgid = pgid;
     pgids_.push_back(pgid);
   };
   const auto pr = util::run_process(spec);
+  {
+    std::lock_guard lock(pgid_mutex_);
+    util::kill_process_group(step_pgid);
+    std::erase(pgids_, step_pgid);
+  }
   stop_token_.clear();
   echo_ = false;
   if (pr.spawn_failed) {
@@ -1055,22 +1068,22 @@ StepResult JobRunner::execute(std::vector<std::string> argv, util::Environment e
 
 void JobRunner::process_file_commands(const FileCommands& files, StepResult& result, StringMap* state) {
   try {
-    for (const auto& [k, v] : parse_key_value_file(util::read_file(files.env))) {
+    for (const auto& [k, v] : parse_key_value_file(read_command_file(files.env))) {
       if (util::iequals(k, "NODE_OPTIONS")) {
         log_->warning("Can't store NODE_OPTIONS output parameter using '$GITHUB_ENV' command.");
         continue;
       }
       global_env_[k] = v;
     }
-    for (const auto& [k, v] : parse_key_value_file(util::read_file(files.output))) result.outputs[k] = v;
-    for (const auto& p : parse_path_file(util::read_file(files.path))) {
+    for (const auto& [k, v] : parse_key_value_file(read_command_file(files.output))) result.outputs[k] = v;
+    for (const auto& p : parse_path_file(read_command_file(files.path))) {
       std::erase(path_prepend_, p);
       path_prepend_.push_back(p);
     }
-    for (const auto& [k, v] : parse_key_value_file(util::read_file(files.state))) {
+    for (const auto& [k, v] : parse_key_value_file(read_command_file(files.state))) {
       if (state != nullptr) (*state)[k] = v;
     }
-    const auto summary = util::read_file(files.summary);
+    const auto summary = read_command_file(files.summary);
     if (summary.size() > kMaxSummarySize) {
       const std::string message = "$GITHUB_STEP_SUMMARY upload aborted, supports content up to a size of 1024k, got " +
                                   std::to_string(summary.size() / 1024) + "k.";
@@ -1362,14 +1375,19 @@ std::string sanitize_key(std::string_view key) {
 }
 
 std::string hash_files(const fs::path& root, const std::vector<std::string>& patterns) {
+  const auto canonical_root = util::real_path(root);
+  if (canonical_root != fs::absolute(root).lexically_normal()) return {};
   const auto files = util::glob_files(root, patterns);
   if (files.empty()) return {};
   util::Sha256 h;
+  bool matched = false;
   for (const auto& f : files) {
+    if (!util::is_subpath(util::real_path(f), canonical_root)) continue;
     const auto d = util::sha256_file(f);
     h.update(d.data(), d.size());
+    matched = true;
   }
-  return util::Sha256::hex(h.digest());
+  return matched ? util::Sha256::hex(h.digest()) : std::string{};
 }
 
 std::function<bool(std::string_view)> job_status_functions(const JobStatus& status) {

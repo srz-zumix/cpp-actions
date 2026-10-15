@@ -25,6 +25,7 @@ struct ProcessSpec {
   std::filesystem::path cwd;
   std::optional<std::chrono::milliseconds> timeout;
   const std::atomic<bool>* cancel = nullptr;
+  const std::atomic<bool>* force_cancel = nullptr;
   // Called for each complete output line (without the line terminator).
   std::function<void(std::string_view line, bool is_stderr)> on_line;
   // Called for raw output chunks (used when on_line is not set).
