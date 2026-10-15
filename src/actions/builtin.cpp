@@ -187,6 +187,26 @@ BuiltinResult checkout(const Inputs& in, const BuiltinContext& ctx) {
   if (!within(target, {util::real_path(ctx.workspace)})) {
     return fail("Repository path '" + target.string() + "' is not under '" + ctx.workspace.string() + "'");
   }
+  for (auto parent = fs::absolute(target).parent_path(); parent != parent.root_path(); parent = parent.parent_path()) {
+    if (fs::is_symlink(fs::symlink_status(parent))) {
+      return fail("Checkout path has a symlinked ancestor");
+    }
+  }
+  const bool self = ctx.repository.empty() ? repository.empty() : util::iequals(repository, ctx.repository);
+  const workspace::Snapshot* snapshot_ptr = nullptr;
+  if (self || repository.empty()) {
+    snapshot_ptr = &ctx.snapshot();
+    const auto source = util::real_path(snapshot_ptr->dir);
+    const auto destination = resolve_existing(target);
+    if (util::is_subpath(source, destination) || util::is_subpath(destination, source)) {
+      return fail("Checkout path must not overlap the source snapshot");
+    }
+  } else {
+    const auto parts = util::split(repository, '/');
+    if (parts.size() != 2 || parts[0].empty() || parts[1].empty() || repository.find("..") != std::string::npos) {
+      return fail("Invalid repository '" + repository + "'. Expected format {owner}/{repo}");
+    }
+  }
   // Clean the target directory.
   std::error_code ec;
   const auto st = fs::symlink_status(target, ec);
@@ -195,9 +215,8 @@ BuiltinResult checkout(const Inputs& in, const BuiltinContext& ctx) {
   for (const auto& entry : fs::directory_iterator(target)) util::remove_tree(entry.path());
 
   BuiltinResult result;
-  const bool self = ctx.repository.empty() ? repository.empty() : util::iequals(repository, ctx.repository);
   if (self || repository.empty()) {
-    const auto& snapshot = ctx.snapshot();
+    const auto& snapshot = *snapshot_ptr;
     workspace::copy_snapshot(snapshot, target);
     if (ctx.info) {
       ctx.info(std::string("Copied the working tree") + (snapshot.dirty ? " (including uncommitted changes)" : "") +
@@ -243,10 +262,6 @@ BuiltinResult checkout(const Inputs& in, const BuiltinContext& ctx) {
   }
 
   // Another repository: fetch it from GitHub.
-  const auto parts = util::split(repository, '/');
-  if (parts.size() != 2 || parts[0].empty() || parts[1].empty() || repository.find("..") != std::string::npos) {
-    return fail("Invalid repository '" + repository + "'. Expected format {owner}/{repo}");
-  }
   const auto token = input(in, "token", ctx.token);
   const auto env = git_token_env(token);
   const auto depth = util::parse_int(input(in, "fetch-depth", "1")).value_or(1);

@@ -64,7 +64,7 @@ void JobLog::write(std::string_view text, Color color, std::string_view marker) 
     std::string body = indent;
     if (!marker.empty()) body += std::string(marker) + " ";
     body += l;
-    console_.line(console_.paint("[" + prefix_ + "]", Color::Gray) + " " + console_.paint(body, color));
+    console_.line(console_.paint("[" + masker_.mask(prefix_) + "]", Color::Gray) + " " + console_.paint(body, color));
     if (file_) file_ << body << '\n';
   }
   if (file_) file_.flush();

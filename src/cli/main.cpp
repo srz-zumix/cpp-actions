@@ -6,6 +6,7 @@
 #include <cerrno>
 #include <chrono>
 #include <csignal>
+#include <unistd.h>
 #include <cstdlib>
 #include <iostream>
 #include <system_error>
@@ -56,7 +57,7 @@ std::map<std::string, std::string> parse_assignments(const std::vector<std::stri
   std::map<std::string, std::string> out;
   for (const auto& item : items) {
     auto [name, value] = config::split_assignment(item);
-    if (name.empty() || !value) throw std::runtime_error(std::string(what) + " must be NAME=VALUE: '" + item + "'");
+    if (name.empty() || !value) throw std::runtime_error(std::string(what) + " must be NAME=VALUE");
     out[name] = *value;
   }
   return out;
@@ -125,6 +126,7 @@ struct RunCli {
   int parallel = -1;
   bool no_sandbox = false;
   bool dry_run = false;
+  bool no_color = false;
 };
 
 std::atomic<unsigned> signal_requests{0};
@@ -206,7 +208,7 @@ engine::RunOptions run_options(const RunCli& o, const fs::path& root) {
   for (const auto& path : o.secret_files) load_values(options.secrets, config::expand_user(path));
   for (const auto& item : o.secrets) {
     const auto [name, value] = config::split_assignment(item);
-    if (name.empty()) throw std::runtime_error("--secret must be NAME or NAME=VALUE");
+    if (name.empty()) throw std::runtime_error("--secret must be NAME=VALUE or NAME");
     if (value) {
       options.secrets[name] = *value;
     } else if (const auto* host_value = std::getenv(name.c_str())) {
@@ -229,7 +231,6 @@ engine::RunOptions run_options(const RunCli& o, const fs::path& root) {
       throw std::runtime_error("--pass-env requires a valid environment variable name");
     }
   }
-  options.inputs = parse_assignments(o.inputs, "--input");
   return options;
 }
 
@@ -239,7 +240,26 @@ int cmd_run(RunCli& o) {
   const auto git = workspace::read_git_info(root);
   const auto event = engine::build_event(o.event, git);
   const auto selection = engine::select_workflows(files, event.info, o.selectors);
-  const auto inputs = parse_assignments(o.inputs, "--input");
+  if (!o.dry_run) {
+    for (const auto& selected : selection) {
+      if (!selected.file->valid()) {
+        throw std::runtime_error(selected.file->display + ": invalid workflow (run 'cpp-actions validate')");
+      }
+    }
+  }
+  auto inputs = parse_assignments(o.inputs, "--input");
+  if (event.info.name == "workflow_dispatch") {
+    const auto payload_inputs = event.info.payload.get("inputs");
+    if (!payload_inputs.is_null()) {
+      if (!payload_inputs.is_object()) throw engine::EventError("event.inputs must be an object");
+      for (const auto& [name, value] : payload_inputs.object_data().entries()) {
+        if (!value.is_string() && !value.is_bool() && !value.is_number()) {
+          throw engine::EventError("event.inputs values must be strings, booleans or numbers");
+        }
+        inputs.try_emplace(name, value.to_string());
+      }
+    }
+  }
   std::cout << engine::render_event(event);
   std::size_t triggered = 0;
   for (const auto& s : selection) {
@@ -256,8 +276,9 @@ int cmd_run(RunCli& o) {
     std::cout << engine::render_graph_text(*s.file->workflow);
   }
   if (triggered == 0) std::cout << "\nNo workflow is triggered by '" << event.info.name << "'.\n";
-  if (o.dry_run) return 0;
+  if (o.dry_run || triggered == 0) return 0;
   auto options = run_options(o, root);
+  options.inputs = inputs;
   if (options.sandbox.enabled) {
     std::string reason;
     if (!sandbox::supported(&reason)) {
@@ -267,7 +288,12 @@ int cmd_run(RunCli& o) {
     std::cerr << "WARNING: --no-sandbox disables filesystem and network isolation. "
                  "Workflow code can access host files, credentials and network services.\n";
   }
-  engine::Console console(std::cout, false);
+  engine::Masker masker;
+  for (const auto& [name, value] : options.secrets) {
+    (void)name;
+    masker.add(value);
+  }
+  engine::Console console(std::cout, !o.no_color && std::getenv("NO_COLOR") == nullptr && ::isatty(STDOUT_FILENO));
   engine::Runner runner(std::move(options), console);
   SignalHandlers handlers;
   std::jthread watcher([&runner](std::stop_token stop) {
@@ -282,9 +308,16 @@ int cmd_run(RunCli& o) {
     }
   });
   const auto report = runner.run(selection, event, git);
-  std::cout << "\nResult: " << report.result << "\nReport: " << report.run_dir << "/report.json\n";
-  if (report.result == "failure") return 1;
-  return report.result == "cancelled" ? 130 : 0;
+  console.line("\nResult: " + report.result + " (" + util::format_duration_ms(report.duration_ms) + ")");
+  for (const auto& workflow : report.workflows) {
+    for (const auto& job : workflow.jobs) {
+      console.line(masker.mask("  " + workflow.name + " / " + job.name + ": " + job.result));
+      if (!job.summary.empty()) console.line(masker.mask(job.summary));
+    }
+  }
+  console.line("Logs and report: " + report.run_dir);
+  if (signal_requests.load(std::memory_order_relaxed) != 0 || report.result == "cancelled") return 130;
+  return report.result == "failure" ? 1 : 0;
 }
 
 }  // namespace
@@ -330,19 +363,21 @@ int main(int argc, char** argv) {
   run->add_flag("--no-sandbox", run_opts.no_sandbox, "DANGER: disable filesystem and network isolation");
   run->add_option("--allow-host", run_opts.options.sandbox.allow_hosts, "Additional allowed network host (repeatable)");
   run->add_option("--allow-read", run_opts.allow_read, "Additional readable host path (repeatable)");
-  run->add_option("--pass-env", run_opts.options.pass_env,
+  run->add_option("--pass-env,--env-pass", run_opts.options.pass_env,
                   "Pass host variable NAME or explicit NAME=VALUE (repeatable)");
   run->add_flag("--keep-workdir", run_opts.options.keep_workdir, "Keep job workspaces after execution");
   run->add_option("--run-dir", run_opts.options.run_dir,
-                  "Run output directory (default: a unique directory under the cache)");
+                  "Run output directory (must not already exist; default: a unique directory under the cache)");
   run->add_option("--cache-dir", run_opts.options.cache_dir, "Shared cache directory");
-  run->add_option("--parallel", run_opts.parallel, "Concurrent jobs (0 = CPU count)")->check(CLI::NonNegativeNumber);
+  run->add_option("-j,--parallel", run_opts.parallel, "Concurrent jobs (0 = CPU count)")->check(CLI::NonNegativeNumber);
   run->add_option("--host-label", run_opts.options.host_labels,
                   "Explicit runs-on label to execute on this host (repeatable)");
   run->add_option("-s,--secret", run_opts.secrets, "Secret NAME from host environment or NAME=VALUE (repeatable)");
-  run->add_option("--secret-file", run_opts.secret_files, "Explicit dotenv secrets file (repeatable)");
+  run->add_option("--secret-file,--secrets-file", run_opts.secret_files, "Explicit dotenv secrets file (repeatable)");
   run->add_option("--var", run_opts.vars, "Workflow variable NAME=VALUE (repeatable)");
-  run->add_option("--var-file", run_opts.var_files, "Explicit dotenv variables file (repeatable)");
+  run->add_option("--var-file,--vars-file", run_opts.var_files, "Explicit dotenv variables file (repeatable)");
+  run->add_flag("--debug", run_opts.options.debug, "Show workflow debug commands");
+  run->add_flag("--no-color", run_opts.no_color, "Disable colored logs");
 
   CLI11_PARSE(app, argc, argv);
 

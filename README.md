@@ -82,7 +82,7 @@ resolution; the host's token is never imported automatically.
 `--parallel 0` (the default) uses the CPU count. `--cache-dir` sets shared caches;
 the default is the platform user-cache directory's `cpp-actions` subdirectory.
 `--run-dir` selects an output directory instead of a unique directory beneath
-`<cache>/runs`. Use a fresh directory: matching job directories can be replaced.
+`<cache>/runs`. It must not already exist; run directories are created privately.
 Logs and `report.json` remain after execution; `summary.md` is written when steps
 produce summaries. Workspaces are removed unless `--keep-workdir` is given.
 Exit codes are 0 for success/skipped, 1 for workflow failure, 2 for setup errors,
@@ -154,3 +154,33 @@ configuration as trusted inputs. Container/service jobs are unsupported.
 The runner itself performs action resolution and built-in operations outside
 step process isolation; the sandbox is not a blanket containment boundary for
 every operation of the CLI.
+
+## Workflow execution
+
+Execution supports `needs`, job/step `if`, matrix expansion, `fail-fast`,
+`max-parallel`, `continue-on-error`, and timeouts. Shells include bash, sh,
+python, pwsh, and custom commands containing `{0}`, with `defaults.run`,
+`working-directory`, and scoped environments. Tools must be installed on the host.
+Workflow contexts, step/job outputs, and workspace-relative `hashFiles` are supported.
+
+Self-repository `actions/checkout` uses a snapshot of the local working tree,
+including uncommitted modifications, deletions, and non-ignored untracked files.
+Git history is copied, including from linked worktrees; any snapshot commit is
+made only in the copy. The original repository is not modified. Job workspaces
+are empty until checkout. Snapshots and job workspaces are removed after the run
+unless `--keep-workdir` is specified; retained files may contain secrets.
+
+`workflow_dispatch` inputs are also read from `--event-path` JSON; explicit
+`--input NAME=VALUE` takes precedence. When no workflow is triggered, no run
+directory is created and execution configuration/secrets are not loaded.
+`--env-pass`, `--secrets-file`, `--vars-file`, and `-j` remain aliases for
+`--pass-env`, `--secret-file`, `--var-file`, and `--parallel`.
+
+The runner processes environment/output/path/state/summary file commands and
+group, annotation, debug, add-mask, and stop-commands workflow commands.
+`GITHUB_STATE` is action state, not an environment variable for later `run:`
+steps. Logs and reports mask known secret values on a best-effort basis while
+preserving report schema. Summaries are displayed at completion; `--debug`
+enables debug commands, and `--no-color` or `NO_COLOR` disables colored logs.
+Local execution does not reproduce GitHub-hosted images, artifact/cache APIs,
+or OIDC services and does not guarantee identical results to GitHub.
