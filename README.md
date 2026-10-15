@@ -138,6 +138,9 @@ The generated profile is kept outside the step-writable workspace, home,
 temporary, and tool-cache directories. There are no blanket grants to the
 operating system's user temporary/cache directories or all of `/opt`; the
 read grant under `/opt` is limited to `/opt/homebrew`.
+Generated step scripts are also outside step-writable directories. File-command
+reads reject symlinks, non-regular files, and multiply linked files; each step's
+process group is killed before file commands are consumed.
 Tools that ignore `TMPDIR` and use macOS's per-user system cache/temp paths
 may require tool-specific configuration to use the job directories instead.
 
