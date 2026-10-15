@@ -32,6 +32,9 @@ std::optional<fs::path> find_executable(std::string_view name, std::string_view 
 
 fs::path home_dir();
 fs::path temp_dir();
+// Creates a new private (0700) directory "<parent>/<prefix>XXXXXX" (mkdtemp)
+// and returns its real path. `parent` defaults to temp_dir().
+fs::path make_temp_dir(std::string_view prefix, const fs::path& parent = {});
 fs::path user_cache_dir();
 
 bool is_subpath(const fs::path& path, const fs::path& base);

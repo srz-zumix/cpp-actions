@@ -1,6 +1,9 @@
 find_package(Threads REQUIRED)
 
 add_library(cpa_core STATIC
+  config/config.cpp
+  engine/catalog.cpp
+  engine/event.cpp
   util/fs.cpp
   util/glob.cpp
   util/process.cpp
@@ -14,6 +17,7 @@ add_library(cpa_core STATIC
   workflow/parser.cpp
   workflow/scopes.cpp
   workflow/yaml.cpp
+  workspace/git.cpp
 )
 target_include_directories(cpa_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(cpa_core

@@ -13,6 +13,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <system_error>
+#include <vector>
 
 #if defined(__APPLE__)
 #include <sys/clonefile.h>
@@ -199,6 +200,18 @@ fs::path home_dir() {
 fs::path temp_dir() {
   if (const char* t = std::getenv("TMPDIR"); t && *t) return fs::path(t);
   return fs::path("/tmp");
+}
+
+fs::path make_temp_dir(std::string_view prefix, const fs::path& parent) {
+  const fs::path base = parent.empty() ? temp_dir() : parent;
+  fs::create_directories(base);
+  std::string templ = (base / (std::string(prefix) + "XXXXXX")).string();
+  std::vector<char> buf(templ.begin(), templ.end());
+  buf.push_back('\0');
+  if (::mkdtemp(buf.data()) == nullptr) {
+    throw std::system_error(errno, std::generic_category(), "mkdtemp " + templ);
+  }
+  return real_path(fs::path(buf.data()));
 }
 
 fs::path user_cache_dir() {
