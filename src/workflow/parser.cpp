@@ -430,6 +430,7 @@ class Parser {
     }
     if (event == "workflow_call") {
       check_keys(config, {"inputs", "outputs", "secrets"});
+      parse_call_config(config, wf);
       return;
     }
     if (event == "workflow_run") {
@@ -440,6 +441,79 @@ class Parser {
     for (const auto& e : config.entries) {
       if (e.key->text != "types") error(e.key, "Unexpected value '" + e.key->text + "'");
       check_filter_list(e.value, "types");
+    }
+  }
+
+  void parse_call_config(const Node& config, Workflow& wf) {
+    if (const Node* inputs = config.get("inputs"); inputs != nullptr && !inputs->is_null()) {
+      if (!inputs->is_mapping()) {
+        error(inputs, "'inputs' must be a mapping");
+      } else {
+        for (const auto& e : inputs->entries) {
+          CallInput in;
+          in.name = e.key->text;
+          const Node* def = e.value;
+          if (!def->is_mapping()) {
+            error(def, "The definition of input '" + in.name + "' must be a mapping with 'type'");
+            continue;
+          }
+          check_keys(*def, {"description", "required", "default", "type", "deprecationMessage"});
+          if (const Node* d = def->get("description")) in.description = d->scalar_string();
+          if (const Node* r = def->get("required")) {
+            if (r->kind != yaml::NodeKind::Boolean) error(r, "'required' must be a boolean");
+            in.required = r->boolean;
+          }
+          in.default_value = def->get("default");
+          const Node* t = def->get("type");
+          if (t == nullptr) {
+            error(def, "Required property is missing: type");
+          } else {
+            in.type = t->scalar_string();
+            if (in.type != "string" && in.type != "boolean" && in.type != "number") {
+              error(t, "Unexpected input type '" + in.type + "'. Expected string, boolean or number");
+            }
+          }
+          wf.call_inputs.push_back(std::move(in));
+        }
+      }
+    }
+    if (const Node* outputs = config.get("outputs"); outputs != nullptr && !outputs->is_null()) {
+      if (!outputs->is_mapping()) {
+        error(outputs, "'outputs' must be a mapping");
+      } else {
+        for (const auto& e : outputs->entries) {
+          CallOutput out;
+          out.name = e.key->text;
+          if (!e.value->is_mapping() || e.value->get("value") == nullptr) {
+            error(e.value, "The output '" + out.name + "' must be a mapping with 'value'");
+            continue;
+          }
+          check_keys(*e.value, {"description", "value"});
+          if (const Node* d = e.value->get("description")) out.description = d->scalar_string();
+          out.value = e.value->get("value");
+          wf.call_outputs.push_back(std::move(out));
+        }
+      }
+    }
+    if (const Node* secrets = config.get("secrets"); secrets != nullptr && !secrets->is_null()) {
+      if (!secrets->is_mapping()) {
+        error(secrets, "'secrets' must be a mapping");
+      } else {
+        for (const auto& e : secrets->entries) {
+          CallSecret sec;
+          sec.name = e.key->text;
+          if (e.value->is_mapping()) {
+            check_keys(*e.value, {"description", "required"});
+            if (const Node* r = e.value->get("required")) {
+              if (r->kind != yaml::NodeKind::Boolean) error(r, "'required' must be a boolean");
+              sec.required = r->boolean;
+            }
+          } else if (!e.value->is_null()) {
+            error(e.value, "The definition of secret '" + sec.name + "' must be a mapping");
+          }
+          wf.call_secrets.push_back(std::move(sec));
+        }
+      }
     }
   }
 
@@ -706,9 +780,16 @@ class Parser {
         error(n, "Every step must define a 'uses' or 'run' key");
       }
       if (step.run != nullptr) {
-        check_keys(*n, {"id", "if", "name", "run", "shell", "env", "continue-on-error", "timeout-minutes",
-                        "working-directory"});
-        check_string_template(step.run, Site::StepGeneral, "run");
+        if (composite_) {
+          check_keys(*n, {"id", "if", "name", "run", "shell", "env", "continue-on-error", "working-directory"});
+          if (n->get("shell") == nullptr) error(n, "Required property is missing: shell");
+        } else {
+          check_keys(*n, {"id", "if", "name", "run", "shell", "env", "continue-on-error", "timeout-minutes",
+                          "working-directory"});
+        }
+        check_string_template(step.run, general_site_, "run");
+      } else if (composite_) {
+        check_keys(*n, {"id", "if", "name", "uses", "with", "env", "continue-on-error"});
       } else {
         check_keys(*n, {"id", "if", "name", "uses", "with", "env", "continue-on-error", "timeout-minutes"});
       }
@@ -725,17 +806,17 @@ class Parser {
         }
       }
       step.name = n->get("name");
-      if (step.name != nullptr) check_string_template(step.name, Site::StepGeneral, "name");
+      if (step.name != nullptr) check_string_template(step.name, general_site_, "name");
       step.condition = n->get("if");
-      if (step.condition != nullptr) check_condition(step.condition, Site::StepIf);
+      if (step.condition != nullptr) check_condition(step.condition, if_site_);
       step.shell = n->get("shell");
-      if (step.shell != nullptr) check_string_template(step.shell, Site::StepGeneral, "shell");
+      if (step.shell != nullptr) check_string_template(step.shell, general_site_, "shell");
       step.working_directory = n->get("working-directory");
       if (step.working_directory != nullptr) {
-        check_string_template(step.working_directory, Site::StepGeneral, "working-directory");
+        check_string_template(step.working_directory, general_site_, "working-directory");
       }
       step.env = n->get("env");
-      if (step.env != nullptr) check_env(step.env, Site::StepGeneral, true);
+      if (step.env != nullptr) check_env(step.env, general_site_, true);
       step.with = n->get("with");
       if (step.with != nullptr) {
         if (!step.with->is_mapping()) {
@@ -744,16 +825,16 @@ class Parser {
           for (const auto& e : step.with->entries) {
             if (!e.value->is_scalar()) error(e.value, "The value of input '" + e.key->text + "' must be a string");
           }
-          check_template(step.with, Site::StepGeneral);
+          check_template(step.with, general_site_);
         }
       }
       step.continue_on_error = n->get("continue-on-error");
       if (step.continue_on_error != nullptr) {
-        check_bool_or_expression(step.continue_on_error, Site::StepGeneral, "continue-on-error");
+        check_bool_or_expression(step.continue_on_error, general_site_, "continue-on-error");
       }
       step.timeout_minutes = n->get("timeout-minutes");
       if (step.timeout_minutes != nullptr) {
-        check_number_or_expression(step.timeout_minutes, Site::StepGeneral, "timeout-minutes");
+        check_number_or_expression(step.timeout_minutes, general_site_, "timeout-minutes");
       }
 
       if (const Node* id = n->get("id")) {
@@ -832,6 +913,20 @@ class Parser {
   std::string file_;
   std::vector<Diagnostic> errors_;
   std::vector<Diagnostic> warnings_;
+
+ public:
+  // Composite action steps (runs.steps of action.yml).
+  void set_composite() {
+    composite_ = true;
+    general_site_ = Site::ActionStepGeneral;
+    if_site_ = Site::ActionStepIf;
+  }
+  void parse_composite_steps(const Node& steps, Job& job) { parse_steps(steps, job); }
+
+ private:
+  bool composite_ = false;
+  Site general_site_ = Site::StepGeneral;
+  Site if_site_ = Site::StepIf;
 };
 
 }  // namespace
@@ -845,6 +940,19 @@ Workflow parse_workflow(std::shared_ptr<yaml::Document> document, std::string fi
   }
   if (!parser.errors().empty()) throw WorkflowError(parser.errors());
   return wf;
+}
+
+std::vector<Step> parse_action_steps(const yaml::Node& steps, std::string file, std::vector<Diagnostic>* warnings) {
+  Parser parser(file);
+  parser.set_composite();
+  Job job;
+  job.id = "composite";
+  parser.parse_composite_steps(steps, job);
+  if (warnings != nullptr) {
+    warnings->insert(warnings->end(), parser.warnings().begin(), parser.warnings().end());
+  }
+  if (!parser.errors().empty()) throw WorkflowError(parser.errors());
+  return std::move(job.steps);
 }
 
 Workflow load_workflow(const fs::path& path, std::string display_name, std::vector<Diagnostic>* warnings) {

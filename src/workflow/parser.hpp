@@ -15,6 +15,11 @@ namespace cpa::workflow {
 Workflow parse_workflow(std::shared_ptr<yaml::Document> document, std::string file,
                         std::vector<Diagnostic>* warnings = nullptr);
 
+// Parses and validates the steps of a composite action (`runs.steps`).
+// Throws WorkflowError.
+std::vector<Step> parse_action_steps(const yaml::Node& steps, std::string file,
+                                     std::vector<Diagnostic>* warnings = nullptr);
+
 // Loads and parses a workflow file (YAML errors are reported as WorkflowError).
 Workflow load_workflow(const std::filesystem::path& path, std::string display_name,
                        std::vector<Diagnostic>* warnings = nullptr);

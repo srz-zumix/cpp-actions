@@ -47,6 +47,26 @@ struct DispatchInput {
   std::vector<std::string> options;
 };
 
+// on.workflow_call
+struct CallInput {
+  std::string name;
+  std::string description;
+  std::string type = "string";  // string, boolean, number
+  bool required = false;
+  Token default_value = nullptr;
+};
+
+struct CallOutput {
+  std::string name;
+  std::string description;
+  Token value = nullptr;
+};
+
+struct CallSecret {
+  std::string name;
+  bool required = false;
+};
+
 struct Step {
   int index = 0;           // 0-based position in the job
   std::string id;          // explicit id or generated ("__run", "__actions_checkout", ...)
@@ -99,6 +119,9 @@ struct Workflow {
   Token run_name = nullptr;
   std::vector<Trigger> triggers;
   std::vector<DispatchInput> dispatch_inputs;
+  std::vector<CallInput> call_inputs;
+  std::vector<CallOutput> call_outputs;
+  std::vector<CallSecret> call_secrets;
   Token env = nullptr;
   Token defaults = nullptr;
   Token permissions = nullptr;

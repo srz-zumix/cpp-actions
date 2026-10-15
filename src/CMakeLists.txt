@@ -1,9 +1,20 @@
 find_package(Threads REQUIRED)
 
 add_library(cpa_core STATIC
+  actions/action.cpp
+  actions/builtin.cpp
+  actions/fetch.cpp
   config/config.cpp
   engine/catalog.cpp
+  engine/commands.cpp
+  engine/console.cpp
+  engine/evaluate.cpp
+  engine/job.cpp
   engine/event.cpp
+  engine/masker.cpp
+  engine/report.cpp
+  engine/runner.cpp
+  engine/shell.cpp
   util/fs.cpp
   util/glob.cpp
   util/process.cpp
@@ -12,12 +23,16 @@ add_library(cpa_core STATIC
   expr/expression.cpp
   expr/template.cpp
   expr/value.cpp
+  sandbox/profile.cpp
+  sandbox/proxy.cpp
+  sandbox/sandbox.cpp
   workflow/events.cpp
   workflow/matrix.cpp
   workflow/parser.cpp
   workflow/scopes.cpp
   workflow/yaml.cpp
   workspace/git.cpp
+  workspace/snapshot.cpp
 )
 target_include_directories(cpa_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(cpa_core
