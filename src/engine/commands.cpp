@@ -86,7 +86,7 @@ std::optional<WorkflowCommand> parse_workflow_command(std::string_view line) {
       for (const auto& prop : util::split(util::trim(info.substr(space + 1)), ',')) {
         if (prop.empty()) continue;
         const auto eq = prop.find('=');
-        if (eq == std::string::npos || eq == 0 || eq + 1 == prop.size()) continue;
+        if (eq == std::string::npos || eq == 0) continue;
         cmd.properties[prop.substr(0, eq)] = unescape_command_property(prop.substr(eq + 1));
       }
     }

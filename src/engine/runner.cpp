@@ -1,14 +1,19 @@
 #include "engine/runner.hpp"
 
+#include <sys/stat.h>
+
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <ctime>
 #include <iomanip>
+#include <limits>
 #include <mutex>
 #include <set>
 #include <sstream>
+#include <system_error>
 #include <thread>
 
 #include "actions/action.hpp"
@@ -50,6 +55,16 @@ std::string random_run_id() {
   std::string id = "1";
   for (char c : util::random_hex(5)) id += static_cast<char>('0' + (c % 10));
   return id;
+}
+
+void create_private_directory(const fs::path& path, bool must_be_new) {
+  if (path.has_parent_path()) fs::create_directories(path.parent_path());
+  if (::mkdir(path.c_str(), 0700) == 0) return;
+  const int error = errno;
+  if (error == EEXIST && !must_be_new && fs::is_directory(path) && !fs::is_symlink(fs::symlink_status(path))) {
+    return;
+  }
+  throw std::system_error(error, std::generic_category(), "Cannot create private directory: " + path.string());
 }
 
 // Result of a job as seen by the jobs that need it.
@@ -228,11 +243,12 @@ class WorkflowExecutor {
       if (!error.empty()) {
         r.result = "failure";
         r.reason = error;
-        run_.console.line(run_.console.paint("[" + r.name + "] " + error, Color::Red));
+        run_.console.line(run_.console.paint(run_.masker.mask("[" + r.name + "] " + error), Color::Red));
       } else {
         r.result = status.cancelled ? "cancelled" : "skipped";
         r.reason = status.cancelled ? "the run was cancelled" : "the job condition is false";
-        run_.console.line(run_.console.paint("[" + r.name + "] Job " + r.result + " (" + r.reason + ")", Color::Gray));
+        run_.console.line(run_.console.paint(
+            run_.masker.mask("[" + r.name + "] Job " + r.result + " (" + r.reason + ")"), Color::Gray));
       }
       const auto result = r.result;
       add_report(std::move(r));
@@ -254,7 +270,12 @@ class WorkflowExecutor {
         }
         if (const auto* ff = job.strategy->get("fail-fast")) fail_fast = evaluate_token(ff, ctx, site, wf_.file).truthy();
         if (const auto* mp = job.strategy->get("max-parallel")) {
-          max_parallel = static_cast<int>(evaluate_token(mp, ctx, site, wf_.file).to_number());
+          const auto value = evaluate_token(mp, ctx, site, wf_.file).to_number();
+          if (!std::isfinite(value) || value <= 0 || std::trunc(value) != value ||
+              value > std::numeric_limits<int>::max()) {
+            throw EvaluationError(location(wf_.file, mp) + ": 'max-parallel' must be a positive integer");
+          }
+          max_parallel = static_cast<int>(value);
         }
       }
     } catch (const std::exception& e) {
@@ -264,7 +285,7 @@ class WorkflowExecutor {
       r.name = job.id;
       r.result = "failure";
       r.reason = e.what();
-      run_.console.line(run_.console.paint("[" + job.id + "] " + e.what(), Color::Red));
+      run_.console.line(run_.console.paint(run_.masker.mask("[" + job.id + "] " + e.what()), Color::Red));
       add_report(std::move(r));
       finish_node(job.id, "failure", {});
       return;
@@ -386,7 +407,7 @@ class WorkflowExecutor {
     std::string path;
     for (std::size_t i = 2; i < parts.size(); ++i) path += (i > 2 ? "/" : "") + parts[i];
     const auto entry = run_.repositories.fetch(parts[0], parts[1], ref, [this](std::string_view m) {
-      run_.console.line(run_.console.paint(std::string(m), Color::Gray));
+      run_.console.line(run_.console.paint(run_.masker.mask(m), Color::Gray));
     });
     const auto file = (entry.dir / path).lexically_normal();
     if (!util::is_subpath(file, entry.dir)) throw EvaluationError(where + ": invalid workflow path " + uses);
@@ -458,7 +479,8 @@ class WorkflowExecutor {
         }
       }
       if (cwf.permissions != nullptr) {
-        run_.console.line(run_.console.paint("[" + inst.name + "] 'permissions' are not emulated", Color::Gray));
+        run_.console.line(run_.console.paint(
+            run_.masker.mask("[" + inst.name + "] 'permissions' are not emulated"), Color::Gray));
       }
       WorkflowRun child;
       child.workflow = called.workflow;
@@ -503,7 +525,7 @@ class WorkflowExecutor {
     } catch (const std::exception& e) {
       caller.result = "failure";
       caller.reason = e.what();
-      run_.console.line(run_.console.paint("[" + inst.name + "] " + e.what(), Color::Red));
+      run_.console.line(run_.console.paint(run_.masker.mask("[" + inst.name + "] " + e.what()), Color::Red));
     }
     if (run_.cancelled && caller.result == "success") caller.result = "cancelled";
     caller.duration_ms = elapsed_ms(started);
@@ -554,6 +576,59 @@ std::string render_summary(const RunReport& report) {
   return out;
 }
 
+Value masked_value(const Value& value, const Masker& masker) {
+  if (value.is_string()) return masker.mask(value.as_string());
+  if (value.is_array()) {
+    auto result = Value::array();
+    for (const auto& item : value.items()) result.push(masked_value(item, masker));
+    return result;
+  }
+  if (value.is_object()) {
+    auto result = Value::object();
+    for (const auto& [key, item] : value.object_data().entries()) {
+      result.set(masker.mask(key), masked_value(item, masker));
+    }
+    return result;
+  }
+  return value;
+}
+
+void mask_report(RunReport& report, const Masker& masker) {
+  auto mask_map = [&](StringMap& values) {
+    StringMap masked;
+    for (const auto& [key, value] : values) masked[masker.mask(key)] = masker.mask(value);
+    values = std::move(masked);
+  };
+  report.run_dir = masker.mask(report.run_dir);
+  report.ref = masker.mask(report.ref);
+  report.sha = masker.mask(report.sha);
+  for (auto& workflow : report.workflows) {
+    workflow.file = masker.mask(workflow.file);
+    workflow.name = masker.mask(workflow.name);
+    for (auto& job : workflow.jobs) {
+      job.key = masker.mask(job.key);
+      job.job_id = masker.mask(job.job_id);
+      job.name = masker.mask(job.name);
+      job.reason = masker.mask(job.reason);
+      job.matrix = masked_value(job.matrix, masker);
+      job.log_file = masker.mask(job.log_file);
+      job.summary = masker.mask(job.summary);
+      mask_map(job.outputs);
+      for (auto& step : job.steps) {
+        step.id = masker.mask(step.id);
+        step.name = masker.mask(step.name);
+        step.error = masker.mask(step.error);
+        mask_map(step.outputs);
+      }
+      for (auto& annotation : job.annotations) {
+        annotation.message = masker.mask(annotation.message);
+        annotation.title = masker.mask(annotation.title);
+        annotation.file = masker.mask(annotation.file);
+      }
+    }
+  }
+}
+
 }  // namespace
 
 struct Runner::Impl {
@@ -578,11 +653,12 @@ RunReport Runner::run(const std::vector<Selection>& selection, const Event& even
   const auto started = Clock::now();
   auto options = impl_->options;
   if (options.cache_dir.empty()) options.cache_dir = default_cache_dir();
-  fs::create_directories(options.cache_dir);
+  create_private_directory(options.cache_dir, false);
   options.cache_dir = util::real_path(options.cache_dir);
   if (options.run_dir.empty()) options.run_dir = options.cache_dir / "runs" / (timestamp() + "-" + util::random_hex(3));
-  fs::create_directories(options.run_dir / "logs");
+  create_private_directory(options.run_dir, true);
   options.run_dir = util::real_path(options.run_dir);
+  create_private_directory(options.run_dir / "logs", true);
 
   for (const auto& id : options.jobs) {
     const bool found = std::any_of(selection.begin(), selection.end(), [&](const Selection& s) {
@@ -592,6 +668,28 @@ RunReport Runner::run(const std::vector<Selection>& selection, const Event& even
   }
 
   RunState state(options, impl_->console, event, git);
+  struct StateGuard {
+    Impl& impl;
+    RunState& run;
+    ~StateGuard() {
+      {
+        std::lock_guard lock(impl.mutex);
+        impl.state = nullptr;
+      }
+      if (!run.options.keep_workdir) {
+        for (const auto* name : {"snapshot", "jobs"}) {
+          try {
+            util::remove_tree(run.options.run_dir / name);
+          } catch (const std::exception& e) {
+            try {
+              impl.console.line(run.masker.mask(std::string("Failed to remove run working directory: ") + e.what()));
+            } catch (...) {
+            }
+          }
+        }
+      }
+    }
+  } state_guard{*impl_, state};
   {
     std::lock_guard lock(impl_->mutex);
     impl_->state = &state;
@@ -661,12 +759,12 @@ RunReport Runner::run(const std::vector<Selection>& selection, const Event& even
         try {
           title = evaluate_string(wf.run_name, ctx, scope_for(Site::RunName), wf.file);
         } catch (const std::exception& e) {
-          console.line(console.paint(item->run.file + ": " + e.what(), Color::Yellow));
+          console.line(console.paint(state.masker.mask(item->run.file + ": " + e.what()), Color::Yellow));
         }
       }
-      console.line(console.paint("Workflow: " + title + " (" + item->run.file + ")", Color::Bold));
+      console.line(console.paint(state.masker.mask("Workflow: " + title + " (" + item->run.file + ")"), Color::Bold));
       if (wf.permissions != nullptr) {
-        console.line(console.paint(item->run.file + ": 'permissions' are not emulated", Color::Gray));
+        console.line(console.paint(state.masker.mask(item->run.file + ": 'permissions' are not emulated"), Color::Gray));
       }
       try {
         WorkflowExecutor executor(state, item->run, item->reports, item->mutex,
@@ -689,7 +787,7 @@ RunReport Runner::run(const std::vector<Selection>& selection, const Event& even
     for (auto& r : item->reports) results.push_back(effective_result(r));
     w.result = item->error.empty() ? combine_results(results) : "failure";
     if (!item->error.empty()) {
-      impl_->console.line(impl_->console.paint(w.file + ": " + item->error, Color::Red));
+      impl_->console.line(impl_->console.paint(state.masker.mask(w.file + ": " + item->error), Color::Red));
       JobReport r;
       r.key = r.job_id = r.name = "(workflow)";
       r.result = "failure";
@@ -704,10 +802,7 @@ RunReport Runner::run(const std::vector<Selection>& selection, const Event& even
   if (state.cancelled && report.result != "failure") report.result = "cancelled";
   report.duration_ms = elapsed_ms(started);
 
-  {
-    std::lock_guard lock(impl_->mutex);
-    impl_->state = nullptr;
-  }
+  mask_report(report, state.masker);
   util::write_file(options.run_dir / "report.json", report_to_json(report));
   const auto summary = render_summary(report);
   if (!summary.empty()) util::write_file(options.run_dir / "summary.md", summary);

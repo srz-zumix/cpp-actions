@@ -76,9 +76,13 @@ Value with_fields(const Value& base, const std::vector<std::pair<std::string, Va
   return out;
 }
 
-std::optional<std::chrono::milliseconds> minutes_to_ms(double minutes) {
-  if (!(minutes > 0) || !std::isfinite(minutes)) return std::nullopt;
-  return std::chrono::milliseconds(static_cast<std::int64_t>(minutes * 60000.0));
+std::chrono::milliseconds minutes_to_ms(double minutes) {
+  const double milliseconds = minutes * 60000.0;
+  const auto maximum = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::duration::max() / 2).count();
+  if (!(minutes > 0) || !std::isfinite(milliseconds) || milliseconds >= static_cast<double>(maximum)) {
+    throw EvaluationError("'timeout-minutes' must be a finite positive number within the supported duration range");
+  }
+  return std::chrono::milliseconds(std::max<std::int64_t>(1, static_cast<std::int64_t>(milliseconds)));
 }
 
 struct StepScope {
@@ -342,7 +346,7 @@ bool JobRunner::evaluate_job_settings() {
   if (job_.timeout_minutes != nullptr) {
     timeout_minutes_ = evaluate_token(job_.timeout_minutes, ctx, general, wf_.file).to_number();
   }
-  if (auto ms = minutes_to_ms(timeout_minutes_)) deadline_ = started_ + *ms;
+  deadline_ = started_ + minutes_to_ms(timeout_minutes_);
   if (job_.continue_on_error != nullptr) {
     continue_on_error_ = evaluate_token(job_.continue_on_error, ctx, general, wf_.file).truthy();
     report_.continue_on_error = continue_on_error_;
@@ -449,7 +453,7 @@ expr::EvalContext JobRunner::make_context(const StepScope& scope, const StringMa
   c.set("vars", vars_);
   c.set("secrets", secrets_);
   auto job = Value::object();
-  job.set("status", current_status(nullptr));
+  job.set("status", current_status(&scope));
   c.set("job", job);
   c.set("steps", scope.steps);
   c.set("runner", runner_ctx_);
@@ -488,6 +492,9 @@ void JobRunner::record_step(StepScope& scope, const workflow::Step& step, StepRe
     scope.steps.set(step.id, entry);
   }
   if (report.conclusion == "failure") scope.status = "failure";
+  report.name = run_.masker.mask(report.name);
+  report.error = run_.masker.mask(report.error);
+  for (auto& [key, value] : report.outputs) value = run_.masker.mask(value);
   report_.steps.push_back(std::move(report));
 }
 
@@ -581,6 +588,10 @@ StepResult JobRunner::run_script(StepScope& scope, const workflow::Step& step, e
                                  const StringMap& env, std::optional<std::chrono::milliseconds> timeout,
                                  bool after_cancel) {
   const auto general = scope_for(scope.general_site);
+  const auto files = prepare_file_commands();
+  ctx.contexts.set("github", with_fields(ctx.contexts.get("github"),
+                                        {{"action", step.id}, {"env", files.env.string()},
+                                         {"path", files.path.string()}}));
   const auto body = evaluate_string(step.run, ctx, general, scope.file);
   std::string shell_name;
   std::string working_directory;
@@ -603,7 +614,6 @@ StepResult JobRunner::run_script(StepScope& scope, const workflow::Step& step, e
       }
     }
   }
-  const auto files = prepare_file_commands();
   auto process_env = step_environment(env, files, scope, step.id);
   const auto shell = resolve_shell(shell_name, process_env["PATH"]);
   fs::path cwd = workspace_;
@@ -1100,8 +1110,8 @@ void JobRunner::annotate(const std::string& level, const WorkflowCommand& cmd) {
     return it != cmd.properties.end() ? it->second : std::string();
   };
   auto num = [&](const char* name) { return static_cast<int>(util::parse_int(prop(name)).value_or(0)); };
-  a.title = prop("title");
-  a.file = prop("file");
+  a.title = run_.masker.mask(prop("title"));
+  a.file = run_.masker.mask(prop("file"));
   a.line = num("line");
   a.end_line = num("endLine");
   a.column = num("col");
@@ -1364,12 +1374,16 @@ std::string sanitize_key(std::string_view key) {
 std::string hash_files(const fs::path& root, const std::vector<std::string>& patterns) {
   const auto files = util::glob_files(root, patterns);
   if (files.empty()) return {};
+  const auto canonical_root = util::real_path(root);
+  bool matched = false;
   util::Sha256 h;
   for (const auto& f : files) {
+    if (!util::is_subpath(util::real_path(f), canonical_root)) continue;
     const auto d = util::sha256_file(f);
     h.update(d.data(), d.size());
+    matched = true;
   }
-  return util::Sha256::hex(h.digest());
+  return matched ? util::Sha256::hex(h.digest()) : std::string();
 }
 
 std::function<bool(std::string_view)> job_status_functions(const JobStatus& status) {
