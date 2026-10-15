@@ -131,6 +131,51 @@ if(NOT result STREQUAL "skipped")
   message(FATAL_ERROR "unmatched host label was not skipped")
 endif()
 
+file(MAKE_DIRECTORY "${WORK}/outside-command")
+set(command_sentinel "CLI_FILE_COMMAND_SECRET_MUST_NOT_LEAK_58129")
+file(WRITE "${WORK}/outside-command/sentinel" "${command_sentinel}\n")
+set(command_modes unsandboxed)
+if(HOST_IS_APPLE)
+  list(APPEND command_modes sandboxed)
+endif()
+foreach(mode IN LISTS command_modes)
+  set(isolation_flags)
+  if(mode STREQUAL "unsandboxed")
+    set(isolation_flags --no-sandbox)
+  endif()
+  foreach(file_command IN ITEMS GITHUB_STEP_SUMMARY GITHUB_ENV GITHUB_OUTPUT GITHUB_STATE GITHUB_PATH)
+    set(symlink_workflow [=[
+name: CLI file command boundary
+on: push
+jobs:
+  symlink:
+    runs-on: cli-local
+    steps:
+      - run: |
+          rm "$@file_command@"
+          ln -s "$CPA_CLI_COMMAND_SECRET" "$@file_command@"
+]=])
+    string(CONFIGURE "${symlink_workflow}" symlink_workflow @ONLY)
+    file(WRITE "${repo}/.github/workflows/command-symlink.yml" "${symlink_workflow}")
+    string(TOLOWER "${file_command}" command_name)
+    set(case_name "symlink-${mode}-${command_name}")
+    check_cli("${case_name}" 1 ${isolation_flags} --workflow command-symlink.yml --host-label cli-local
+      --pass-env "CPA_CLI_COMMAND_SECRET=${WORK}/outside-command/sentinel")
+    file(READ "${WORK}/runs/${case_name}/report.json" report)
+    string(JSON result GET "${report}" result)
+    if(NOT result STREQUAL "failure" OR "${cli_output}${cli_error}${report}" MATCHES "${command_sentinel}")
+      message(FATAL_ERROR "file-command symlink leaked host content or did not fail")
+    endif()
+    file(GLOB logs "${WORK}/runs/${case_name}/logs/*.log")
+    foreach(log IN LISTS logs)
+      file(READ "${log}" log_text)
+      if(log_text MATCHES "${command_sentinel}")
+        message(FATAL_ERROR "file-command symlink leaked host content to a job log")
+      endif()
+    endforeach()
+  endforeach()
+endforeach()
+
 if(HOST_IS_APPLE)
   if(NOT IS_DIRECTORY "$ENV{HOME}")
     message(FATAL_ERROR "a real host HOME directory is required for the sandbox boundary test")

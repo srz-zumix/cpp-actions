@@ -338,7 +338,9 @@ IUTEST(ProxyTest, DelayedSecondRequestIsNeverRelayed) {
   LocalServer server([&](int fd) {
     received = read_header(fd);
     got_first = true;
-    while (!sent_second) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!sent_second && std::chrono::steady_clock::now() < deadline)
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
     received += read_all(fd);
     send_text(fd, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok");
   });

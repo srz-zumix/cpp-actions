@@ -89,6 +89,8 @@ Exit codes are 0 for success/skipped, 1 for workflow failure, 2 for setup errors
 and 130 for cancelled runs; argument-parser errors also return a nonzero code.
 SIGINT/SIGTERM request graceful cancellation; a second signal requests forced
 cancellation.
+Remaining processes in a step's process group are killed when that step ends;
+background services cannot be carried over to later steps.
 
 ### User configuration
 
@@ -135,7 +137,9 @@ carefully.
 The generated profile is kept outside the step-writable workspace, home,
 temporary, and tool-cache directories. There are no blanket grants to the
 operating system's user temporary/cache directories or all of `/opt`; the
-Homebrew system-software read grant is limited to `/opt/homebrew`.
+read grant under `/opt` is limited to `/opt/homebrew`.
+Tools that ignore `TMPDIR` and use macOS's per-user system cache/temp paths
+may require tool-specific configuration to use the job directories instead.
 
 This is not a VM or a complete GitHub-hosted runner. System software and some
 system metadata remain visible; shared writable caches are not isolated between
