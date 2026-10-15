@@ -3,6 +3,7 @@
 #include <nlohmann/json.hpp>
 
 #include "actions/builtin.hpp"
+#include "test_support.hpp"
 #include "util/fs.hpp"
 
 using namespace cpa;
@@ -13,7 +14,7 @@ namespace {
 class BuiltinSandboxTest : public ::iutest::Test {
  protected:
   void SetUp() override {
-    root = util::make_temp_dir("builtin-sandbox-", fs::current_path());
+    root = dir.path();
     ctx.workspace = root / "work";
     ctx.home = root / "home";
     ctx.writable = {ctx.workspace, ctx.home, root / "tmp", root / "tools"};
@@ -29,8 +30,6 @@ class BuiltinSandboxTest : public ::iutest::Test {
     util::write_file(ctx.workspace / "file", "workspace content");
     ctx.warning = [&](std::string_view text) { warnings.emplace_back(text); };
   }
-
-  void TearDown() override { util::remove_tree(root); }
 
   actions::BuiltinResult run(actions::Builtin kind, const std::map<std::string, std::string>& inputs) {
     return actions::run_builtin(kind, false, inputs, {}, ctx);
@@ -48,6 +47,7 @@ class BuiltinSandboxTest : public ::iutest::Test {
 
   fs::path cache_entry() { return fs::directory_iterator(ctx.cache_store)->path(); }
 
+  cpa_test::TempDir dir;
   fs::path root, profile, secret;
   actions::BuiltinContext ctx;
   std::vector<std::string> warnings;
