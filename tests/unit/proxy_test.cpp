@@ -6,6 +6,7 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <functional>
 #include <memory>
@@ -443,11 +444,17 @@ IUTEST(ProxyTest, IdleClientFloodDoesNotPreventShutdown) {
   for (int i = 0; i < 48; ++i) clients.push_back(std::make_unique<Socket>(dial(proxy.port())));
   std::vector<pollfd> fds;
   for (const auto& client : clients) fds.push_back({client->get(), POLLIN, 0});
-  IUTEST_EXPECT_GT(::poll(fds.data(), fds.size(), 2000), 0);
   bool rejected = false;
-  for (const auto& fd : fds) {
-    char c;
-    if (fd.revents && ::recv(fd.fd, &c, 1, MSG_PEEK | MSG_DONTWAIT) == 0) rejected = true;
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (!rejected && std::chrono::steady_clock::now() < deadline) {
+    for (auto& fd : fds) fd.revents = 0;
+    if (::poll(fds.data(), fds.size(), 50) <= 0) continue;
+    for (const auto& fd : fds) {
+      if (!fd.revents) continue;
+      char c;
+      const auto n = ::recv(fd.fd, &c, 1, MSG_PEEK | MSG_DONTWAIT);
+      if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) rejected = true;
+    }
   }
   IUTEST_EXPECT_TRUE(rejected);
   const auto start = std::chrono::steady_clock::now();

@@ -190,6 +190,7 @@ bool split_host_port(std::string_view authority, std::string& host, int& port, i
     const auto close = authority.find(']');
     if (close == std::string_view::npos) return false;
     host = std::string(authority.substr(1, close - 1));
+    if (host.find('%') != std::string::npos) return false;
     in6_addr v6{};
     if (::inet_pton(AF_INET6, host.c_str(), &v6) != 1) return false;
     authority.remove_prefix(close + 1);
@@ -517,6 +518,20 @@ void NetworkProxy::handle(int client) {
     ::shutdown(upstream, SHUT_WR);
   }
   if (ok) relay(client, upstream, tunnel);
+  int flags = ::fcntl(client, F_GETFL, 0);
+  if (flags >= 0 && ::fcntl(client, F_SETFL, flags | O_NONBLOCK) == 0) {
+    std::size_t discarded = 0;
+    while (discarded < kMaxHeader) {
+      const auto n = ::recv(client, buf, std::min(sizeof(buf), kMaxHeader - discarded), 0);
+      if (n > 0) {
+        discarded += static_cast<std::size_t>(n);
+        continue;
+      }
+      if (n < 0 && errno == EINTR) continue;
+      break;
+    }
+    ::fcntl(client, F_SETFL, flags);
+  }
 }
 
 }  // namespace cpa::sandbox
