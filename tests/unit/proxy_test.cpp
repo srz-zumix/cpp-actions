@@ -220,6 +220,22 @@ IUTEST(ProxyTest, DenialCallsCallbackWithoutDialing) {
   IUTEST_EXPECT_EQ(0, server.connections.load());
 }
 
+IUTEST(ProxyTest, WaitsForRequestAfterAccept) {
+  LocalServer server([](int fd) {
+    read_header(fd);
+    send_text(fd, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+  });
+  NetworkProxy proxy({"127.0.0.1"}, {});
+  proxy.start();
+  Socket client(dial(proxy.port()));
+  pollfd fd{client.get(), POLLIN, 0};
+  IUTEST_EXPECT_EQ(0, ::poll(&fd, 1, 50));
+  IUTEST_ASSERT_TRUE(send_text(client.get(), request(server.port)));
+  IUTEST_EXPECT_TRUE(read_all(client.get()).starts_with("HTTP/1.1 200"));
+  proxy.stop();
+  server.stop();
+}
+
 IUTEST(ProxyTest, WildcardCannotAccessPrivateAddressesOrNumericAliases) {
   LocalServer server([](int) {});
   std::atomic<int> denied{0};

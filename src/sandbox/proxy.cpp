@@ -361,6 +361,8 @@ void NetworkProxy::accept_loop() {
     if (!(fds[0].revents & POLLIN)) continue;
     const int client = ::accept(listen_fd_, nullptr, nullptr);
     if (client < 0) continue;
+    const int flags = ::fcntl(client, F_GETFL, 0);
+    if (flags >= 0) ::fcntl(client, F_SETFL, flags & ~O_NONBLOCK);
     configure_socket(client);
     {
       std::lock_guard lock(mutex_);
