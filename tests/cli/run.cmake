@@ -69,11 +69,12 @@ if(NOT NODE)
 endif()
 file(WRITE "${TEST_ROOT}/secrets.env" "TEST_SECRET=file-secret-value\n")
 file(WRITE "${TEST_ROOT}/vars.env" "TEST_VARIABLE=file-variable-value\n")
+file(WRITE "${TEST_ROOT}/config.yml" "node: missing-config-node\n")
 execute_process(COMMAND "${GIT}" init -q "${REPO}" COMMAND_ERROR_IS_FATAL ANY)
 execute_process(COMMAND "${GIT}" -C "${REPO}" add . COMMAND_ERROR_IS_FATAL ANY)
 
 set(COMMON run -C "${REPO}" -e workflow_dispatch --host-label cli-test-host
-  --cache-dir "${TEST_ROOT}/cache" --parallel 1)
+  --cache-dir "${TEST_ROOT}/cache" --parallel 1 --config "${TEST_ROOT}/config.yml")
 if(NODE)
   list(APPEND COMMON --node "${NODE}")
 endif()
@@ -86,7 +87,7 @@ execute_process(COMMAND "${CLI}" ${COMMON} --no-sandbox --run-dir "${TEST_ROOT}/
   --keep-workdir --env EXPLICIT_ENV=explicit-env
   --secrets-file "${TEST_ROOT}/secrets.env" --secret TEST_SECRET=cli-secret-value
   --vars-file "${TEST_ROOT}/vars.env" --var TEST_VARIABLE=cli-variable-value
-  --github-token cli-token-value --input message=explicit-message
+  --github-token cli-token-value --secret GITHUB_TOKEN=secret-token-value --input message=explicit-message
   RESULT_VARIABLE STATUS OUTPUT_VARIABLE OUTPUT ERROR_VARIABLE ERROR)
 if(NOT STATUS EQUAL 0)
   message(FATAL_ERROR "Execution failed: ${STATUS}\n${OUTPUT}\n${ERROR}")
@@ -94,7 +95,7 @@ endif()
 if(OUTPUT MATCHES "cli-secret-value")
   message(FATAL_ERROR "Secret was not masked")
 endif()
-if(NOT OUTPUT MATCHES "sandbox is disabled")
+if(NOT ERROR MATCHES "WARNING: --no-sandbox disables filesystem and network isolation")
   message(FATAL_ERROR "Unsafe execution did not warn")
 endif()
 file(READ "${TEST_ROOT}/success/report.json" REPORT)
@@ -102,7 +103,13 @@ string(JSON RESULT GET "${REPORT}" result)
 if(NOT RESULT STREQUAL "success")
   message(FATAL_ERROR "Unexpected report: ${REPORT}")
 endif()
-if(NOT IS_DIRECTORY "${TEST_ROOT}/success/jobs/sample/work")
+string(JSON SUCCESS_RUN_ID GET "${REPORT}" workflows 0 run_id)
+string(JSON SUCCESS_LOG GET "${REPORT}" workflows 0 jobs 0 log)
+get_filename_component(SUCCESS_JOB_DIR "${SUCCESS_LOG}" NAME_WE)
+if(SUCCESS_RUN_ID STREQUAL "" OR
+   NOT EXISTS "${SUCCESS_LOG}" OR
+   NOT IS_DIRECTORY "${TEST_ROOT}/success/jobs/${SUCCESS_RUN_ID}/${SUCCESS_JOB_DIR}/work" OR
+   NOT IS_DIRECTORY "${TEST_ROOT}/success/control/${SUCCESS_RUN_ID}/${SUCCESS_JOB_DIR}")
   message(FATAL_ERROR "--keep-workdir did not retain the job workspace")
 endif()
 
@@ -119,13 +126,24 @@ execute_process(COMMAND "${CLI}" ${COMMON} -w failure.yml --no-sandbox --run-dir
 if(NOT STATUS EQUAL 1)
   message(FATAL_ERROR "Expected failure exit code 1, got ${STATUS}\n${OUTPUT}\n${ERROR}")
 endif()
-if(EXISTS "${TEST_ROOT}/failure/jobs/failure")
-  message(FATAL_ERROR "Job workspace was not cleaned by default")
+file(READ "${TEST_ROOT}/failure/report.json" REPORT)
+string(JSON RESULT GET "${REPORT}" result)
+string(JSON FAILURE_RUN_ID GET "${REPORT}" workflows 0 run_id)
+string(JSON FAILURE_LOG GET "${REPORT}" workflows 0 jobs 0 log)
+get_filename_component(FAILURE_JOB_DIR "${FAILURE_LOG}" NAME_WE)
+if(NOT RESULT STREQUAL "failure" OR FAILURE_RUN_ID STREQUAL "" OR
+   NOT EXISTS "${FAILURE_LOG}")
+  message(FATAL_ERROR "Failed job did not execute or produce a report: ${REPORT}")
+endif()
+if(EXISTS "${TEST_ROOT}/failure/jobs/${FAILURE_RUN_ID}/${FAILURE_JOB_DIR}" OR
+   EXISTS "${TEST_ROOT}/failure/control/${FAILURE_RUN_ID}/${FAILURE_JOB_DIR}")
+  message(FATAL_ERROR "Job workspace or control directory was not cleaned by default")
 endif()
 if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Linux")
   execute_process(COMMAND "${CLI}" ${COMMON} -w failure.yml --run-dir "${TEST_ROOT}/sandbox"
     RESULT_VARIABLE STATUS OUTPUT_VARIABLE OUTPUT ERROR_VARIABLE ERROR)
-  if(NOT STATUS EQUAL 1 OR OUTPUT MATCHES "sandbox is disabled")
+  if(NOT STATUS EQUAL 2 OR NOT ERROR MATCHES "refusing execution" OR
+     EXISTS "${TEST_ROOT}/sandbox")
     message(FATAL_ERROR "Default sandbox did not fail closed on Linux: ${STATUS}\n${OUTPUT}\n${ERROR}")
   endif()
 endif()

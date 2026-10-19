@@ -1,6 +1,12 @@
 #include "engine/commands.hpp"
 
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include <array>
+#include <cerrno>
+#include <iterator>
 
 #include "util/strings.hpp"
 
@@ -53,6 +59,47 @@ std::optional<std::string_view> read_line(std::string_view text, std::size_t& in
 
 }  // namespace
 
+std::string read_command_file(const std::filesystem::path& path) {
+  struct Descriptor {
+    int fd = -1;
+    ~Descriptor() { if (fd >= 0) ::close(fd); }
+  } directory, file;
+  const auto absolute = std::filesystem::absolute(path).lexically_normal();
+  auto fail = [&]() -> void {
+    throw FileCommandError("Cannot safely read workflow command file: " + path.string());
+  };
+  directory.fd = ::open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (directory.fd < 0) fail();
+  const auto relative = absolute.relative_path();
+  for (auto it = relative.begin(); it != relative.end(); ++it) {
+    const bool last = std::next(it) == relative.end();
+    const int fd = ::openat(directory.fd, it->c_str(),
+                            O_RDONLY | O_NOFOLLOW | O_CLOEXEC | (last ? O_NONBLOCK : O_DIRECTORY));
+    if (fd < 0) fail();
+    if (last) {
+      file.fd = fd;
+    } else {
+      ::close(directory.fd);
+      directory.fd = fd;
+    }
+  }
+  struct stat st {};
+  constexpr std::size_t kMaxCommandSize = 16 * 1024 * 1024;
+  if (file.fd < 0 || ::fstat(file.fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_nlink != 1 ||
+      st.st_size < 0 || static_cast<std::uintmax_t>(st.st_size) > kMaxCommandSize) fail();
+  std::string content;
+  char buffer[8192];
+  while (true) {
+    const auto n = ::read(file.fd, buffer, sizeof(buffer));
+    if (n < 0 && errno == EINTR) continue;
+    if (n < 0) fail();
+    if (n == 0) break;
+    content.append(buffer, static_cast<std::size_t>(n));
+    if (content.size() > kMaxCommandSize) fail();
+  }
+  return content;
+}
+
 std::string unescape_command_data(std::string_view text) {
   return replace_sequence(std::string(text), {{"%0D", "\r"}, {"%0A", "\n"}, {"%25", "%"}});
 }
@@ -86,7 +133,7 @@ std::optional<WorkflowCommand> parse_workflow_command(std::string_view line) {
       for (const auto& prop : util::split(util::trim(info.substr(space + 1)), ',')) {
         if (prop.empty()) continue;
         const auto eq = prop.find('=');
-        if (eq == std::string::npos || eq == 0 || eq + 1 == prop.size()) continue;
+        if (eq == std::string::npos || eq == 0) continue;
         cmd.properties[prop.substr(0, eq)] = unescape_command_property(prop.substr(eq + 1));
       }
     }

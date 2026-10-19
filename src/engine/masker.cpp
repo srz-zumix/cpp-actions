@@ -44,6 +44,7 @@ void Masker::add_one(std::string value) {
 }
 
 void Masker::add(std::string_view value) {
+  if (util::trim(value).empty()) return;
   std::lock_guard lock(mutex_);
   add_one(std::string(value));
   if (value.find_first_of("\r\n") != std::string_view::npos) {

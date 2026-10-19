@@ -76,9 +76,13 @@ Value with_fields(const Value& base, const std::vector<std::pair<std::string, Va
   return out;
 }
 
-std::optional<std::chrono::milliseconds> minutes_to_ms(double minutes) {
-  if (!(minutes > 0) || !std::isfinite(minutes)) return std::nullopt;
-  return std::chrono::milliseconds(static_cast<std::int64_t>(minutes * 60000.0));
+std::chrono::milliseconds minutes_to_ms(double minutes) {
+  const double milliseconds = minutes * 60000.0;
+  const auto maximum = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::duration::max() / 2).count();
+  if (!(minutes > 0) || !std::isfinite(milliseconds) || milliseconds >= static_cast<double>(maximum)) {
+    throw EvaluationError("'timeout-minutes' must be a finite positive number within the supported duration range");
+  }
+  return std::chrono::milliseconds(std::max<std::int64_t>(1, static_cast<std::int64_t>(milliseconds)));
 }
 
 struct StepScope {
@@ -233,8 +237,6 @@ class JobRunner {
   bool timed_out_ = false;
   bool running_post_ = false;
   std::unique_ptr<sandbox::Sandbox> sandbox_;
-  std::mutex pgid_mutex_;
-  std::vector<pid_t> pgids_;
   std::vector<PostStep> post_steps_;
   std::vector<std::unique_ptr<actions::Action>> loaded_actions_;
   std::vector<std::unique_ptr<StepScope>> composite_scopes_;
@@ -247,21 +249,22 @@ class JobRunner {
 
 void JobRunner::create_directories() {
   const auto key = sanitize_key(inst_.key);
-  job_dir_ = run_.options.run_dir / "jobs" / key;
-  control_dir_ = run_.options.run_dir / "control" / key;
+  job_dir_ = run_.options.run_dir / "jobs" / wr_.run_id / key;
+  control_dir_ = run_.options.run_dir / "control" / wr_.run_id / key;
   const std::string repo_name = run_.repository.substr(run_.repository.find('/') + 1);
   work_root_ = job_dir_ / "work";
   workspace_ = work_root_ / repo_name / repo_name;
   temp_ = work_root_ / "_temp";
   home_ = job_dir_ / "home";
   tmp_ = job_dir_ / "tmp";
-  file_commands_dir_ = temp_ / "_runner_file_commands";
+  file_commands_dir_ = job_dir_ / "file_commands";
   event_path_ = temp_ / "_github_workflow" / "event.json";
   tool_cache_ = run_.options.cache_dir / "toolcache";
   util::remove_tree(job_dir_);
   util::remove_tree(control_dir_);
   fs::create_directories(control_dir_);
-  for (const auto& d : {workspace_, temp_, home_, tmp_, file_commands_dir_, event_path_.parent_path(), tool_cache_}) {
+  for (const auto& d : {workspace_, temp_, home_, tmp_, file_commands_dir_, event_path_.parent_path(), tool_cache_,
+                        job_dir_ / "scripts"}) {
     fs::create_directories(d);
   }
   // Canonical paths (e.g. /var -> /private/var on macOS) for the sandbox rules.
@@ -272,10 +275,10 @@ void JobRunner::create_directories() {
   temp_ = work_root_ / "_temp";
   home_ = job_dir_ / "home";
   tmp_ = job_dir_ / "tmp";
-  file_commands_dir_ = temp_ / "_runner_file_commands";
+  file_commands_dir_ = job_dir_ / "file_commands";
   event_path_ = temp_ / "_github_workflow" / "event.json";
   tool_cache_ = util::real_path(tool_cache_);
-  const auto control_root = control_dir_.parent_path();
+  const auto control_root = util::real_path(run_.options.run_dir / "control");
   for (const auto& d : {workspace_, temp_, home_, tmp_, tool_cache_,
                         run_.options.cache_dir / "cache" / run_.repository, wr_.artifacts}) {
     const auto allocated = util::real_path(d);
@@ -297,9 +300,8 @@ void JobRunner::build_base_environment() {
 #else
   base_env_["LANG"] = "C.UTF-8";
 #endif
-  for (const char* name : {"USER", "LOGNAME"}) {
-    if (auto it = host.find(name); it != host.end()) base_env_[name] = it->second;
-  }
+  base_env_["USER"] = "runner";
+  base_env_["LOGNAME"] = "runner";
   base_env_["SHELL"] = "/bin/bash";
   base_env_["CI"] = "true";
   for (const auto& entry : run_.options.pass_env) {
@@ -359,7 +361,7 @@ bool JobRunner::evaluate_job_settings() {
   if (job_.timeout_minutes != nullptr) {
     timeout_minutes_ = evaluate_token(job_.timeout_minutes, ctx, general, wf_.file).to_number();
   }
-  if (auto ms = minutes_to_ms(timeout_minutes_)) deadline_ = started_ + *ms;
+  deadline_ = started_ + minutes_to_ms(timeout_minutes_);
   if (job_.continue_on_error != nullptr) {
     continue_on_error_ = evaluate_token(job_.continue_on_error, ctx, general, wf_.file).truthy();
     report_.continue_on_error = continue_on_error_;
@@ -381,10 +383,9 @@ void JobRunner::start_sandbox() {
     return;
   }
   sandbox::SandboxConfig config;
-  config.write = {workspace_, temp_, home_, tmp_, tool_cache_};
-  for (const auto& d : sandbox::darwin_user_dirs()) config.write.push_back(d);
+  config.write = {workspace_, temp_, home_, tmp_, file_commands_dir_, tool_cache_};
   for (const auto& d : run_.options.sandbox.allow_write) config.write.push_back(d);
-  const auto control_root = control_dir_.parent_path();
+  const auto control_root = util::real_path(run_.options.run_dir / "control");
   for (const auto& d : config.write) {
     const auto writable = util::real_path(d);
     if (util::is_subpath(control_root, writable) || util::is_subpath(writable, control_root)) {
@@ -396,7 +397,7 @@ void JobRunner::start_sandbox() {
   const auto node_dir = run_.options.cache_dir / "node";
   fs::create_directories(actions_dir);
   fs::create_directories(node_dir);
-  config.read = {actions_dir, node_dir};
+  config.read = {actions_dir, node_dir, job_dir_ / "scripts"};
   for (const auto& d : run_.options.sandbox.allow_read) config.read.push_back(d);
   config.allow_hosts = run_.options.sandbox.allow_hosts;
   config.allow_localhost = run_.options.sandbox.allow_localhost;
@@ -425,7 +426,7 @@ void JobRunner::prefetch_actions() {
 bool JobRunner::setup() {
   create_directories();
   build_base_environment();
-  report_.log_file = (run_.options.run_dir / "logs" / (sanitize_key(inst_.key) + ".log")).string();
+  report_.log_file = (run_.options.run_dir / "logs" / wr_.run_id / (sanitize_key(inst_.key) + ".log")).string();
   log_ = std::make_unique<JobLog>(run_.console, run_.masker, inst_.name, report_.log_file, run_.options.debug);
   log_->info("Set up job", Color::Bold);
 
@@ -479,7 +480,7 @@ expr::EvalContext JobRunner::make_context(const StepScope& scope, const StringMa
   c.set("vars", vars_);
   c.set("secrets", secrets_);
   auto job = Value::object();
-  job.set("status", current_status(nullptr));
+  job.set("status", current_status(&scope));
   c.set("job", job);
   c.set("steps", scope.steps);
   c.set("runner", runner_ctx_);
@@ -518,6 +519,9 @@ void JobRunner::record_step(StepScope& scope, const workflow::Step& step, StepRe
     scope.steps.set(step.id, entry);
   }
   if (report.conclusion == "failure") scope.status = "failure";
+  report.name = run_.masker.mask(report.name);
+  report.error = run_.masker.mask(report.error);
+  for (auto& [key, value] : report.outputs) value = run_.masker.mask(value);
   report_.steps.push_back(std::move(report));
 }
 
@@ -611,6 +615,10 @@ StepResult JobRunner::run_script(StepScope& scope, const workflow::Step& step, e
                                  const StringMap& env, std::optional<std::chrono::milliseconds> timeout,
                                  bool after_cancel) {
   const auto general = scope_for(scope.general_site);
+  const auto files = prepare_file_commands();
+  ctx.contexts.set("github", with_fields(ctx.contexts.get("github"),
+                                        {{"action", step.id}, {"env", files.env.string()},
+                                         {"path", files.path.string()}}));
   const auto body = evaluate_string(step.run, ctx, general, scope.file);
   std::string shell_name;
   std::string working_directory;
@@ -633,7 +641,6 @@ StepResult JobRunner::run_script(StepScope& scope, const workflow::Step& step, e
       }
     }
   }
-  const auto files = prepare_file_commands();
   auto process_env = step_environment(env, files, scope, step.id);
   const auto shell = resolve_shell(shell_name, process_env["PATH"]);
   fs::path cwd = workspace_;
@@ -652,7 +659,7 @@ StepResult JobRunner::run_script(StepScope& scope, const workflow::Step& step, e
     log_->error(r.error);
     return r;
   }
-  const auto script = temp_ / (util::random_uuid() + shell.extension);
+  const auto script = job_dir_ / "scripts" / (util::random_uuid() + shell.extension);
   util::write_file(script, shell.script(body));
   return execute(shell.argv(script), std::move(process_env), cwd, timeout, after_cancel, files, nullptr);
 }
@@ -717,12 +724,16 @@ actions::BuiltinContext JobRunner::builtin_context() {
   bc.writable = {workspace_, temp_, home_, tmp_, tool_cache_, file_commands_dir_};
   for (const auto& d : run_.options.sandbox.allow_write) {
     const auto writable = util::real_path(d);
-    const auto control_root = control_dir_.parent_path();
+    const auto control_root = util::real_path(run_.options.run_dir / "control");
     if (util::is_subpath(control_root, writable) || util::is_subpath(writable, control_root)) {
       throw EvaluationError("Writable builtin path overlaps the protected job control directory: " +
                             writable.string());
     }
     bc.writable.push_back(writable);
+  }
+  if (run_.options.sandbox.enabled) {
+    bc.readable = bc.writable;
+    for (const auto& d : run_.options.sandbox.allow_read) bc.readable.push_back(util::real_path(d));
   }
   bc.cache_store = run_.options.cache_dir / "cache" / run_.repository;
   bc.artifact_store = wr_.artifacts;
@@ -1047,6 +1058,8 @@ util::Environment JobRunner::step_environment(const StringMap& env, const FileCo
   if (run_.options.debug) out["RUNNER_DEBUG"] = "1";
   if (scope.composite || !scope.action_path.empty()) out["GITHUB_ACTION_PATH"] = scope.action_path.string();
   if (sandbox_) {
+    out["HOME"] = home_.string();
+    out["TMPDIR"] = tmp_.string();
     for (const auto& [k, v] : sandbox_->environment()) out[k] = v;
   }
   return out;
@@ -1074,12 +1087,16 @@ StepResult JobRunner::execute(std::vector<std::string> argv, util::Environment e
   spec.cwd = cwd;
   spec.timeout = timeout;
   spec.cancel = after_cancel ? &inst_.force : &inst_.cancel;
+  spec.force_cancel = &inst_.force;
   spec.on_line = [&](std::string_view line, bool) { handle_line(line, cs); };
-  spec.on_spawn = [this](pid_t pgid) {
-    std::lock_guard lock(pgid_mutex_);
-    pgids_.push_back(pgid);
-  };
+  struct ProcessGroupGuard {
+    pid_t pgid = 0;
+    ~ProcessGroupGuard() { util::kill_process_group(pgid); }
+  } process_group;
+  spec.on_spawn = [&](pid_t pgid) { process_group.pgid = pgid; };
   const auto pr = util::run_process(spec);
+  util::kill_process_group(process_group.pgid);
+  process_group.pgid = 0;
   stop_token_.clear();
   echo_ = false;
   if (pr.spawn_failed) {
@@ -1122,22 +1139,22 @@ StepResult JobRunner::execute(std::vector<std::string> argv, util::Environment e
 
 void JobRunner::process_file_commands(const FileCommands& files, StepResult& result, StringMap* state) {
   try {
-    for (const auto& [k, v] : parse_key_value_file(util::read_file(files.env))) {
+    for (const auto& [k, v] : parse_key_value_file(read_command_file(files.env))) {
       if (util::iequals(k, "NODE_OPTIONS")) {
         log_->warning("Can't store NODE_OPTIONS output parameter using '$GITHUB_ENV' command.");
         continue;
       }
       global_env_[k] = v;
     }
-    for (const auto& [k, v] : parse_key_value_file(util::read_file(files.output))) result.outputs[k] = v;
-    for (const auto& p : parse_path_file(util::read_file(files.path))) {
+    for (const auto& [k, v] : parse_key_value_file(read_command_file(files.output))) result.outputs[k] = v;
+    for (const auto& p : parse_path_file(read_command_file(files.path))) {
       std::erase(path_prepend_, p);
       path_prepend_.push_back(p);
     }
-    for (const auto& [k, v] : parse_key_value_file(util::read_file(files.state))) {
+    for (const auto& [k, v] : parse_key_value_file(read_command_file(files.state))) {
       if (state != nullptr) (*state)[k] = v;
     }
-    const auto summary = util::read_file(files.summary);
+    const auto summary = read_command_file(files.summary);
     if (summary.size() > kMaxSummarySize) {
       const std::string message = "$GITHUB_STEP_SUMMARY upload aborted, supports content up to a size of 1024k, got " +
                                   std::to_string(summary.size() / 1024) + "k.";
@@ -1167,8 +1184,8 @@ void JobRunner::annotate(const std::string& level, const WorkflowCommand& cmd) {
     return it != cmd.properties.end() ? it->second : std::string();
   };
   auto num = [&](const char* name) { return static_cast<int>(util::parse_int(prop(name)).value_or(0)); };
-  a.title = prop("title");
-  a.file = prop("file");
+  a.title = run_.masker.mask(prop("title"));
+  a.file = run_.masker.mask(prop("file"));
   a.line = num("line");
   a.end_line = num("endLine");
   a.column = num("col");
@@ -1270,12 +1287,6 @@ void JobRunner::evaluate_outputs() {
 }
 
 void JobRunner::finish() {
-  {
-    std::lock_guard lock(pgid_mutex_);
-    for (const auto pgid : pgids_) {
-      if (util::process_group_alive(pgid)) util::kill_process_group(pgid);
-    }
-  }
   sandbox_.reset();
   if (!run_.options.keep_workdir && !job_dir_.empty()) {
     try {
@@ -1425,19 +1436,23 @@ std::string sanitize_key(std::string_view key) {
   }
   while (!out.empty() && (out.back() == '_' || out.back() == '.')) out.pop_back();
   if (out.empty()) out = "job";
-  if (out.size() > 100) out = out.substr(0, 80) + "-" + util::sha256_hex(key).substr(0, 16);
-  return out;
+  return out.substr(0, 32) + "-" + util::sha256_hex(key);
 }
 
 std::string hash_files(const fs::path& root, const std::vector<std::string>& patterns) {
+  const auto canonical_root = util::real_path(root);
+  if (canonical_root != fs::absolute(root).lexically_normal()) return {};
   const auto files = util::glob_files(root, patterns);
   if (files.empty()) return {};
   util::Sha256 h;
+  bool matched = false;
   for (const auto& f : files) {
+    if (!util::is_subpath(util::real_path(f), canonical_root)) continue;
     const auto d = util::sha256_file(f);
     h.update(d.data(), d.size());
+    matched = true;
   }
-  return util::Sha256::hex(h.digest());
+  return matched ? util::Sha256::hex(h.digest()) : std::string{};
 }
 
 std::function<bool(std::string_view)> job_status_functions(const JobStatus& status) {

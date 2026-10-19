@@ -2,16 +2,21 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
+#include <cerrno>
 #include <chrono>
 #include <csignal>
+#include <unistd.h>
 #include <cstdlib>
 #include <iostream>
+#include <system_error>
 #include <thread>
 
 #include "config/config.hpp"
 #include "engine/catalog.hpp"
 #include "engine/event.hpp"
 #include "engine/runner.hpp"
+#include "sandbox/sandbox.hpp"
 #include "util/fs.hpp"
 #include "util/strings.hpp"
 #include "workspace/git.hpp"
@@ -52,7 +57,7 @@ std::map<std::string, std::string> parse_assignments(const std::vector<std::stri
   std::map<std::string, std::string> out;
   for (const auto& item : items) {
     auto [name, value] = config::split_assignment(item);
-    if (name.empty() || !value) throw std::runtime_error(std::string(what) + " must be NAME=VALUE: '" + item + "'");
+    if (name.empty() || !value) throw std::runtime_error(std::string(what) + " must be NAME=VALUE");
     out[name] = *value;
   }
   return out;
@@ -109,43 +114,132 @@ int cmd_graph(const CommonOptions& o, const std::vector<std::string>& selectors,
 struct RunCli {
   CommonOptions common;
   engine::EventOptions event;
-  engine::RunOptions execution;
   std::vector<std::string> inputs;
-  std::vector<std::string> secrets;
-  std::vector<std::string> vars;
   std::vector<std::string> matrix;
-  fs::path secrets_file;
-  fs::path vars_file;
   std::vector<std::string> selectors;
-  bool dry_run = false;
+  engine::RunOptions options;
+  std::string config_path;
+  std::vector<std::string> allow_read;
+  std::vector<std::string> secrets;
+  std::vector<std::string> secret_files;
+  std::vector<std::string> vars;
+  std::vector<std::string> var_files;
+  int parallel = -1;
   bool no_sandbox = false;
+  bool dry_run = false;
   bool no_needs = false;
+  bool no_color = false;
 };
 
+std::atomic<unsigned> signal_requests{0};
 static_assert(std::atomic<unsigned>::is_always_lock_free);
-std::atomic<unsigned> interrupt_count{0};
 
-void handle_interrupt(int) {
-  if (interrupt_count.load(std::memory_order_relaxed) < 2) {
-    interrupt_count.fetch_add(1, std::memory_order_relaxed);
-  }
-}
+void request_cancel(int) { signal_requests.fetch_add(1, std::memory_order_relaxed); }
 
-class InterruptHandler {
+// Runner::cancel takes locks; only the watcher, never the signal handler, calls it.
+class SignalHandlers {
  public:
-  InterruptHandler() {
-    interrupt_count.store(0, std::memory_order_relaxed);
-    previous_ = std::signal(SIGINT, handle_interrupt);
-    if (previous_ == SIG_ERR) throw std::runtime_error("cannot install Ctrl-C handler");
+  SignalHandlers() {
+    signal_requests.store(0, std::memory_order_relaxed);
+    struct sigaction action {};
+    action.sa_handler = request_cancel;
+    sigemptyset(&action.sa_mask);
+    sigaddset(&action.sa_mask, SIGINT);
+    sigaddset(&action.sa_mask, SIGTERM);
+    if (sigaction(SIGINT, &action, &old_int_) != 0) {
+      throw std::system_error(errno, std::generic_category(), "install SIGINT handler");
+    }
+    if (sigaction(SIGTERM, &action, &old_term_) != 0) {
+      const auto error = errno;
+      sigaction(SIGINT, &old_int_, nullptr);
+      throw std::system_error(error, std::generic_category(), "install SIGTERM handler");
+    }
   }
-  ~InterruptHandler() { std::signal(SIGINT, previous_); }
-  InterruptHandler(const InterruptHandler&) = delete;
-  InterruptHandler& operator=(const InterruptHandler&) = delete;
+  ~SignalHandlers() {
+    sigaction(SIGTERM, &old_term_, nullptr);
+    sigaction(SIGINT, &old_int_, nullptr);
+  }
+  SignalHandlers(const SignalHandlers&) = delete;
+  SignalHandlers& operator=(const SignalHandlers&) = delete;
 
  private:
-  using Handler = void (*)(int);
-  Handler previous_ = SIG_DFL;
+  struct sigaction old_int_ {};
+  struct sigaction old_term_ {};
 };
+
+engine::RunOptions run_options(const RunCli& o, const fs::path& root) {
+  auto options = o.options;
+  const bool explicit_config = !o.config_path.empty();
+  const auto config_path = explicit_config ? config::expand_user(o.config_path) : config::default_config_path();
+  config::Config cfg;
+  if (explicit_config || fs::exists(config_path)) {
+    if (!explicit_config && util::is_subpath(util::real_path(config_path), root)) {
+      throw std::runtime_error("automatic configuration is inside the repository; use --config to trust it explicitly");
+    }
+    cfg = config::load_config(config_path);
+  }
+  const auto config_dir = fs::absolute(config_path).parent_path();
+  auto config_file = [&](std::string_view value) {
+    auto path = config::expand_user(value);
+    return (path.is_absolute() ? path : config_dir / path).lexically_normal();
+  };
+  options.sandbox.enabled = !o.no_sandbox;
+  options.sandbox.allow_hosts.insert(options.sandbox.allow_hosts.begin(), cfg.allow_hosts.begin(),
+                                     cfg.allow_hosts.end());
+  for (const auto& path : cfg.allow_read) options.sandbox.allow_read.push_back(config_file(path));
+  for (const auto& path : o.allow_read) options.sandbox.allow_read.push_back(config::expand_user(path));
+  for (auto& path : options.sandbox.allow_write) path = config::expand_user(path.string());
+  for (const auto& path : cfg.allow_write) options.sandbox.allow_write.push_back(config_file(path));
+  options.sandbox.allow_localhost = options.sandbox.allow_localhost || cfg.allow_localhost.value_or(false);
+  options.pass_env.insert(options.pass_env.begin(), cfg.pass_env.begin(), cfg.pass_env.end());
+  options.host_labels.insert(options.host_labels.begin(), cfg.host_labels.begin(), cfg.host_labels.end());
+  options.parallel = o.parallel >= 0 ? o.parallel : cfg.parallel.value_or(0);
+  if (options.cache_dir.empty() && !cfg.cache_dir.empty()) options.cache_dir = config_file(cfg.cache_dir);
+  if (!options.cache_dir.empty()) options.cache_dir = config::expand_user(options.cache_dir.string());
+  if (!options.run_dir.empty()) options.run_dir = config::expand_user(options.run_dir.string());
+  if (options.node.empty() && !cfg.node.empty()) options.node = config_file(cfg.node);
+  if (!options.node.empty()) options.node = config::expand_user(options.node.string());
+  options.with_needs = !o.no_needs;
+  options.matrix = parse_assignments(o.matrix, "--matrix");
+  options.environments = cfg.environments;
+  for (auto& [name, env] : options.environments) {
+    (void)name;
+    if (!env.secrets_file.empty()) env.secrets_file = config_file(env.secrets_file).string();
+    if (!env.vars_file.empty()) env.vars_file = config_file(env.vars_file).string();
+  }
+  auto load_values = [](auto& values, const fs::path& path) {
+    for (const auto& [key, value] : config::load_dotenv(path)) values[key] = value;
+  };
+  if (!cfg.secrets_file.empty()) load_values(options.secrets, config_file(cfg.secrets_file));
+  for (const auto& path : o.secret_files) load_values(options.secrets, config::expand_user(path));
+  for (const auto& item : o.secrets) {
+    const auto [name, value] = config::split_assignment(item);
+    if (name.empty()) throw std::runtime_error("--secret must be NAME=VALUE or NAME");
+    if (value) {
+      options.secrets[name] = *value;
+    } else if (const auto* host_value = std::getenv(name.c_str())) {
+      options.secrets[name] = host_value;
+    } else {
+      throw std::runtime_error("environment variable for --secret '" + name + "' is not set");
+    }
+  }
+  if (const auto it = options.secrets.find("GITHUB_TOKEN");
+      options.github_token.empty() && it != options.secrets.end()) {
+    options.github_token = it->second;
+  }
+  if (!cfg.vars_file.empty()) load_values(options.vars, config_file(cfg.vars_file));
+  for (const auto& [key, value] : cfg.vars) options.vars[key] = value;
+  for (const auto& path : o.var_files) load_values(options.vars, config::expand_user(path));
+  for (const auto& [key, value] : parse_assignments(o.vars, "--var")) options.vars[key] = value;
+  for (const auto& item : options.pass_env) {
+    const auto name = config::split_assignment(item).first;
+    if (name.empty() || !(std::isalpha(static_cast<unsigned char>(name[0])) || name[0] == '_') ||
+        !std::all_of(name.begin(), name.end(), [](unsigned char c) { return std::isalnum(c) || c == '_'; })) {
+      throw std::runtime_error("--pass-env requires a valid environment variable name");
+    }
+  }
+  return options;
+}
 
 int cmd_run(RunCli& o) {
   const auto root = repository_root(o.common);
@@ -153,7 +247,26 @@ int cmd_run(RunCli& o) {
   const auto git = workspace::read_git_info(root);
   const auto event = engine::build_event(o.event, git);
   const auto selection = engine::select_workflows(files, event.info, o.selectors);
-  const auto inputs = parse_assignments(o.inputs, "--input");
+  if (!o.dry_run) {
+    for (const auto& selected : selection) {
+      if (!selected.file->valid()) {
+        throw std::runtime_error(selected.file->display + ": invalid workflow (run 'cpp-actions validate')");
+      }
+    }
+  }
+  auto inputs = parse_assignments(o.inputs, "--input");
+  if (event.info.name == "workflow_dispatch") {
+    const auto payload_inputs = event.info.payload.get("inputs");
+    if (!payload_inputs.is_null()) {
+      if (!payload_inputs.is_object()) throw engine::EventError("event.inputs must be an object");
+      for (const auto& [name, value] : payload_inputs.object_data().entries()) {
+        if (!value.is_string() && !value.is_bool() && !value.is_number()) {
+          throw engine::EventError("event.inputs values must be strings, booleans or numbers");
+        }
+        inputs.try_emplace(name, value.to_string());
+      }
+    }
+  }
   std::cout << engine::render_event(event);
   std::size_t triggered = 0;
   for (const auto& s : selection) {
@@ -171,29 +284,31 @@ int cmd_run(RunCli& o) {
   }
   if (triggered == 0) std::cout << "\nNo workflow is triggered by '" << event.info.name << "'.\n";
   if (o.dry_run || triggered == 0) return 0;
-
-  auto& options = o.execution;
+  auto options = run_options(o, root);
   options.inputs = inputs;
-  if (!o.secrets_file.empty()) options.secrets = config::load_dotenv(o.secrets_file);
-  for (const auto& [name, value] : parse_assignments(o.secrets, "--secret")) options.secrets[name] = value;
-  if (!o.vars_file.empty()) options.vars = config::load_dotenv(o.vars_file);
-  for (const auto& [name, value] : parse_assignments(o.vars, "--var")) options.vars[name] = value;
-  options.matrix = parse_assignments(o.matrix, "--matrix");
-  for (const auto& entry : options.pass_env) {
-    if (config::split_assignment(entry).first.empty()) {
-      throw std::runtime_error("--env must be NAME or NAME=VALUE");
+  if (options.sandbox.enabled) {
+    std::string reason;
+    if (!sandbox::supported(&reason)) {
+      throw std::runtime_error(reason + "; refusing execution (use --no-sandbox only for trusted local debugging)");
     }
+  } else {
+    std::cerr << "WARNING: --no-sandbox disables filesystem and network isolation. "
+                 "Workflow code can access host files, credentials and network services.\n";
   }
-  options.sandbox.enabled = !o.no_sandbox;
-  options.with_needs = !o.no_needs;
-  engine::Console console(std::cout, false);
-  engine::Runner runner(options, console);
-  InterruptHandler interrupts;
-  // Runner::cancel takes locks; forward signals on a normal thread, never in the handler.
-  std::jthread cancellation([&runner](std::stop_token stop) {
+  engine::Masker masker;
+  for (const auto& [name, value] : options.secrets) {
+    (void)name;
+    masker.add(value);
+  }
+  engine::Console console(std::cout, !o.no_color && std::getenv("NO_COLOR") == nullptr && ::isatty(STDOUT_FILENO));
+  masker.add(options.github_token);
+  engine::Runner runner(std::move(options), console);
+  SignalHandlers handlers;
+  std::jthread watcher([&runner](std::stop_token stop) {
     unsigned handled = 0;
     while (!stop.stop_requested()) {
-      while (handled < interrupt_count.load(std::memory_order_relaxed)) {
+      const auto requested = signal_requests.load(std::memory_order_relaxed);
+      while (handled < requested) {
         runner.cancel();
         ++handled;
       }
@@ -201,12 +316,18 @@ int cmd_run(RunCli& o) {
     }
   });
   const auto report = runner.run(selection, event, git);
-  cancellation.request_stop();
-  cancellation.join();
-  std::cout << "\nResult: " << report.result << "\nReport: " << (fs::path(report.run_dir) / "report.json").string()
-            << "\n";
-  if (report.result == "failure") return 1;
-  return report.result == "cancelled" || interrupt_count.load(std::memory_order_relaxed) != 0 ? 130 : 0;
+  watcher.request_stop();
+  watcher.join();
+  console.line("\nResult: " + report.result + " (" + util::format_duration_ms(report.duration_ms) + ")");
+  for (const auto& workflow : report.workflows) {
+    for (const auto& job : workflow.jobs) {
+      console.line(masker.mask("  " + workflow.name + " / " + job.name + ": " + job.result));
+      if (!job.summary.empty()) console.line(masker.mask(job.summary));
+    }
+  }
+  console.line("Logs and report: " + report.run_dir);
+  if (signal_requests.load(std::memory_order_relaxed) != 0 || report.result == "cancelled") return 130;
+  return report.result == "failure" ? 1 : 0;
 }
 
 }  // namespace
@@ -247,29 +368,33 @@ int main(int argc, char** argv) {
   run->add_option("-i,--input", run_opts.inputs, "workflow_dispatch input (NAME=VALUE)");
   run->add_option("-w,--workflow", run_opts.selectors, "Workflow to run (path, file name or name)");
   run->add_flag("-n,--dry-run", run_opts.dry_run, "Show what would run without running it");
-  run->add_option("--node", run_opts.execution.node, "Node executable for JavaScript actions");
-  run->add_option("--cache-dir", run_opts.execution.cache_dir, "Shared action and dependency cache directory");
-  run->add_option("--run-dir", run_opts.execution.run_dir, "Run directory containing logs, artifacts and report.json");
-  run->add_flag("--keep-workdir", run_opts.execution.keep_workdir, "Keep job workspaces after execution");
-  run->add_flag("--no-sandbox", run_opts.no_sandbox, "Disable sandbox isolation (unsafe; trusted workflows only)");
-  run->add_option("--host-label", run_opts.execution.host_labels,
-                  "Additional runs-on label to execute on this host (e.g. ubuntu-latest for Linux development)");
-  run->add_option("-j,--job", run_opts.execution.jobs, "Job id to run (includes dependencies by default)");
+  run->add_option("--node", run_opts.options.node, "Node executable for JavaScript actions");
+  run->add_option("-j,--job", run_opts.options.jobs, "Job id to run (includes dependencies by default)");
   run->add_flag("--no-needs", run_opts.no_needs, "Do not run dependencies of the selected jobs");
   run->add_option("--matrix", run_opts.matrix, "Matrix filter (NAME=VALUE)");
-  run->add_option("--parallel", run_opts.execution.parallel, "Concurrent jobs (0 = number of CPUs)")
-      ->check(CLI::NonNegativeNumber);
-  run->add_option("--env", run_opts.execution.pass_env, "Explicit host environment variable (NAME or NAME=VALUE)");
-  run->add_option("--secret", run_opts.secrets, "Secret (NAME=VALUE; prefer --secrets-file for sensitive values)");
-  run->add_option("--secrets-file", run_opts.secrets_file, "Explicit dotenv file containing secrets");
-  run->add_option("--var", run_opts.vars, "Repository variable (NAME=VALUE)");
-  run->add_option("--vars-file", run_opts.vars_file, "Explicit dotenv file containing repository variables");
-  run->add_option("--github-token,--token", run_opts.execution.github_token, "Explicit GitHub API token");
-  run->add_option("--allow-host", run_opts.execution.sandbox.allow_hosts, "Additional sandbox network host");
-  run->add_option("--allow-read", run_opts.execution.sandbox.allow_read, "Additional sandbox readable path");
-  run->add_option("--allow-write", run_opts.execution.sandbox.allow_write, "Additional sandbox writable path");
-  run->add_flag("--allow-localhost", run_opts.execution.sandbox.allow_localhost, "Allow sandbox localhost access");
-  run->add_flag("--debug", run_opts.execution.debug, "Enable debug job logging");
+  run->add_option("--github-token,--token", run_opts.options.github_token, "Explicit GitHub API token");
+  run->add_option("--allow-write", run_opts.options.sandbox.allow_write, "Additional sandbox writable path");
+  run->add_flag("--allow-localhost", run_opts.options.sandbox.allow_localhost, "Allow sandbox localhost access");
+  run->add_option("--config", run_opts.config_path,
+                  "Explicit trusted configuration file (never auto-load repository config)");
+  run->add_flag("--no-sandbox", run_opts.no_sandbox, "DANGER: disable filesystem and network isolation");
+  run->add_option("--allow-host", run_opts.options.sandbox.allow_hosts, "Additional allowed network host (repeatable)");
+  run->add_option("--allow-read", run_opts.allow_read, "Additional readable host path (repeatable)");
+  run->add_option("--pass-env,--env-pass,--env", run_opts.options.pass_env,
+                  "Pass host variable NAME or explicit NAME=VALUE (repeatable)");
+  run->add_flag("--keep-workdir", run_opts.options.keep_workdir, "Keep job workspaces after execution");
+  run->add_option("--run-dir", run_opts.options.run_dir,
+                  "Run output directory (must not already exist; default: a unique directory under the cache)");
+  run->add_option("--cache-dir", run_opts.options.cache_dir, "Shared cache directory");
+  run->add_option("--parallel", run_opts.parallel, "Concurrent jobs (0 = CPU count)")->check(CLI::NonNegativeNumber);
+  run->add_option("--host-label", run_opts.options.host_labels,
+                  "Explicit runs-on label to execute on this host (repeatable)");
+  run->add_option("-s,--secret", run_opts.secrets, "Secret NAME from host environment or NAME=VALUE (repeatable)");
+  run->add_option("--secret-file,--secrets-file", run_opts.secret_files, "Explicit dotenv secrets file (repeatable)");
+  run->add_option("--var", run_opts.vars, "Workflow variable NAME=VALUE (repeatable)");
+  run->add_option("--var-file,--vars-file", run_opts.var_files, "Explicit dotenv variables file (repeatable)");
+  run->add_flag("--debug", run_opts.options.debug, "Show workflow debug commands");
+  run->add_flag("--no-color", run_opts.no_color, "Disable colored logs");
 
   CLI11_PARSE(app, argc, argv);
 

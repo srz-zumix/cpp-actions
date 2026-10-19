@@ -3,8 +3,7 @@
 #include <unistd.h>
 
 #include <climits>
-
-#include "util/fs.hpp"
+#include <stdexcept>
 
 namespace cpa::sandbox {
 
@@ -12,7 +11,8 @@ namespace {
 
 void append_paths(std::string& out, const std::vector<fs::path>& paths) {
   for (const auto& p : paths) {
-    out += "\n  (subpath " + sbpl_quote(util::real_path(p).string()) + ")";
+    if (p.empty()) throw std::invalid_argument("sandbox paths must not be empty");
+    out += "\n  (subpath " + sbpl_quote(fs::weakly_canonical(fs::absolute(p)).string()) + ")";
   }
 }
 
@@ -22,9 +22,12 @@ constexpr std::string_view kBase = R"((version 1)
 ; Processes
 (allow process-fork)
 (allow process-exec)
-(allow process-info*)
+(allow process-info* (target same-sandbox))
 (allow signal (target same-sandbox))
 (allow sysctl-read)
+(deny sysctl-read
+  (sysctl-name "kern.procargs")
+  (sysctl-name "kern.procargs2"))
 (allow ipc-posix*)
 (allow ipc-sysv*)
 (allow system-socket)
@@ -36,20 +39,11 @@ constexpr std::string_view kBase = R"((version 1)
 (allow mach-lookup
   (global-name "com.apple.system.opendirectoryd.libinfo")
   (global-name "com.apple.system.opendirectoryd.membership")
-  (global-name "com.apple.system.notification_center")
   (global-name "com.apple.system.logger")
   (global-name "com.apple.logd")
-  (global-name "com.apple.diagnosticd")
-  (global-name "com.apple.analyticsd")
   (global-name "com.apple.bsd.dirhelper")
-  (global-name "com.apple.cfprefsd.daemon")
-  (global-name "com.apple.cfprefsd.agent")
   (global-name "com.apple.trustd")
-  (global-name "com.apple.trustd.agent")
-  (global-name "com.apple.SystemConfiguration.configd")
-  (global-name "com.apple.CoreServices.coreservicesd")
-  (global-name "com.apple.lsd.mapdb")
-  (global-name "com.apple.xpc.activity.unmanaged"))
+  (global-name "com.apple.SystemConfiguration.configd"))
 
 ; Files: metadata everywhere, contents of the system directories only
 (allow file-read-metadata)
@@ -61,7 +55,7 @@ constexpr std::string_view kBase = R"((version 1)
   (subpath "/System")
   (subpath "/Library")
   (subpath "/Applications")
-  (subpath "/opt")
+  (subpath "/opt/homebrew")
   (subpath "/private/etc")
   (subpath "/private/var/select")
   (subpath "/private/var/db/timezone")
@@ -88,6 +82,9 @@ constexpr std::string_view kBase = R"((version 1)
 std::string sbpl_quote(std::string_view s) {
   std::string out = "\"";
   for (char c : s) {
+    if (static_cast<unsigned char>(c) < 0x20 || c == 0x7f) {
+      throw std::invalid_argument("sandbox paths must not contain control characters");
+    }
     if (c == '\\' || c == '"') out += '\\';
     out += c;
   }
@@ -108,6 +105,9 @@ std::vector<fs::path> darwin_user_dirs() {
 }
 
 std::string generate_profile(const ProfileOptions& options) {
+  if (options.proxy_port < 0 || options.proxy_port > 65535) {
+    throw std::invalid_argument("invalid sandbox proxy port");
+  }
   std::string out(kBase);
   if (!options.read.empty()) {
     out += "\n; Additional readable directories\n(allow file-read*";

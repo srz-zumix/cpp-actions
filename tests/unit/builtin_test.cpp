@@ -170,11 +170,13 @@ IUTEST_F(BuiltinTest, CacheRestoreReplacesNestedDestinationSymlinks) {
 }
 
 IUTEST_F(BuiltinTest, CacheRefusesOutsidePathsAndSymlinkedParents) {
+  ctx.readable = ctx.writable;
   cpa::util::write_file(root / "outside/file", "host");
   fs::create_directory_symlink(root / "outside", ctx.workspace / "escape");
   const Inputs inputs{{"key", "outside"}, {"path", "escape/file"}};
-  IUTEST_ASSERT_TRUE(run(Builtin::CacheSave, inputs).ok);
-  IUTEST_EXPECT_FALSE(warnings.empty());
+  const auto result = run(Builtin::CacheSave, inputs);
+  IUTEST_EXPECT_FALSE(result.ok);
+  IUTEST_EXPECT_NE(std::string::npos, result.error.find("Read denied"));
   IUTEST_EXPECT_FALSE(fs::exists(ctx.cache_store));
   IUTEST_EXPECT_EQ("host", cpa::util::read_file(root / "outside/file"));
 }
@@ -250,6 +252,7 @@ IUTEST_F(BuiltinTest, ArtifactDownloadPreservesSymlinksAndReplacesDestinationLin
 }
 
 IUTEST_F(BuiltinTest, ArtifactPathsCannotEscapeWritableRoots) {
+  ctx.readable = ctx.writable;
   cpa::util::write_file(root / "outside/file", "host");
   fs::create_directory_symlink(root / "outside", ctx.workspace / "escape");
   IUTEST_EXPECT_FALSE(run(Builtin::UploadArtifact, {{"path", "escape/file"}}).ok);

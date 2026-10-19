@@ -6,6 +6,7 @@
 #include <chrono>
 #include <mutex>
 #include <nlohmann/json.hpp>
+#include <stdexcept>
 
 #include "actions/fetch.hpp"
 #include "util/fs.hpp"
@@ -63,9 +64,21 @@ fs::path resolve_existing(const fs::path& path) {
 bool within(const fs::path& path, const std::vector<fs::path>& roots) {
   const auto real = resolve_existing(path);
   for (const auto& root : roots) {
-    if (util::is_subpath(real, root)) return true;
+    if (util::is_subpath(real, resolve_existing(root))) return true;
   }
   return false;
+}
+
+void require_readable(const fs::path& path, const BuiltinContext& ctx) {
+  if (!ctx.readable.empty() && !within(path, ctx.readable)) {
+    throw std::runtime_error("Read denied: path is outside of the readable directories: " + path.string());
+  }
+}
+
+void require_readable_tree(const fs::path& path, const BuiltinContext& ctx) {
+  require_readable(path, ctx);
+  if (ctx.readable.empty() || !fs::is_directory(fs::symlink_status(path))) return;
+  for (const auto& entry : fs::recursive_directory_iterator(path)) require_readable(entry.path(), ctx);
 }
 
 fs::path expand_path(std::string_view raw, const BuiltinContext& ctx) {
@@ -118,6 +131,8 @@ void safe_copy_tree(const fs::path& from, const fs::path& to) {
   if (fs::is_symlink(top) || (fs::exists(top) && !fs::is_directory(top))) fs::remove(to);
   fs::create_directories(to);
   for (auto it = fs::recursive_directory_iterator(from); it != fs::recursive_directory_iterator(); ++it) {
+    // Canonicalizing a source symlink here can turn its name into "../..."
+    // and redirect the destination outside the tree.
     const auto dest = to / it->path().lexically_relative(from);
     const auto dest_status = fs::symlink_status(dest, ec);
     if (it->is_directory() && !it->is_symlink()) {
@@ -172,6 +187,26 @@ BuiltinResult checkout(const Inputs& in, const BuiltinContext& ctx) {
   if (!within(target, {util::real_path(ctx.workspace)})) {
     return fail("Repository path '" + target.string() + "' is not under '" + ctx.workspace.string() + "'");
   }
+  for (auto parent = fs::absolute(target).parent_path(); parent != parent.root_path(); parent = parent.parent_path()) {
+    if (fs::is_symlink(fs::symlink_status(parent))) {
+      return fail("Checkout path has a symlinked ancestor");
+    }
+  }
+  const bool self = ctx.repository.empty() ? repository.empty() : util::iequals(repository, ctx.repository);
+  const workspace::Snapshot* snapshot_ptr = nullptr;
+  if (self || repository.empty()) {
+    snapshot_ptr = &ctx.snapshot();
+    const auto source = util::real_path(snapshot_ptr->dir);
+    const auto destination = resolve_existing(target);
+    if (util::is_subpath(source, destination) || util::is_subpath(destination, source)) {
+      return fail("Checkout path must not overlap the source snapshot");
+    }
+  } else {
+    const auto parts = util::split(repository, '/');
+    if (parts.size() != 2 || parts[0].empty() || parts[1].empty() || repository.find("..") != std::string::npos) {
+      return fail("Invalid repository '" + repository + "'. Expected format {owner}/{repo}");
+    }
+  }
   // Clean the target directory.
   std::error_code ec;
   const auto st = fs::symlink_status(target, ec);
@@ -180,10 +215,9 @@ BuiltinResult checkout(const Inputs& in, const BuiltinContext& ctx) {
   for (const auto& entry : fs::directory_iterator(target)) util::remove_tree(entry.path());
 
   BuiltinResult result;
-  const bool self = ctx.repository.empty() ? repository.empty() : util::iequals(repository, ctx.repository);
   if (self || repository.empty()) {
-    const auto& snapshot = ctx.snapshot();
-    safe_copy_tree(snapshot.dir, target);
+    const auto& snapshot = *snapshot_ptr;
+    workspace::copy_snapshot(snapshot, target);
     if (ctx.info) {
       ctx.info(std::string("Copied the working tree") + (snapshot.dirty ? " (including uncommitted changes)" : "") +
                " to " + target.string());
@@ -229,10 +263,6 @@ BuiltinResult checkout(const Inputs& in, const BuiltinContext& ctx) {
   }
 
   // Another repository: fetch it from GitHub.
-  const auto parts = util::split(repository, '/');
-  if (parts.size() != 2 || parts[0].empty() || parts[1].empty() || repository.find("..") != std::string::npos) {
-    return fail("Invalid repository '" + repository + "'. Expected format {owner}/{repo}");
-  }
   const auto token = input(in, "token", ctx.token);
   const auto env = git_token_env(token);
   const auto depth = util::parse_int(input(in, "fetch-depth", "1")).value_or(1);
@@ -342,9 +372,14 @@ std::vector<fs::path> resolve_paths(const std::vector<std::string>& lines, const
     std::error_code ec;
     if (has_glob(path.string())) {
       const auto [base, rest] = split_glob(path);
+      require_readable(base, ctx);
       if (search_roots != nullptr) search_roots->push_back(base);
-      for (const auto& f : util::glob_files(base, {rest})) result.push_back(f);
+      for (const auto& f : util::glob_files(base, {rest})) {
+        require_readable(f, ctx);
+        result.push_back(f);
+      }
     } else {
+      require_readable(path, ctx);
       if (search_roots != nullptr) {
         search_roots->push_back(fs::is_directory(fs::symlink_status(path, ec)) ? path : path.parent_path());
       }
@@ -377,6 +412,7 @@ std::vector<fs::path> resolve_paths(const std::vector<std::string>& lines, const
   }
   std::sort(result.begin(), result.end());
   result.erase(std::unique(result.begin(), result.end()), result.end());
+  for (const auto& path : result) require_readable_tree(path, ctx);
   return result;
 }
 
@@ -400,12 +436,7 @@ void restore_cache(const CacheEntry& entry, const BuiltinContext& ctx) {
 BuiltinResult save_cache(const std::string& key, const std::vector<std::string>& lines, const BuiltinContext& ctx) {
   BuiltinResult result;
   const auto version = cache_version(lines);
-  auto paths = resolve_paths(lines, ctx);
-  std::erase_if(paths, [&](const fs::path& p) {
-    if (within(p, ctx.writable)) return false;
-    if (ctx.warning) ctx.warning("Skipping path outside of the writable directories: " + p.string());
-    return true;
-  });
+  const auto paths = resolve_paths(lines, ctx);
   if (paths.empty()) {
     if (ctx.warning) {
       ctx.warning(
@@ -533,7 +564,6 @@ BuiltinResult upload_artifact(const Inputs& in, const BuiltinContext& ctx) {
   const auto root = artifact_root(roots);
   std::vector<std::pair<fs::path, fs::path>> files;  // source, relative destination
   for (const auto& p : matched) {
-    if (!within(p, ctx.writable)) return fail("Path is outside of the writable directories: " + p.string());
     std::error_code ec;
     if (fs::is_directory(fs::symlink_status(p, ec))) {
       for (auto it = fs::recursive_directory_iterator(p); it != fs::recursive_directory_iterator(); ++it) {

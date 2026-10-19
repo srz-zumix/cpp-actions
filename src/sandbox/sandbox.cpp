@@ -2,6 +2,8 @@
 
 #include <unistd.h>
 
+#include <stdexcept>
+
 #include "util/fs.hpp"
 
 namespace cpa::sandbox {
@@ -20,6 +22,16 @@ bool supported(std::string* reason) {
 }
 
 Sandbox::Sandbox(SandboxConfig config, NetworkProxy::DenyFn on_deny) : config_(std::move(config)) {
+  std::string reason;
+  if (!supported(&reason)) throw std::runtime_error("sandbox unavailable: " + reason);
+  if (config_.profile_file.empty()) throw std::invalid_argument("sandbox profile path must not be empty");
+  config_.profile_file = fs::weakly_canonical(fs::absolute(config_.profile_file));
+  const auto& profile = config_.profile_file;
+  for (const auto& path : config_.write) {
+    if (util::is_subpath(profile, fs::weakly_canonical(fs::absolute(path)))) {
+      throw std::invalid_argument("sandbox profile must be outside writable directories");
+    }
+  }
   auto hosts = default_allowed_hosts();
   hosts.insert(hosts.end(), config_.allow_hosts.begin(), config_.allow_hosts.end());
   proxy_ = std::make_unique<NetworkProxy>(std::move(hosts), std::move(on_deny));
@@ -69,6 +81,7 @@ std::map<std::string, std::string> Sandbox::environment() const {
       {"HTTP_PROXY", url},  {"HTTPS_PROXY", url}, {"http_proxy", url},
       {"https_proxy", url}, {"ALL_PROXY", url},   {"all_proxy", url},
       {"NODE_USE_ENV_PROXY", "1"},
+      {"NO_PROXY", ""}, {"no_proxy", ""},
   };
   if (config_.allow_localhost) {
     env["NO_PROXY"] = "localhost,127.0.0.1,::1";

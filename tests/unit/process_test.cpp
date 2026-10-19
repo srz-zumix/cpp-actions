@@ -53,6 +53,22 @@ IUTEST(ProcessTest, Timeout) {
   IUTEST_EXPECT_LT(elapsed, std::chrono::seconds(5));
 }
 
+IUTEST(ProcessTest, ForceCancellationSkipsSignalGracePeriod) {
+  auto spec = shell("trap '' INT TERM; echo ready; while :; do sleep 1; done");
+  std::atomic<bool> force{false};
+  spec.force_cancel = &force;
+  spec.timeout = std::chrono::seconds(5);
+  spec.on_line = [&](std::string_view line, bool) {
+    if (line == "ready") force = true;
+  };
+  const auto start = std::chrono::steady_clock::now();
+  const auto r = run_process(spec);
+  IUTEST_EXPECT_TRUE(r.cancelled);
+  IUTEST_EXPECT_FALSE(r.timed_out);
+  IUTEST_EXPECT_NE(0, r.exit_code);
+  IUTEST_EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::seconds(3));
+}
+
 IUTEST(ProcessTest, BackgroundChildDoesNotBlock) {
   auto spec = shell("sleep 5 & echo done");
   const auto start = std::chrono::steady_clock::now();

@@ -5,6 +5,7 @@
 
 #include "engine/runner.hpp"
 #include "sandbox/profile.hpp"
+#include "sandbox/sandbox.hpp"
 #include "test_support.hpp"
 
 using namespace cpa;
@@ -45,7 +46,13 @@ class ActionFixture {
     std::ostringstream out;
     Console console(out, false);
     Runner runner(options, console);
-    const auto report = runner.run(select_workflows(files, event.info, {}), event, git);
+    RunReport report;
+    try {
+      report = runner.run(select_workflows(files, event.info, {}), event, git);
+    } catch (...) {
+      log = out.str();
+      throw;
+    }
     log = out.str();
     if (report.workflows.size() != 1 || report.workflows.front().jobs.size() != 1) {
       throw std::runtime_error("Unexpected Runner report: " + log);
@@ -371,6 +378,7 @@ IUTEST(ActionRunnerTest, BuiltinDownloadsCannotWriteProtectedJobControlDirectory
 }
 
 IUTEST(ActionRunnerTest, SandboxProfilesUseSeparateProtectedControlDirectory) {
+  if (!sandbox::supported()) IUTEST_SKIP() << "Seatbelt requires macOS";
   ActionFixture f;
   for (const auto& root : sandbox::darwin_user_dirs()) {
     if (util::is_subpath(util::real_path(f.dir.path()), util::real_path(root))) {
@@ -405,6 +413,7 @@ IUTEST(ActionRunnerTest, SandboxProfilesUseSeparateProtectedControlDirectory) {
 
 IUTEST(ActionRunnerTest, RejectsWritableRootsOverlappingProtectedControls) {
   for (const bool sandbox_enabled : {false, true}) {
+    if (sandbox_enabled && !sandbox::supported()) continue;
     ActionFixture f;
     const auto job = f.run("      - run: true\n", {}, {}, [sandbox_enabled](RunOptions& options) {
       options.sandbox.enabled = sandbox_enabled;
@@ -418,7 +427,7 @@ IUTEST(ActionRunnerTest, RejectsWritableRootsOverlappingProtectedControls) {
 IUTEST(ActionRunnerTest, RejectsCacheAllocationsOverlappingProtectedControls) {
   ActionFixture f;
   const auto job = f.run("      - run: true\n", {}, {}, [](RunOptions& options) {
-    options.cache_dir = options.run_dir / "control";
+    options.run_dir = options.cache_dir / "toolcache" / "execution";
   });
   IUTEST_EXPECT_EQ("failure", job.result);
   IUTEST_EXPECT_NE(std::string::npos,
