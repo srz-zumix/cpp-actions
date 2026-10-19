@@ -211,6 +211,7 @@ class JobRunner {
   bool continue_on_error_ = false;
 
   fs::path job_dir_;
+  fs::path control_dir_;
   fs::path work_root_;
   fs::path workspace_;
   fs::path temp_;
@@ -247,6 +248,7 @@ class JobRunner {
 void JobRunner::create_directories() {
   const auto key = sanitize_key(inst_.key);
   job_dir_ = run_.options.run_dir / "jobs" / key;
+  control_dir_ = run_.options.run_dir / "control" / key;
   const std::string repo_name = run_.repository.substr(run_.repository.find('/') + 1);
   work_root_ = job_dir_ / "work";
   workspace_ = work_root_ / repo_name / repo_name;
@@ -257,11 +259,14 @@ void JobRunner::create_directories() {
   event_path_ = temp_ / "_github_workflow" / "event.json";
   tool_cache_ = run_.options.cache_dir / "toolcache";
   util::remove_tree(job_dir_);
+  util::remove_tree(control_dir_);
+  fs::create_directories(control_dir_);
   for (const auto& d : {workspace_, temp_, home_, tmp_, file_commands_dir_, event_path_.parent_path(), tool_cache_}) {
     fs::create_directories(d);
   }
   // Canonical paths (e.g. /var -> /private/var on macOS) for the sandbox rules.
   job_dir_ = util::real_path(job_dir_);
+  control_dir_ = util::real_path(control_dir_);
   work_root_ = job_dir_ / "work";
   workspace_ = work_root_ / repo_name / repo_name;
   temp_ = work_root_ / "_temp";
@@ -367,9 +372,17 @@ void JobRunner::start_sandbox() {
     return;
   }
   sandbox::SandboxConfig config;
-  config.write = {work_root_, home_, tmp_, tool_cache_};
+  config.write = {workspace_, temp_, home_, tmp_, tool_cache_};
   for (const auto& d : sandbox::darwin_user_dirs()) config.write.push_back(d);
   for (const auto& d : run_.options.sandbox.allow_write) config.write.push_back(d);
+  const auto control_root = control_dir_.parent_path();
+  for (const auto& d : config.write) {
+    const auto writable = util::real_path(d);
+    if (util::is_subpath(control_root, writable) || util::is_subpath(writable, control_root)) {
+      throw EvaluationError("Writable sandbox path overlaps the protected job control directory: " +
+                            writable.string());
+    }
+  }
   const auto actions_dir = run_.options.cache_dir / "actions";
   const auto node_dir = run_.options.cache_dir / "node";
   fs::create_directories(actions_dir);
@@ -378,7 +391,7 @@ void JobRunner::start_sandbox() {
   for (const auto& d : run_.options.sandbox.allow_read) config.read.push_back(d);
   config.allow_hosts = run_.options.sandbox.allow_hosts;
   config.allow_localhost = run_.options.sandbox.allow_localhost;
-  config.profile_file = job_dir_ / "sandbox.sb";
+  config.profile_file = control_dir_ / "sandbox.sb";
   auto* log = log_.get();
   sandbox_ = std::make_unique<sandbox::Sandbox>(config, [log](const std::string& host, int port) {
     log->warning("Blocked a connection to " + host + ":" + std::to_string(port) +
@@ -690,8 +703,16 @@ actions::BuiltinContext JobRunner::builtin_context() {
   actions::BuiltinContext bc;
   bc.workspace = workspace_;
   bc.home = home_;
-  bc.writable = {work_root_, home_, tmp_, tool_cache_};
-  for (const auto& d : run_.options.sandbox.allow_write) bc.writable.push_back(util::real_path(d));
+  bc.writable = {workspace_, temp_, home_, file_commands_dir_};
+  for (const auto& d : run_.options.sandbox.allow_write) {
+    const auto writable = util::real_path(d);
+    const auto control_root = control_dir_.parent_path();
+    if (util::is_subpath(control_root, writable) || util::is_subpath(writable, control_root)) {
+      throw EvaluationError("Writable builtin path overlaps the protected job control directory: " +
+                            writable.string());
+    }
+    bc.writable.push_back(writable);
+  }
   bc.cache_store = run_.options.cache_dir / "cache" / run_.repository;
   bc.artifact_store = wr_.artifacts;
   bc.repository = run_.repository;
@@ -831,10 +852,10 @@ StepResult JobRunner::run_node(const StepScope& scope, const std::string& step_i
     process_env["INPUT_" + util::to_upper(util::replace_all(k, " ", "_"))] = v;
   }
   for (const auto& [k, v] : state) process_env["STATE_" + k] = v;
-  // The Node.js installation must be readable in the sandbox.
-  const auto node_root = node.parent_path().parent_path();
+  // Cached installations are already readable; an explicit binary must not
+  // implicitly grant access to its parent directories (e.g. the host HOME).
   return execute({node.string(), script.string()}, std::move(process_env), workspace_, timeout, after_cancel, files,
-                 &state, {node_root});
+                 &state, {node});
 }
 
 StepResult JobRunner::run_composite(StepScope& parent, const std::string& name,
@@ -1248,6 +1269,7 @@ void JobRunner::finish() {
   if (!run_.options.keep_workdir && !job_dir_.empty()) {
     try {
       util::remove_tree(job_dir_);
+      util::remove_tree(control_dir_);
     } catch (const std::exception& e) {
       if (log_) log_->warning(std::string("Failed to remove the job directory: ") + e.what());
     }

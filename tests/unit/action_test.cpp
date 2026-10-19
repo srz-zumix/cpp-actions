@@ -1,7 +1,10 @@
 #include "iutest.hpp"
 
+#include <sstream>
+
 #include "actions/action.hpp"
 #include "actions/fetch.hpp"
+#include "engine/runner.hpp"
 #include "test_support.hpp"
 #include "util/fs.hpp"
 
@@ -78,13 +81,30 @@ outputs:
   IUTEST_EXPECT_EQ("${{ steps.inner.outputs.value }}", action.outputs.front().value->scalar_string());
 }
 
+IUTEST(ActionTest, QuotedRequiredMetadataRemainsCompatible) {
+  cpa_test::TempDir dir;
+  util::write_file(dir / "action.yml", R"(inputs:
+  yes:
+    required: 'true'
+  no:
+    required: 'false'
+runs:
+  using: node20
+  main: main.js
+)");
+  const auto action = load_action(dir.path(), "./quoted");
+  IUTEST_ASSERT_NE(nullptr, action.find_input("yes"));
+  IUTEST_ASSERT_NE(nullptr, action.find_input("no"));
+  IUTEST_EXPECT_TRUE(action.find_input("yes")->required);
+  IUTEST_EXPECT_FALSE(action.find_input("no")->required);
+}
+
 IUTEST(ActionTest, InvalidMetadata) {
   cpa_test::TempDir dir;
   for (const auto* text : {
            "[]", "runs: []", "runs: {using: node20}", "runs: {using: unknown, main: main.js}",
            "runs: {using: node20, main: [main.js]}", "runs: {using: [node20], main: main.js}",
            "inputs: {x: value}\nruns: {using: node20, main: main.js}",
-           "inputs: {x: {required: maybe}}\nruns: {using: node20, main: main.js}",
            "inputs: {x: {default: [value]}}\nruns: {using: node20, main: main.js}",
            "inputs: {x: {}, X: {}}\nruns: {using: node20, main: main.js}",
            "outputs: {x: value}\nruns: {using: node20, main: main.js}",
@@ -152,4 +172,44 @@ IUTEST(ActionFetchTest, ExplicitNode) {
   IUTEST_EXPECT_EQ(util::real_path(dir / "node"), provider.get(20, {}));
   NodeProvider missing(dir / "missing", dir / "cache");
   IUTEST_EXPECT_THROW(missing.get(24, {}), ActionError);
+}
+
+IUTEST(ActionTest, ExplicitRuntimeDoesNotExposeParentDirectory) {
+  if (!engine::host_is_macos()) IUTEST_SKIP() << "Seatbelt isolation requires macOS";
+  cpa_test::TempDir dir;
+  const auto node = dir / "private-runtime/runtime";
+  util::write_file(node, "#!/bin/sh\nexec /bin/sh \"$@\"\n");
+  util::make_executable(node);
+  util::write_file(dir / "private-runtime/marker", "host-only");
+  std::filesystem::create_directories(dir / "repo");
+  cpa_test::init_repo(dir / "repo", {
+      {".github/workflows/test.yml", R"(on: push
+jobs:
+  test:
+    runs-on: runtime-test-host
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./action
+        env:
+          MARKER: )" + (dir / "private-runtime/marker").string() + "\n"},
+      {"action/action.yml", "runs: {using: node20, main: main.js}\n"},
+      {"action/main.js", R"(if cat "$MARKER"; then exit 1; fi
+echo isolated >> "$GITHUB_STEP_SUMMARY"
+)"}});
+  const auto git = workspace::read_git_info(dir / "repo");
+  const auto event = engine::build_event({}, git);
+  const auto files = engine::load_workflow_files(git.root, {});
+  engine::RunOptions options;
+  options.node = node;
+  options.cache_dir = dir / "cache";
+  options.run_dir = dir / "run";
+  options.host_labels = {"runtime-test-host"};
+  std::ostringstream log;
+  engine::Console console(log, false);
+  engine::Runner runner(options, console);
+  const auto report = runner.run(engine::select_workflows(files, event.info, {}), event, git);
+  IUTEST_EXPECT_EQ("success", report.result) << log.str();
+  IUTEST_ASSERT_EQ(1u, report.workflows.size());
+  IUTEST_ASSERT_EQ(1u, report.workflows.front().jobs.size());
+  IUTEST_EXPECT_EQ("isolated\n", report.workflows.front().jobs.front().summary);
 }

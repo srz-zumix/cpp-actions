@@ -129,7 +129,6 @@ Action load_action(const fs::path& dir, const std::string& display) {
       if (e.value->is_mapping()) {
         if (const auto* d = e.value->get("description")) in.description = d->scalar_string();
         if (const auto* r = e.value->get("required")) {
-          if (r->kind != yaml::NodeKind::Boolean) throw fail(r, "'required' must be a boolean");
           in.required = r->kind == yaml::NodeKind::Boolean ? r->boolean : util::iequals(r->scalar_string(), "true");
         }
         in.default_value = e.value->get("default");
