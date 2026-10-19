@@ -1,14 +1,18 @@
 #include "actions/fetch.hpp"
 
 #include <sys/utsname.h>
+#include <fcntl.h>
 #include <unistd.h>
 
+#include <cerrno>
 #include <cctype>
 #include <nlohmann/json.hpp>
+#include <system_error>
 
 #include "actions/action.hpp"
 #include "util/fs.hpp"
 #include "util/process.hpp"
+#include "util/sha256.hpp"
 #include "util/strings.hpp"
 
 namespace cpa::actions {
@@ -39,14 +43,6 @@ std::string base64(std::string_view in) {
     out += kTable[(n >> 12) & 63];
     out += kTable[(n >> 6) & 63];
     out += '=';
-  }
-  return out;
-}
-
-std::string sanitize_ref(std::string_view ref) {
-  std::string out;
-  for (char c : ref) {
-    out += std::isalnum(static_cast<unsigned char>(c)) || c == '-' || c == '.' || c == '_' ? c : '_';
   }
   return out;
 }
@@ -108,7 +104,7 @@ std::optional<std::string> pick_ls_remote_sha(std::string_view output, std::stri
     refs[line.substr(tab + 1)] = line.substr(0, tab);
   }
   const std::string r(ref);
-  for (const auto& name : {"refs/tags/" + r + "^{}", "refs/tags/" + r, "refs/heads/" + r, r}) {
+  for (const auto& name : {"refs/tags/" + r + "^{}", "refs/tags/" + r, "refs/heads/" + r, r + "^{}", r}) {
     auto it = refs.find(name);
     if (it != refs.end() && is_commit_sha(it->second)) return it->second;
   }
@@ -138,9 +134,29 @@ std::map<std::string, std::string> git_token_env(const std::string& token) {
 }
 
 fs::path write_curl_auth_config(const fs::path& dir, const std::string& token) {
+  std::string escaped;
+  for (char c : token) {
+    if (std::iscntrl(static_cast<unsigned char>(c))) throw ActionError("Invalid character in GitHub token");
+    if (c == '"' || c == '\\') escaped += '\\';
+    escaped += c;
+  }
   const auto path = dir / "curl-auth.conf";
-  util::write_file(path, "header = \"Authorization: Bearer " + token + "\"\n");
-  fs::permissions(path, fs::perms::owner_read | fs::perms::owner_write, fs::perm_options::replace);
+  const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+  if (fd < 0) throw std::system_error(errno, std::generic_category(), "Creating curl auth config");
+  const auto content = "header = \"Authorization: Bearer " + escaped + "\"\n";
+  std::size_t written = 0;
+  while (written < content.size()) {
+    const auto count = ::write(fd, content.data() + written, content.size() - written);
+    if (count < 0 && errno == EINTR) continue;
+    if (count <= 0) {
+      const int error = count < 0 ? errno : EIO;
+      ::close(fd);
+      fs::remove(path);
+      throw std::system_error(error, std::generic_category(), "Writing curl auth config");
+    }
+    written += static_cast<std::size_t>(count);
+  }
+  ::close(fd);
   return path;
 }
 
@@ -149,12 +165,16 @@ RepositoryCache::RepositoryCache(fs::path root, std::string token) : root_(std::
 std::string RepositoryCache::resolve_sha(const std::string& owner, const std::string& repo, const std::string& ref,
                                          const LogFn& log) {
   if (is_commit_sha(ref)) return util::to_lower(ref);
-  const auto record = root_ / owner / repo / "refs" / sanitize_ref(ref);
+  const auto record = root_ / owner / repo / "refs" / util::sha256_hex(ref);
   const std::string url = "https://github.com/" + owner + "/" + repo;
   try {
-    const auto out = run_tool({"git", "ls-remote", "--", url, "refs/tags/" + ref, "refs/tags/" + ref + "^{}",
-                               "refs/heads/" + ref},
-                              {}, git_token_env(token_));
+    std::vector<std::string> argv = {"git", "ls-remote", "--", url};
+    if (ref.starts_with("refs/")) {
+      argv.insert(argv.end(), {ref, ref + "^{}"});
+    } else {
+      argv.insert(argv.end(), {"refs/tags/" + ref, "refs/tags/" + ref + "^{}", "refs/heads/" + ref});
+    }
+    const auto out = run_tool(argv, {}, git_token_env(token_));
     auto sha = pick_ls_remote_sha(out, ref);
     if (!sha) {
       throw ActionError("Unable to resolve action '" + owner + "/" + repo + "@" + ref +
@@ -265,7 +285,20 @@ std::optional<fs::path> NodeProvider::download(int major, const LogFn& warn) {
 }
 
 fs::path NodeProvider::get(int major, const LogFn& warn) {
-  if (!explicit_node_.empty()) return explicit_node_;
+  if (!explicit_node_.empty()) {
+    auto path = explicit_node_;
+    if (!path.has_parent_path()) {
+      const auto env = util::current_environment();
+      const auto it = env.find("PATH");
+      const auto executable = util::find_executable(path.string(), it == env.end() ? "" : it->second);
+      if (!executable) throw ActionError("Node.js executable not found: " + path.string());
+      path = *executable;
+    }
+    if (::access(path.c_str(), X_OK) != 0 || !fs::is_regular_file(path)) {
+      throw ActionError("Node.js executable is not executable: " + path.string());
+    }
+    return util::real_path(path);
+  }
   std::lock_guard lock(mutex_);
   if (auto it = resolved_.find(major); it != resolved_.end()) return it->second;
   const auto env = util::current_environment();

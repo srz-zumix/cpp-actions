@@ -1,5 +1,6 @@
 #pragma once
 
+#include <filesystem>
 #include <map>
 #include <optional>
 #include <stdexcept>
@@ -30,6 +31,9 @@ class FileCommandError : public std::runtime_error {
  public:
   using std::runtime_error::runtime_error;
 };
+
+// Reads a bounded regular command file without following symlinks in its path.
+std::string read_command_file(const std::filesystem::path& path);
 
 // Parses GITHUB_ENV / GITHUB_OUTPUT / GITHUB_STATE contents ("NAME=VALUE" and
 // "NAME<<DELIMITER" heredocs). Throws FileCommandError on invalid content.

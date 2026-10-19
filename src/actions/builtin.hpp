@@ -23,6 +23,7 @@ struct BuiltinContext {
   fs::path workspace;  // GITHUB_WORKSPACE
   fs::path home;       // HOME of the job ("~" in paths)
   std::vector<fs::path> writable;  // roots that may be written (workspace, temp, home, tool cache, ...)
+  std::vector<fs::path> readable;  // roots that may be read; empty disables read confinement
   fs::path cache_store;            // actions/cache entries of the repository
   fs::path artifact_store;         // artifacts of the workflow run
   std::string repository;          // owner/name of the workflow repository ("" when unknown)

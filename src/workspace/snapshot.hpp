@@ -26,7 +26,9 @@ class SnapshotError : public std::runtime_error {
 // commit contains the uncommitted changes. Non-git directories are copied.
 Snapshot create_snapshot(const GitInfo& git, const fs::path& dest, const std::string& ref);
 
-// Copies a snapshot to a workspace directory (clonefile on macOS).
+// Copies a snapshot to a non-overlapping workspace directory (clonefile on
+// macOS), replacing destination entries without following their symlinks.
+// Symlinked destination ancestors are rejected.
 void copy_snapshot(const Snapshot& snapshot, const fs::path& dest);
 
 }  // namespace cpa::workspace

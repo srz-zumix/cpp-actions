@@ -76,9 +76,13 @@ Value with_fields(const Value& base, const std::vector<std::pair<std::string, Va
   return out;
 }
 
-std::optional<std::chrono::milliseconds> minutes_to_ms(double minutes) {
-  if (!(minutes > 0) || !std::isfinite(minutes)) return std::nullopt;
-  return std::chrono::milliseconds(static_cast<std::int64_t>(minutes * 60000.0));
+std::chrono::milliseconds minutes_to_ms(double minutes) {
+  const double milliseconds = minutes * 60000.0;
+  const auto maximum = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::duration::max() / 2).count();
+  if (!(minutes > 0) || !std::isfinite(milliseconds) || milliseconds >= static_cast<double>(maximum)) {
+    throw EvaluationError("'timeout-minutes' must be a finite positive number within the supported duration range");
+  }
+  return std::chrono::milliseconds(std::max<std::int64_t>(1, static_cast<std::int64_t>(milliseconds)));
 }
 
 struct StepScope {
@@ -134,6 +138,7 @@ struct PostStep {
   StringMap inputs;
   StringMap state;
   StringMap env;  // env context of the main step
+  const StepScope* scope = nullptr;
   const yaml::Node* condition = nullptr;
   std::string condition_text = "always()";
   std::string file;
@@ -210,6 +215,7 @@ class JobRunner {
   bool continue_on_error_ = false;
 
   fs::path job_dir_;
+  fs::path control_dir_;
   fs::path work_root_;
   fs::path workspace_;
   fs::path temp_;
@@ -229,11 +235,11 @@ class JobRunner {
   Value runner_ctx_;
   std::string status_ = "success";
   bool timed_out_ = false;
+  bool running_post_ = false;
   std::unique_ptr<sandbox::Sandbox> sandbox_;
-  std::mutex pgid_mutex_;
-  std::vector<pid_t> pgids_;
   std::vector<PostStep> post_steps_;
   std::vector<std::unique_ptr<actions::Action>> loaded_actions_;
+  std::vector<std::unique_ptr<StepScope>> composite_scopes_;
   bool echo_ = false;
   std::string stop_token_;
   StepScope top_;
@@ -243,30 +249,44 @@ class JobRunner {
 
 void JobRunner::create_directories() {
   const auto key = sanitize_key(inst_.key);
-  job_dir_ = run_.options.run_dir / "jobs" / key;
+  job_dir_ = run_.options.run_dir / "jobs" / wr_.run_id / key;
+  control_dir_ = run_.options.run_dir / "control" / wr_.run_id / key;
   const std::string repo_name = run_.repository.substr(run_.repository.find('/') + 1);
   work_root_ = job_dir_ / "work";
   workspace_ = work_root_ / repo_name / repo_name;
   temp_ = work_root_ / "_temp";
   home_ = job_dir_ / "home";
   tmp_ = job_dir_ / "tmp";
-  file_commands_dir_ = temp_ / "_runner_file_commands";
+  file_commands_dir_ = job_dir_ / "file_commands";
   event_path_ = temp_ / "_github_workflow" / "event.json";
   tool_cache_ = run_.options.cache_dir / "toolcache";
   util::remove_tree(job_dir_);
-  for (const auto& d : {workspace_, temp_, home_, tmp_, file_commands_dir_, event_path_.parent_path(), tool_cache_}) {
+  util::remove_tree(control_dir_);
+  fs::create_directories(control_dir_);
+  for (const auto& d : {workspace_, temp_, home_, tmp_, file_commands_dir_, event_path_.parent_path(), tool_cache_,
+                        job_dir_ / "scripts"}) {
     fs::create_directories(d);
   }
   // Canonical paths (e.g. /var -> /private/var on macOS) for the sandbox rules.
   job_dir_ = util::real_path(job_dir_);
+  control_dir_ = util::real_path(control_dir_);
   work_root_ = job_dir_ / "work";
   workspace_ = work_root_ / repo_name / repo_name;
   temp_ = work_root_ / "_temp";
   home_ = job_dir_ / "home";
   tmp_ = job_dir_ / "tmp";
-  file_commands_dir_ = temp_ / "_runner_file_commands";
+  file_commands_dir_ = job_dir_ / "file_commands";
   event_path_ = temp_ / "_github_workflow" / "event.json";
   tool_cache_ = util::real_path(tool_cache_);
+  const auto control_root = util::real_path(run_.options.run_dir / "control");
+  for (const auto& d : {workspace_, temp_, home_, tmp_, tool_cache_,
+                        run_.options.cache_dir / "cache" / run_.repository, wr_.artifacts}) {
+    const auto allocated = util::real_path(d);
+    if (util::is_subpath(control_root, allocated) || util::is_subpath(allocated, control_root)) {
+      throw EvaluationError("Allocated action directory overlaps the protected job control directory: " +
+                            allocated.string());
+    }
+  }
   util::write_file(event_path_, wr_.payload.to_json_string(true));
 }
 
@@ -280,9 +300,8 @@ void JobRunner::build_base_environment() {
 #else
   base_env_["LANG"] = "C.UTF-8";
 #endif
-  for (const char* name : {"USER", "LOGNAME"}) {
-    if (auto it = host.find(name); it != host.end()) base_env_[name] = it->second;
-  }
+  base_env_["USER"] = "runner";
+  base_env_["LOGNAME"] = "runner";
   base_env_["SHELL"] = "/bin/bash";
   base_env_["CI"] = "true";
   for (const auto& entry : run_.options.pass_env) {
@@ -342,7 +361,7 @@ bool JobRunner::evaluate_job_settings() {
   if (job_.timeout_minutes != nullptr) {
     timeout_minutes_ = evaluate_token(job_.timeout_minutes, ctx, general, wf_.file).to_number();
   }
-  if (auto ms = minutes_to_ms(timeout_minutes_)) deadline_ = started_ + *ms;
+  deadline_ = started_ + minutes_to_ms(timeout_minutes_);
   if (job_.continue_on_error != nullptr) {
     continue_on_error_ = evaluate_token(job_.continue_on_error, ctx, general, wf_.file).truthy();
     report_.continue_on_error = continue_on_error_;
@@ -364,18 +383,27 @@ void JobRunner::start_sandbox() {
     return;
   }
   sandbox::SandboxConfig config;
-  config.write = {job_dir_, tool_cache_};
-  for (const auto& d : sandbox::darwin_user_dirs()) config.write.push_back(d);
+  config.write = {workspace_, temp_, home_, tmp_, file_commands_dir_, tool_cache_};
   for (const auto& d : run_.options.sandbox.allow_write) config.write.push_back(d);
+  const auto control_root = util::real_path(run_.options.run_dir / "control");
+  for (const auto& d : config.write) {
+    const auto writable = util::real_path(d);
+    if (util::is_subpath(control_root, writable) || util::is_subpath(writable, control_root)) {
+      throw EvaluationError("Writable sandbox path overlaps the protected job control directory: " +
+                            writable.string());
+    }
+  }
   const auto actions_dir = run_.options.cache_dir / "actions";
   const auto node_dir = run_.options.cache_dir / "node";
   fs::create_directories(actions_dir);
   fs::create_directories(node_dir);
-  config.read = {actions_dir, node_dir};
+  config.read = {actions_dir, node_dir, job_dir_ / "scripts"};
   for (const auto& d : run_.options.sandbox.allow_read) config.read.push_back(d);
   config.allow_hosts = run_.options.sandbox.allow_hosts;
   config.allow_localhost = run_.options.sandbox.allow_localhost;
-  config.profile_file = job_dir_ / "sandbox.sb";
+  config.profile_file = control_dir_ / "sandbox.sb";
+  config.extra_rules = "(deny file-read* file-write* (subpath " +
+                       sandbox::sbpl_quote(control_root.string()) + "))";
   auto* log = log_.get();
   sandbox_ = std::make_unique<sandbox::Sandbox>(config, [log](const std::string& host, int port) {
     log->warning("Blocked a connection to " + host + ":" + std::to_string(port) +
@@ -398,7 +426,7 @@ void JobRunner::prefetch_actions() {
 bool JobRunner::setup() {
   create_directories();
   build_base_environment();
-  report_.log_file = (run_.options.run_dir / "logs" / (sanitize_key(inst_.key) + ".log")).string();
+  report_.log_file = (run_.options.run_dir / "logs" / wr_.run_id / (sanitize_key(inst_.key) + ".log")).string();
   log_ = std::make_unique<JobLog>(run_.console, run_.masker, inst_.name, report_.log_file, run_.options.debug);
   log_->info("Set up job", Color::Bold);
 
@@ -431,17 +459,20 @@ expr::EvalContext JobRunner::job_context(const StringMap& env) { return make_con
 
 std::string JobRunner::current_status(const StepScope* scope) const {
   if (is_cancelled() || status_ == "cancelled") return "cancelled";
-  if (status_ == "failure" || (scope != nullptr && scope->status == "failure")) return "failure";
+  if (status_ == "failure" || top_.status == "failure" || (scope != nullptr && scope->status == "failure")) {
+    return "failure";
+  }
   return "success";
 }
 
 expr::EvalContext JobRunner::make_context(const StepScope& scope, const StringMap& env) {
   expr::EvalContext ctx;
   auto c = Value::object();
-  if (scope.composite) {
+  if (scope.composite || !scope.action_path.empty()) {
     c.set("github", with_fields(github_, {{"action_path", scope.action_path.string()},
                                           {"action_repository", scope.action_repository},
-                                          {"action_ref", scope.action_ref}}));
+                                          {"action_ref", scope.action_ref},
+                                          {"action_status", current_status(&scope)}}));
   } else {
     c.set("github", github_);
   }
@@ -449,7 +480,7 @@ expr::EvalContext JobRunner::make_context(const StepScope& scope, const StringMa
   c.set("vars", vars_);
   c.set("secrets", secrets_);
   auto job = Value::object();
-  job.set("status", current_status(nullptr));
+  job.set("status", current_status(&scope));
   c.set("job", job);
   c.set("steps", scope.steps);
   c.set("runner", runner_ctx_);
@@ -488,6 +519,9 @@ void JobRunner::record_step(StepScope& scope, const workflow::Step& step, StepRe
     scope.steps.set(step.id, entry);
   }
   if (report.conclusion == "failure") scope.status = "failure";
+  report.name = run_.masker.mask(report.name);
+  report.error = run_.masker.mask(report.error);
+  for (auto& [key, value] : report.outputs) value = run_.masker.mask(value);
   report_.steps.push_back(std::move(report));
 }
 
@@ -581,6 +615,10 @@ StepResult JobRunner::run_script(StepScope& scope, const workflow::Step& step, e
                                  const StringMap& env, std::optional<std::chrono::milliseconds> timeout,
                                  bool after_cancel) {
   const auto general = scope_for(scope.general_site);
+  const auto files = prepare_file_commands();
+  ctx.contexts.set("github", with_fields(ctx.contexts.get("github"),
+                                        {{"action", step.id}, {"env", files.env.string()},
+                                         {"path", files.path.string()}}));
   const auto body = evaluate_string(step.run, ctx, general, scope.file);
   std::string shell_name;
   std::string working_directory;
@@ -603,7 +641,6 @@ StepResult JobRunner::run_script(StepScope& scope, const workflow::Step& step, e
       }
     }
   }
-  const auto files = prepare_file_commands();
   auto process_env = step_environment(env, files, scope, step.id);
   const auto shell = resolve_shell(shell_name, process_env["PATH"]);
   fs::path cwd = workspace_;
@@ -622,7 +659,7 @@ StepResult JobRunner::run_script(StepScope& scope, const workflow::Step& step, e
     log_->error(r.error);
     return r;
   }
-  const auto script = temp_ / (util::random_uuid() + shell.extension);
+  const auto script = job_dir_ / "scripts" / (util::random_uuid() + shell.extension);
   util::write_file(script, shell.script(body));
   return execute(shell.argv(script), std::move(process_env), cwd, timeout, after_cancel, files, nullptr);
 }
@@ -631,7 +668,7 @@ ResolvedAction JobRunner::resolve_action(const actions::ActionRef& ref) {
   ResolvedAction resolved;
   resolved.display = ref.display();
   if (ref.kind == actions::ActionRef::Kind::Local) {
-    resolved.dir = (workspace_ / ref.local_path).lexically_normal();
+    resolved.dir = util::real_path(workspace_ / ref.local_path);
     if (!util::is_subpath(resolved.dir, workspace_)) {
       throw actions::ActionError("The local action path '" + ref.local_path + "' is outside of the workspace");
     }
@@ -641,7 +678,10 @@ ResolvedAction JobRunner::resolve_action(const actions::ActionRef& ref) {
   const auto entry = run_.repositories.fetch(ref.owner, ref.repo, ref.ref, [log](std::string_view m) {
     log->info(std::string(m), Color::Gray);
   });
-  resolved.dir = ref.path.empty() ? entry.dir : entry.dir / ref.path;
+  resolved.dir = util::real_path(ref.path.empty() ? entry.dir : entry.dir / ref.path);
+  if (!util::is_subpath(resolved.dir, util::real_path(entry.dir))) {
+    throw actions::ActionError("The action path is outside of the repository: " + ref.path);
+  }
   resolved.repository = ref.full_name();
   resolved.ref = ref.ref;
   return resolved;
@@ -681,8 +721,20 @@ actions::BuiltinContext JobRunner::builtin_context() {
   actions::BuiltinContext bc;
   bc.workspace = workspace_;
   bc.home = home_;
-  bc.writable = {job_dir_, tool_cache_};
-  for (const auto& d : run_.options.sandbox.allow_write) bc.writable.push_back(util::real_path(d));
+  bc.writable = {workspace_, temp_, home_, tmp_, tool_cache_, file_commands_dir_};
+  for (const auto& d : run_.options.sandbox.allow_write) {
+    const auto writable = util::real_path(d);
+    const auto control_root = util::real_path(run_.options.run_dir / "control");
+    if (util::is_subpath(control_root, writable) || util::is_subpath(writable, control_root)) {
+      throw EvaluationError("Writable builtin path overlaps the protected job control directory: " +
+                            writable.string());
+    }
+    bc.writable.push_back(writable);
+  }
+  if (run_.options.sandbox.enabled) {
+    bc.readable = bc.writable;
+    for (const auto& d : run_.options.sandbox.allow_read) bc.readable.push_back(util::real_path(d));
+  }
   bc.cache_store = run_.options.cache_dir / "cache" / run_.repository;
   bc.artifact_store = wr_.artifacts;
   bc.repository = run_.repository;
@@ -708,6 +760,15 @@ StepResult JobRunner::run_uses(StepScope& scope, const workflow::Step& step, con
                                           scope_for(scope.general_site), scope.file)
                         : step.uses;
   const auto ref = actions::parse_action_ref(uses);
+  StringMap overrides = scope.env;
+  if (step.env != nullptr && step.env->is_mapping()) {
+    for (const auto& e : step.env->entries) overrides[e.key->text] = env.at(e.key->text);
+  }
+  auto action_env = [&]() {
+    auto values = global_env_;
+    for (const auto& [k, v] : overrides) values[k] = v;
+    return values;
+  };
   if (ref.kind == actions::ActionRef::Kind::Docker) {
     throw actions::ActionError("Docker container actions are not supported by cpp-actions: " + uses);
   }
@@ -731,7 +792,8 @@ StepResult JobRunner::run_uses(StepScope& scope, const workflow::Step& step, con
       post.builtin = builtin;
       post.inputs = inputs;
       post.state = r.state;
-      post.env = env;
+      post.env = overrides;
+      post.scope = &scope;
       post.condition_text = "success()";
       post_steps_.push_back(std::move(post));
     }
@@ -748,23 +810,12 @@ StepResult JobRunner::run_uses(StepScope& scope, const workflow::Step& step, con
     case actions::ActionKind::Docker:
       throw actions::ActionError("Docker container actions are not supported by cpp-actions: " + uses);
     case actions::ActionKind::Composite:
-      return run_composite(scope, name, *a, resolved, inputs, env);
+      return run_composite(scope, name, *a, resolved, inputs, overrides);
     case actions::ActionKind::Node:
       break;
   }
   StringMap state;
-  if (!a->pre.empty()) {
-    yaml::Node always;
-    always.kind = yaml::NodeKind::String;
-    always.text = "always()";
-    const auto* cond = a->pre_if != nullptr ? a->pre_if : &always;
-    if (evaluate_condition(cond, ctx, scope_for(Site::StepIf), a->file)) {
-      log_->info("  pre: " + a->pre, Color::Gray);
-      const auto pre = run_node(scope, step.id, *a, resolved, inputs, a->pre, state, env, timeout, after_cancel);
-      if (pre.outcome != "success") return pre;
-    }
-  }
-  result = run_node(scope, step.id, *a, resolved, inputs, a->main, state, env, timeout, after_cancel);
+  std::optional<std::size_t> post_index;
   if (!a->post.empty()) {
     PostStep post;
     post.name = "Post " + name;
@@ -772,12 +823,32 @@ StepResult JobRunner::run_uses(StepScope& scope, const workflow::Step& step, con
     post.action = a;
     post.resolved = resolved;
     post.inputs = inputs;
-    post.state = state;
-    post.env = env;
+    post.env = overrides;
+    post.scope = &scope;
     post.condition = a->post_if;
     post.file = a->file;
+    post_index = post_steps_.size();
     post_steps_.push_back(std::move(post));
   }
+  try {
+    if (!a->pre.empty()) {
+      yaml::Node always;
+      always.kind = yaml::NodeKind::String;
+      always.text = "always()";
+      const auto* cond = a->pre_if != nullptr ? a->pre_if : &always;
+      if (evaluate_condition(cond, ctx, scope_for(scope.if_site), a->file)) {
+        log_->info("  pre: " + a->pre, Color::Gray);
+        result = run_node(scope, step.id, *a, resolved, inputs, a->pre, state, action_env(), timeout, after_cancel);
+      }
+    }
+    if (result.outcome == "success") {
+      result = run_node(scope, step.id, *a, resolved, inputs, a->main, state, action_env(), timeout, after_cancel);
+    }
+  } catch (...) {
+    if (post_index) post_steps_[*post_index].state = state;
+    throw;
+  }
+  if (post_index) post_steps_[*post_index].state = std::move(state);
   return result;
 }
 
@@ -786,10 +857,10 @@ StepResult JobRunner::run_node(const StepScope& scope, const std::string& step_i
                                StringMap& state, const StringMap& env,
                                std::optional<std::chrono::milliseconds> timeout, bool after_cancel) {
   auto* log = log_.get();
+  const auto script = util::real_path(resolved.dir / file);
+  if (!util::is_subpath(script, resolved.dir)) throw actions::ActionError("Invalid action entry point: " + file);
   const auto node = run_.node.get(actions::node_major_version(action.runtime),
                                   [log](std::string_view m) { log->warning(m); });
-  const auto script = (resolved.dir / file).lexically_normal();
-  if (!util::is_subpath(script, resolved.dir)) throw actions::ActionError("Invalid action entry point: " + file);
   const auto files = prepare_file_commands();
   StepScope action_scope = scope;
   action_scope.action_path = resolved.dir;
@@ -803,10 +874,10 @@ StepResult JobRunner::run_node(const StepScope& scope, const std::string& step_i
     process_env["INPUT_" + util::to_upper(util::replace_all(k, " ", "_"))] = v;
   }
   for (const auto& [k, v] : state) process_env["STATE_" + k] = v;
-  // The Node.js installation must be readable in the sandbox.
-  const auto node_root = node.parent_path().parent_path();
+  // Cached installations are already readable; an explicit binary must not
+  // implicitly grant access to its parent directories (e.g. the host HOME).
   return execute({node.string(), script.string()}, std::move(process_env), workspace_, timeout, after_cancel, files,
-                 &state, {node_root});
+                 &state, {node});
 }
 
 StepResult JobRunner::run_composite(StepScope& parent, const std::string& name,
@@ -816,7 +887,8 @@ StepResult JobRunner::run_composite(StepScope& parent, const std::string& name,
     throw actions::ActionError("Composite actions can be nested up to " + std::to_string(kMaxCompositeDepth) +
                                " levels");
   }
-  StepScope child;
+  composite_scopes_.push_back(std::make_unique<StepScope>());
+  auto& child = *composite_scopes_.back();
   child.composite = true;
   child.depth = parent.depth + 1;
   child.file = action.file;
@@ -828,11 +900,7 @@ StepResult JobRunner::run_composite(StepScope& parent, const std::string& name,
   child.general_site = Site::ActionStepGeneral;
   child.prefix = parent.prefix + name + " / ";
   // The env of the composite step (not the global env, which may change).
-  child.env = parent.env;
-  for (const auto& [k, v] : step_env) {
-    auto it = global_env_.find(k);
-    if (it == global_env_.end() || it->second != v) child.env[k] = v;
-  }
+  child.env = step_env;
   for (const auto& nested : action.steps) run_step(child, nested);
   StepResult result;
   if (child.status == "failure") {
@@ -856,6 +924,7 @@ StepResult JobRunner::run_composite(StepScope& parent, const std::string& name,
 }
 
 void JobRunner::run_post_steps() {
+  running_post_ = true;
   for (auto it = post_steps_.rbegin(); it != post_steps_.rend(); ++it) {
     auto& post = *it;
     StepReport sr;
@@ -863,16 +932,24 @@ void JobRunner::run_post_steps() {
     sr.name = post.name;
     sr.post = true;
     const auto step_started = Clock::now();
-    auto ctx = make_context(top_, post.env);
+    const auto& scope = post.scope != nullptr ? *post.scope : top_;
+    auto env = global_env_;
+    for (const auto& [k, v] : post.env) env[k] = v;
+    auto ctx = make_context(scope, env);
     yaml::Node text;
     text.kind = yaml::NodeKind::String;
     text.text = post.condition_text;
     bool run_it = false;
     try {
-      run_it = evaluate_condition(post.condition != nullptr ? post.condition : &text, ctx, scope_for(Site::StepIf),
+      run_it = evaluate_condition(post.condition != nullptr ? post.condition : &text, ctx, scope_for(scope.if_site),
                                   post.file.empty() ? wf_.file : post.file);
     } catch (const std::exception& e) {
       log_->error(e.what());
+      sr.outcome = sr.conclusion = "failure";
+      sr.error = e.what();
+      status_ = "failure";
+      report_.steps.push_back(std::move(sr));
+      continue;
     }
     if (!run_it) {
       sr.outcome = sr.conclusion = "skipped";
@@ -891,8 +968,8 @@ void JobRunner::run_post_steps() {
           log_->error(r.error);
         }
       } else {
-        result = run_node(top_, post.id, *post.action, post.resolved, post.inputs, post.action->post, post.state,
-                          post.env, std::nullopt, true);
+        result = run_node(scope, post.id, *post.action, post.resolved, post.inputs, post.action->post, post.state,
+                          env, std::chrono::minutes(5), true);
       }
     } catch (const std::exception& e) {
       result.outcome = "failure";
@@ -908,6 +985,7 @@ void JobRunner::run_post_steps() {
     if (sr.outcome == "failure" && status_ == "success") status_ = "failure";
     report_.steps.push_back(std::move(sr));
   }
+  running_post_ = false;
 }
 
 // -------------------------------------------------------------- processes
@@ -980,6 +1058,8 @@ util::Environment JobRunner::step_environment(const StringMap& env, const FileCo
   if (run_.options.debug) out["RUNNER_DEBUG"] = "1";
   if (scope.composite || !scope.action_path.empty()) out["GITHUB_ACTION_PATH"] = scope.action_path.string();
   if (sandbox_) {
+    out["HOME"] = home_.string();
+    out["TMPDIR"] = tmp_.string();
     for (const auto& [k, v] : sandbox_->environment()) out[k] = v;
   }
   return out;
@@ -993,7 +1073,7 @@ StepResult JobRunner::execute(std::vector<std::string> argv, util::Environment e
   CommandState cs;
   cs.allow_unsecure = util::iequals(env["ACTIONS_ALLOW_UNSECURE_COMMANDS"], "true");
   bool job_timeout = false;
-  if (deadline_) {
+  if (deadline_ && !running_post_) {
     const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(*deadline_ - Clock::now());
     const auto limit = std::max(remaining, std::chrono::milliseconds(1));
     if (!timeout || limit < *timeout) {
@@ -1007,12 +1087,16 @@ StepResult JobRunner::execute(std::vector<std::string> argv, util::Environment e
   spec.cwd = cwd;
   spec.timeout = timeout;
   spec.cancel = after_cancel ? &inst_.force : &inst_.cancel;
+  spec.force_cancel = &inst_.force;
   spec.on_line = [&](std::string_view line, bool) { handle_line(line, cs); };
-  spec.on_spawn = [this](pid_t pgid) {
-    std::lock_guard lock(pgid_mutex_);
-    pgids_.push_back(pgid);
-  };
+  struct ProcessGroupGuard {
+    pid_t pgid = 0;
+    ~ProcessGroupGuard() { util::kill_process_group(pgid); }
+  } process_group;
+  spec.on_spawn = [&](pid_t pgid) { process_group.pgid = pgid; };
   const auto pr = util::run_process(spec);
+  util::kill_process_group(process_group.pgid);
+  process_group.pgid = 0;
   stop_token_.clear();
   echo_ = false;
   if (pr.spawn_failed) {
@@ -1055,22 +1139,22 @@ StepResult JobRunner::execute(std::vector<std::string> argv, util::Environment e
 
 void JobRunner::process_file_commands(const FileCommands& files, StepResult& result, StringMap* state) {
   try {
-    for (const auto& [k, v] : parse_key_value_file(util::read_file(files.env))) {
+    for (const auto& [k, v] : parse_key_value_file(read_command_file(files.env))) {
       if (util::iequals(k, "NODE_OPTIONS")) {
         log_->warning("Can't store NODE_OPTIONS output parameter using '$GITHUB_ENV' command.");
         continue;
       }
       global_env_[k] = v;
     }
-    for (const auto& [k, v] : parse_key_value_file(util::read_file(files.output))) result.outputs[k] = v;
-    for (const auto& p : parse_path_file(util::read_file(files.path))) {
+    for (const auto& [k, v] : parse_key_value_file(read_command_file(files.output))) result.outputs[k] = v;
+    for (const auto& p : parse_path_file(read_command_file(files.path))) {
       std::erase(path_prepend_, p);
       path_prepend_.push_back(p);
     }
-    for (const auto& [k, v] : parse_key_value_file(util::read_file(files.state))) {
+    for (const auto& [k, v] : parse_key_value_file(read_command_file(files.state))) {
       if (state != nullptr) (*state)[k] = v;
     }
-    const auto summary = util::read_file(files.summary);
+    const auto summary = read_command_file(files.summary);
     if (summary.size() > kMaxSummarySize) {
       const std::string message = "$GITHUB_STEP_SUMMARY upload aborted, supports content up to a size of 1024k, got " +
                                   std::to_string(summary.size() / 1024) + "k.";
@@ -1100,8 +1184,8 @@ void JobRunner::annotate(const std::string& level, const WorkflowCommand& cmd) {
     return it != cmd.properties.end() ? it->second : std::string();
   };
   auto num = [&](const char* name) { return static_cast<int>(util::parse_int(prop(name)).value_or(0)); };
-  a.title = prop("title");
-  a.file = prop("file");
+  a.title = run_.masker.mask(prop("title"));
+  a.file = run_.masker.mask(prop("file"));
   a.line = num("line");
   a.end_line = num("endLine");
   a.column = num("col");
@@ -1203,16 +1287,11 @@ void JobRunner::evaluate_outputs() {
 }
 
 void JobRunner::finish() {
-  {
-    std::lock_guard lock(pgid_mutex_);
-    for (const auto pgid : pgids_) {
-      if (util::process_group_alive(pgid)) util::kill_process_group(pgid);
-    }
-  }
   sandbox_.reset();
   if (!run_.options.keep_workdir && !job_dir_.empty()) {
     try {
       util::remove_tree(job_dir_);
+      util::remove_tree(control_dir_);
     } catch (const std::exception& e) {
       if (log_) log_->warning(std::string("Failed to remove the job directory: ") + e.what());
     }
@@ -1357,19 +1436,23 @@ std::string sanitize_key(std::string_view key) {
   }
   while (!out.empty() && (out.back() == '_' || out.back() == '.')) out.pop_back();
   if (out.empty()) out = "job";
-  if (out.size() > 100) out = out.substr(0, 80) + "-" + util::sha256_hex(key).substr(0, 16);
-  return out;
+  return out.substr(0, 32) + "-" + util::sha256_hex(key);
 }
 
 std::string hash_files(const fs::path& root, const std::vector<std::string>& patterns) {
+  const auto canonical_root = util::real_path(root);
+  if (canonical_root != fs::absolute(root).lexically_normal()) return {};
   const auto files = util::glob_files(root, patterns);
   if (files.empty()) return {};
   util::Sha256 h;
+  bool matched = false;
   for (const auto& f : files) {
+    if (!util::is_subpath(util::real_path(f), canonical_root)) continue;
     const auto d = util::sha256_file(f);
     h.update(d.data(), d.size());
+    matched = true;
   }
-  return util::Sha256::hex(h.digest());
+  return matched ? util::Sha256::hex(h.digest()) : std::string{};
 }
 
 std::function<bool(std::string_view)> job_status_functions(const JobStatus& status) {
