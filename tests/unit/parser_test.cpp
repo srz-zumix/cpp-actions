@@ -225,3 +225,135 @@ jobs:
 )");
   IUTEST_EXPECT_EQ("octo/repo/.github/workflows/x.yml@main", wf.jobs[0].uses);
 }
+
+IUTEST(ParserTest, ReusableWorkflowReferences) {
+  for (const auto* uses : {"./.github/workflows/build.yml", "./.github/workflows/build.yaml",
+                           "octo/repo/.github/workflows/build.yaml@feature/build",
+                           "octo/repo/.github/workflows/build.yml@0123456789"}) {
+    const auto text = std::string("on: push\njobs:\n  call:\n    uses: ") + uses + "\n";
+    IUTEST_EXPECT_TRUE(errors_of(text.c_str()).empty()) << uses;
+  }
+  for (const auto* uses : {"''", "null", "true", "[]", "{}", "actions/checkout@v4",
+                           "./other/build.yml", "./.github/workflows/nested/build.yml",
+                           "./.github/workflows/../build.yml", "./.github/workflows/build.yml@main",
+                           "octo/repo/.github/workflows/build.yml",
+                           "octo/repo/.github/workflows/build.yml@",
+                           "octo/repo/.github/workflows/nested/build.yml@main",
+                           "../repo/.github/workflows/build.yml@main",
+                           "octo/repo/.github/workflows/build.txt@main",
+                           "${{ inputs.workflow }}", "./.github/workflows/${{ inputs.file }}.yml"}) {
+    const auto text = std::string("on: push\njobs:\n  call:\n    uses: ") + uses + "\n";
+    IUTEST_EXPECT_FALSE(errors_of(text.c_str()).empty()) << uses;
+  }
+}
+
+IUTEST(ParserTest, ReusableWorkflowArguments) {
+  IUTEST_EXPECT_TRUE(errors_of(R"(
+on: push
+jobs:
+  call:
+    uses: ./.github/workflows/build.yml
+    with:
+      text: hello
+      boolean: true
+      number: 42
+      expression: ${{ false }}
+      numeric-expression: ${{ fromJSON('42') }}
+      contexts: ${{ github.ref }}-${{ needs.build.outputs.x }}-${{ strategy.job-index }}-${{ matrix.os }}-${{ inputs.x }}-${{ vars.X }}
+    secrets:
+      token: ${{ secrets.TOKEN }}
+      literal: text
+      expression: ${{ 'secret' }}
+      contexts: ${{ github.ref }}-${{ needs.build.outputs.x }}-${{ strategy.job-index }}-${{ matrix.os }}-${{ inputs.x }}-${{ vars.X }}
+)").empty());
+  IUTEST_EXPECT_TRUE(errors_of(R"(
+on: push
+jobs:
+  call:
+    uses: ./.github/workflows/build.yml
+    secrets: inherit
+)").empty());
+  for (const auto* value : {"[]", "null", "hello", "${{ inputs.values }}", "{a: []}", "{a: {x: y}}",
+                            "{a: null}", "{a: '${{ fromJSON(\"[]\") }}'}", "{a: '${{ null }}'}",
+                            "{a: '${{ github }}'}", "{a: '${{ secrets.TOKEN }}'}", "{a: '${{ env.X }}'}",
+                            "{a: '${{ steps.x.outputs.y }}'}", "{'${{ inputs.key }}': text}"}) {
+    const auto text = std::string("on: push\njobs:\n  call:\n    uses: ./.github/workflows/build.yml\n    with: ") +
+                      value + "\n";
+    IUTEST_EXPECT_FALSE(errors_of(text.c_str()).empty()) << value;
+  }
+}
+
+IUTEST(ParserTest, ReusableWorkflowSecretValidation) {
+  for (const auto* value : {"[]", "null", "other", "${{ secrets }}", "{token: true}", "{token: 1}",
+                            "{token: null}", "{token: []}", "{token: {x: y}}",
+                            "{token: '${{ secrets }}'}", "{token: '${{ true }}'}",
+                            "{token: '${{ fromJSON(\"[]\") }}'}",
+                            "{token: '${{ env.X }}'}", "{token: '${{ steps.x.outputs.y }}'}",
+                            "{token: '${{ runner.os }}'}", "{token: '${{ hashFiles(\"x\") }}'}",
+                            "{'${{ inputs.key }}': text}", "{token: '${{ secrets.TOKEN'}"}) {
+    const auto text = std::string("on: push\njobs:\n  call:\n    uses: ./.github/workflows/build.yml\n    secrets: ") +
+                      value + "\n";
+    IUTEST_EXPECT_FALSE(errors_of(text.c_str()).empty()) << value;
+  }
+}
+
+IUTEST(ParserTest, WorkflowCallDeclarations) {
+  const auto wf = parse(R"(
+on:
+  workflow_call:
+    inputs:
+      text: {type: string, default: hello}
+      flag: {type: boolean, default: false}
+      count: {type: number, default: 2.5}
+      expression: {type: boolean, default: '${{ true }}'}
+      optional: {type: string}
+    outputs:
+      result: {description: Result, value: '${{ jobs.build.outputs.result }}'}
+    secrets:
+      token: {required: true}
+      optional:
+jobs:
+  build: {runs-on: x, steps: [{run: a}]}
+)");
+  IUTEST_EXPECT_EQ(5u, wf.call_inputs.size());
+  IUTEST_EXPECT_EQ(1u, wf.call_outputs.size());
+  IUTEST_EXPECT_EQ(2u, wf.call_secrets.size());
+  for (const auto* definition : {"{type: string, default: true}", "{type: string, default: 1}",
+                                 "{type: boolean, default: 'false'}", "{type: number, default: '2'}",
+                                 "{type: string, default: null}", "{type: string, default: []}",
+                                 "{type: string, default: {x: y}}",
+                                 "{type: boolean, default: '${{ 1 }}'}",
+                                 "{type: number, default: '${{ fromJSON(\"[]\") }}'}",
+                                 "{type: choice}", "{required: true}", "{type: string, required: yes}"}) {
+    const auto text = std::string("on:\n  workflow_call:\n    inputs:\n      x: ") + definition +
+                      "\njobs:\n  build: {runs-on: x, steps: [{run: a}]}\n";
+    IUTEST_EXPECT_FALSE(errors_of(text.c_str()).empty()) << definition;
+  }
+  for (const auto* config : {"inputs: []", "inputs: {x: true}", "outputs: []",
+                             "outputs: {x: {description: missing-value}}", "secrets: []",
+                             "secrets: {x: true}", "secrets: {x: {required: 'true'}}"}) {
+    const auto text = std::string("on:\n  workflow_call:\n    ") + config +
+                      "\njobs:\n  build: {runs-on: x, steps: [{run: a}]}\n";
+    IUTEST_EXPECT_FALSE(errors_of(text.c_str()).empty()) << config;
+  }
+}
+
+IUTEST(ParserTest, EnvironmentMappingRequiresName) {
+  IUTEST_EXPECT_TRUE(has_error(errors_of(R"(
+on: push
+jobs:
+  build:
+    runs-on: x
+    environment: {url: 'https://example.com'}
+    steps: [{run: a}]
+)"), "Required property is missing: name"));
+  IUTEST_EXPECT_TRUE(errors_of(R"(
+on: push
+jobs:
+  build:
+    runs-on: x
+    env: {TOKEN: '${{ secrets.TOKEN }}'}
+    environment: {name: '${{ matrix.environment }}', url: '${{ steps.deploy.outputs.url }}'}
+    steps: [{id: deploy, run: a}]
+)").empty());
+}

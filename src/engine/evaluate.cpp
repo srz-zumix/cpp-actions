@@ -93,4 +93,19 @@ std::vector<std::pair<std::string, std::string>> evaluate_string_map(const yaml:
   return out;
 }
 
+std::string describe_concurrency(const yaml::Node* node, const expr::EvalContext& context,
+                                 const expr::Scope& scope, const std::string& file) {
+  const auto value = evaluate_token(node, context, scope, file);
+  const auto group = value.is_object() ? value.get("group") : value;
+  if (!group.is_string() || group.as_string().empty()) {
+    fail(file, node, "concurrency.group must be a non-empty string");
+  }
+  const auto cancel = value.is_object() && value.has("cancel-in-progress")
+                          ? value.get("cancel-in-progress")
+                          : expr::Value(false);
+  if (!cancel.is_bool()) fail(file, node, "concurrency.cancel-in-progress must be a boolean");
+  return "Concurrency: group=" + group.as_string() + ", cancel-in-progress=" + cancel.to_string() +
+         " (display only; not enforced)";
+}
+
 }  // namespace cpa::engine

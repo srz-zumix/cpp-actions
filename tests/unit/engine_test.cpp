@@ -218,6 +218,156 @@ jobs:
   IUTEST_EXPECT_EQ("success", report.result) << test.output.str();
 }
 
+IUTEST(EngineTest, EnvironmentOverridesSecretsAndVariablesInJobAndWorkflowEnv) {
+  EngineRun test;
+  test.options.vars = {{"VALUE", "repository"}, {"ENVIRONMENT", "Testing"}};
+  test.options.secrets = {{"TOKEN", "repository-value"}};
+  const auto secret_file = test.dir / "environment.env";
+  const auto vars_file = test.dir / "variables.env";
+  util::write_file(secret_file, "TOKEN=environment-value\n");
+  util::write_file(vars_file, "VALUE=from-file\nFILE_ONLY=present\n");
+  config::EnvironmentConfig environment;
+  environment.secrets_file = secret_file.string();
+  environment.vars_file = vars_file.string();
+  environment.vars = {{"VALUE", "inline"}};
+  test.options.environments["testing"] = environment;
+  const auto report = test.run(R"(
+on: push
+env:
+  WORKFLOW_VALUE: ${{ vars.VALUE }}
+  WORKFLOW_TOKEN: ${{ secrets.TOKEN }}
+jobs:
+  scoped:
+    runs-on: test-host
+    environment:
+      name: ${{ vars.ENVIRONMENT }}
+      url: ${{ steps.deploy.outputs.url }}
+    env:
+      VALUE: ${{ vars.VALUE }}
+      TOKEN: ${{ secrets.TOKEN }}
+    steps:
+      - run: |
+          test "$VALUE" = inline
+          test "$WORKFLOW_VALUE" = inline
+          test "$TOKEN" = "$WORKFLOW_TOKEN"
+          test "${#TOKEN}" = 17
+          test '${{ vars.FILE_ONLY }}' = present
+          printf '%s\n' "$TOKEN"
+  unscoped:
+    runs-on: test-host
+    steps:
+      - run: |
+          test '${{ vars.VALUE }}' = repository
+          test '${{ vars.FILE_ONLY }}' = ''
+)");
+  IUTEST_EXPECT_EQ("success", report.result) << test.output.str();
+  IUTEST_EXPECT_EQ(std::string::npos, test.output.str().find("environment-value"));
+}
+
+IUTEST(EngineTest, ConcurrencyAndPermissionsAreDiagnosticOnly) {
+  EngineRun test;
+  const auto report = test.run(R"(
+on: push
+permissions: {}
+concurrency:
+  group: ${{ github.workflow }}-global
+  cancel-in-progress: true
+jobs:
+  scoped:
+    runs-on: test-host
+    permissions: {contents: read}
+    concurrency:
+      group: build-${{ matrix.target }}
+      cancel-in-progress: ${{ matrix.cancel }}
+    strategy:
+      matrix:
+        include:
+          - {target: one, cancel: true}
+          - {target: two, cancel: false}
+    steps:
+      - run: 'true'
+)");
+  IUTEST_EXPECT_EQ("success", report.result) << test.output.str();
+  IUTEST_EXPECT_NE(std::string::npos, test.output.str().find("group=build-one, cancel-in-progress=true"));
+  IUTEST_EXPECT_NE(std::string::npos, test.output.str().find("group=build-two, cancel-in-progress=false"));
+  IUTEST_EXPECT_NE(std::string::npos, test.output.str().find("(display only; not enforced)"));
+  IUTEST_EXPECT_NE(std::string::npos, test.output.str().find("'permissions' are not emulated"));
+  IUTEST_EXPECT_NE(std::string::npos, test.output.str().find("tokens retain their original permissions"));
+  IUTEST_EXPECT_EQ(2U, report.workflows.front().jobs.size());
+}
+
+IUTEST(EngineTest, DynamicMatrixAndRunnerLabelsUseNeedsOutputs) {
+  EngineRun test;
+  test.options.host_labels.push_back("custom-builder");
+  const auto report = test.run(R"(
+on: push
+jobs:
+  prepare:
+    runs-on: test-host
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+      runner: ${{ steps.set.outputs.runner }}
+    steps:
+      - id: set
+        run: |
+          echo 'matrix={"include":[{"target":"one"},{"target":"two"}]}' >> "$GITHUB_OUTPUT"
+          echo 'runner=["self-hosted","custom-builder"]' >> "$GITHUB_OUTPUT"
+  build:
+    needs: prepare
+    strategy:
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    runs-on: ${{ fromJSON(needs.prepare.outputs.runner) }}
+    outputs:
+      target: ${{ matrix.target }}
+    steps:
+      - run: test '${{ strategy.job-total }}' = 2
+)");
+  IUTEST_EXPECT_EQ("success", report.result) << test.output.str();
+  std::vector<std::string> targets;
+  for (const auto& item : report.workflows.front().jobs) {
+    if (item.job_id == "build") targets.push_back(item.outputs.at("target"));
+  }
+  std::sort(targets.begin(), targets.end());
+  IUTEST_EXPECT_EQ((std::vector<std::string>{"one", "two"}), targets);
+}
+
+IUTEST(EngineTest, InvalidDynamicMatrixFailsBeforeRunningSteps) {
+  for (const auto& invalid : {std::string("not-json"), std::string("[]")}) {
+    EngineRun test;
+    test.options.vars = {{"MATRIX", invalid}};
+    const auto report = test.run(R"(
+on: push
+jobs:
+  build:
+    strategy:
+      matrix: ${{ fromJSON(vars.MATRIX) }}
+    runs-on: test-host
+    steps:
+      - run: echo should-not-run
+)");
+    IUTEST_EXPECT_EQ("failure", report.result);
+    IUTEST_EXPECT_TRUE(job(report, "build").steps.empty());
+  }
+}
+
+IUTEST(EngineTest, ConcurrencyExpressionsAreTyped) {
+  const auto document = yaml::load(R"(
+group: build-${{ vars.BRANCH }}
+cancel-in-progress: ${{ vars.CANCEL == 'yes' }}
+)", "test.yml");
+  expr::EvalContext context;
+  context.contexts = expr::Value::parse_json(R"({"vars":{"BRANCH":"main","CANCEL":"yes"}})");
+  IUTEST_EXPECT_EQ("Concurrency: group=build-main, cancel-in-progress=true (display only; not enforced)",
+                   describe_concurrency(document->root, context, workflow::scope_for(workflow::Site::JobGeneral),
+                                        "test.yml"));
+  for (const auto& text : {"group: ''", "group: build\ncancel-in-progress: 'false'", "group: [build]"}) {
+    const auto invalid = yaml::load(text, "test.yml");
+    IUTEST_EXPECT_THROW(
+        describe_concurrency(invalid->root, context, workflow::scope_for(workflow::Site::JobGeneral), "test.yml"),
+        EvaluationError);
+  }
+}
+
 IUTEST(EngineTest, DefaultBashAndExplicitPipefailAndCustomShell) {
   EngineRun test;
   const auto report = test.run(R"(

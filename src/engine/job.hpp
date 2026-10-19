@@ -103,6 +103,7 @@ struct WorkflowRun {
   int depth = 0;
   fs::path artifacts;         // artifact store of the top-level run
   fs::path repo_root;         // root for local `uses: ./...` (the snapshot is used for checkouts)
+  std::vector<fs::path> call_stack;  // canonical workflow files in this call chain
 };
 
 struct JobInstance {

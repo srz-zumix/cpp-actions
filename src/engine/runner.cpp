@@ -74,26 +74,45 @@ std::string effective_result(const JobReport& r) {
 }
 
 Value convert_call_input(const workflow::CallInput& in, const Value& v, const std::string& where) {
-  if (in.type == "boolean") {
-    if (v.is_bool()) return v;
-    const auto s = v.to_string();
-    if (s == "true") return Value(true);
-    if (s == "false") return Value(false);
-  } else if (in.type == "number") {
-    if (v.is_number()) return v;
-    const auto n = v.to_number();
-    if (!std::isnan(n) && !v.to_string().empty()) return Value(n);
-  } else {
-    if (v.is_string()) return v;
-    if (v.is_bool() || v.is_number() || v.is_null()) return Value(v.to_string());
-  }
+  if ((in.type == "boolean" && v.is_bool()) || (in.type == "number" && v.is_number()) ||
+      (in.type == "string" && v.is_string())) return v;
   throw EvaluationError(where + ": the input '" + in.name + "' must be a " + in.type);
 }
 
 struct CalledWorkflow {
   std::shared_ptr<const workflow::Workflow> workflow;
   std::string display;
+  fs::path root;
+  fs::path path;
 };
+
+bool valid_workflow_path(const std::string& path) {
+  const fs::path p(path);
+  return path.starts_with(".github/workflows/") && p.parent_path() == ".github/workflows" &&
+         !p.filename().empty() && (p.extension() == ".yml" || p.extension() == ".yaml") &&
+         path.find('\\') == std::string::npos && path.find('@') == std::string::npos;
+}
+
+bool valid_repository_component(const std::string& text) {
+  return !text.empty() && text != "." && text != ".." &&
+         std::all_of(text.begin(), text.end(), [](unsigned char c) {
+           return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                  c == '-' || c == '_' || c == '.';
+         });
+}
+
+bool valid_workflow_ref(const std::string& ref) {
+  if (ref.empty() || ref.front() == '-' || ref.front() == '/' || ref.back() == '/' || ref.back() == '.' ||
+      ref.find("..") != std::string::npos || ref.find("//") != std::string::npos ||
+      ref.find("@{") != std::string::npos || ref == "@") return false;
+  for (unsigned char c : ref) {
+    if (c <= ' ' || c == 127 || std::string_view("~^:?*[\\").find(c) != std::string_view::npos) return false;
+  }
+  for (const auto& part : util::split(ref, '/')) {
+    if (part.empty() || part.front() == '.' || part.ends_with(".lock")) return false;
+  }
+  return true;
+}
 
 class WorkflowExecutor;
 
@@ -108,8 +127,8 @@ struct JobNode {
 class WorkflowExecutor {
  public:
   WorkflowExecutor(RunState& run, WorkflowRun& wr, std::vector<JobReport>& reports, std::mutex& reports_mutex,
-                   const std::set<std::string>* selected)
-      : run_(run), wr_(wr), wf_(*wr.workflow), reports_(reports), reports_mutex_(reports_mutex) {
+                  const std::set<std::string>* selected, JobInstance* parent = nullptr)
+      : run_(run), wr_(wr), wf_(*wr.workflow), reports_(reports), reports_mutex_(reports_mutex), parent_(parent) {
     for (const auto& job : wf_.jobs) {
       JobNode node;
       node.job = &job;
@@ -120,6 +139,25 @@ class WorkflowExecutor {
 
   // Runs all jobs; returns the effective results and outputs of the jobs.
   void execute() {
+    if (wf_.concurrency != nullptr) {
+      const auto ctx = job_level_context(Value::object(), Value(), Value());
+      run_.console.line(run_.console.paint(
+          run_.masker.mask("[" + wr_.file + "] " +
+                           describe_concurrency(wf_.concurrency, ctx, scope_for(Site::WorkflowConcurrency), wf_.file)),
+          Color::Gray));
+    }
+    std::jthread cancellation;
+    if (parent_ != nullptr) {
+      cancellation = std::jthread([this](std::stop_token stop) {
+        while (!stop.stop_requested()) {
+          {
+            std::lock_guard lock(active_mutex_);
+            for (auto* inst : active_) inherit_cancellation(*inst);
+          }
+          std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+      });
+    }
     std::vector<std::thread> threads;
     for (const auto& job : wf_.jobs) {
       if (!nodes_.at(job.id).selected) continue;
@@ -131,6 +169,12 @@ class WorkflowExecutor {
   const std::map<std::string, JobNode>& nodes() const { return nodes_; }
 
  private:
+  void inherit_cancellation(JobInstance& inst) const {
+    if (parent_ == nullptr) return;
+    if (parent_->cancel) inst.cancel = true;
+    if (parent_->force) inst.force = true;
+  }
+
   void add_report(JobReport report) {
     std::lock_guard lock(reports_mutex_);
     reports_.push_back(std::move(report));
@@ -176,7 +220,7 @@ class WorkflowExecutor {
       if (r == "failure") st.failure = true;
       for (const auto& n : nodes_.at(id).job->needs) stack.push_back(n);
     }
-    st.cancelled = run_.cancelled;
+    st.cancelled = run_.cancelled || (parent_ != nullptr && parent_->cancel);
     return st;
   }
 
@@ -361,6 +405,11 @@ class WorkflowExecutor {
       threads.emplace_back([&, inst] {
         SemaphoreGuard limit(&limiter);
         run_.register_cancel(&inst->cancel, &inst->force);
+        {
+          std::lock_guard lock(active_mutex_);
+          inherit_cancellation(*inst);
+          active_.push_back(inst);
+        }
         if (fail_fast_triggered) inst->cancel = true;
         std::vector<JobReport> produced;
         if (!job.uses.empty()) {
@@ -370,6 +419,10 @@ class WorkflowExecutor {
           produced.push_back(run_job_instance(*inst));
         }
         run_.unregister_cancel(&inst->cancel);
+        {
+          std::lock_guard lock(active_mutex_);
+          std::erase(active_, inst);
+        }
         const auto& main = produced.front();
         const auto effective = effective_result(main);
         {
@@ -391,29 +444,36 @@ class WorkflowExecutor {
 
   CalledWorkflow load_called(const std::string& uses, const std::string& where) {
     CalledWorkflow called;
-    if (uses.starts_with("./")) {
-      const auto path = (wr_.repo_root / uses).lexically_normal();
-      if (!util::is_subpath(path, wr_.repo_root)) throw EvaluationError(where + ": invalid workflow path " + uses);
-      std::vector<workflow::Diagnostic> warnings;
-      called.display = uses.substr(2);
-      called.workflow = std::make_shared<workflow::Workflow>(workflow::load_workflow(path, called.display, &warnings));
-      return called;
-    }
-    // owner/repo/path/to/workflow.yml@ref
-    const auto at = uses.rfind('@');
-    if (at == std::string::npos) throw EvaluationError(where + ": the reusable workflow needs a ref: " + uses);
-    const auto ref = uses.substr(at + 1);
-    const auto parts = util::split(uses.substr(0, at), '/');
-    if (parts.size() < 3) throw EvaluationError(where + ": invalid reusable workflow reference: " + uses);
     std::string path;
-    for (std::size_t i = 2; i < parts.size(); ++i) path += (i > 2 ? "/" : "") + parts[i];
-    const auto entry = run_.repositories.fetch(parts[0], parts[1], ref, [this](std::string_view m) {
-      run_.console.line(run_.console.paint(run_.masker.mask(m), Color::Gray));
-    });
-    const auto file = (entry.dir / path).lexically_normal();
-    if (!util::is_subpath(file, entry.dir)) throw EvaluationError(where + ": invalid workflow path " + uses);
-    called.display = uses;
-    called.workflow = std::make_shared<workflow::Workflow>(workflow::load_workflow(file, uses));
+    if (uses.starts_with("./")) {
+      path = uses.substr(2);
+      called.root = wr_.repo_root;
+      called.display = uses.substr(2);
+    } else {
+      // owner/repo/.github/workflows/workflow.yml@ref
+      const auto at = uses.rfind('@');
+      if (at == std::string::npos) throw EvaluationError(where + ": the reusable workflow needs a ref: " + uses);
+      const auto ref = uses.substr(at + 1);
+      const auto parts = util::split(uses.substr(0, at), '/');
+      if (parts.size() != 5 || !valid_repository_component(parts[0]) ||
+          !valid_repository_component(parts[1]) || !valid_workflow_ref(ref)) {
+        throw EvaluationError(where + ": invalid reusable workflow reference: " + uses);
+      }
+      path = parts[2] + "/" + parts[3] + "/" + parts[4];
+      if (!valid_workflow_path(path)) throw EvaluationError(where + ": invalid workflow path " + uses);
+      const auto entry = run_.repositories.fetch(parts[0], parts[1], ref, [this](std::string_view m) {
+        run_.console.line(run_.console.paint(run_.masker.mask(m), Color::Gray));
+      });
+      called.root = entry.dir;
+      called.display = uses;
+    }
+    if (!valid_workflow_path(path)) throw EvaluationError(where + ": invalid workflow path " + uses);
+    called.root = fs::canonical(called.root);
+    called.path = fs::canonical(called.root / path);
+    if (!util::is_subpath(called.path, called.root)) {
+      throw EvaluationError(where + ": invalid workflow path " + uses);
+    }
+    called.workflow = std::make_shared<workflow::Workflow>(workflow::load_workflow(called.path, called.display));
     return called;
   }
 
@@ -428,16 +488,36 @@ class WorkflowExecutor {
     caller.reason = "calls " + job.uses;
     std::vector<JobReport> nested_reports;
     try {
+      if (inst.cancel) {
+        caller.result = "cancelled";
+        caller.reason = "the calling job was cancelled";
+        return {std::move(caller)};
+      }
+      auto ctx = job_level_context(inst.needs, inst.matrix, inst.strategy);
+      if (job.permissions != nullptr) {
+        run_.console.line(run_.console.paint(
+            run_.masker.mask("[" + inst.name +
+                             "] 'permissions' are not emulated; explicitly supplied tokens retain their original permissions"),
+            Color::Yellow));
+      }
+      if (job.concurrency != nullptr) {
+        run_.console.line(run_.console.paint(
+            run_.masker.mask("[" + inst.name + "] " +
+                             describe_concurrency(job.concurrency, ctx, scope_for(Site::JobGeneral), wf_.file)),
+            Color::Gray));
+      }
       if (wr_.depth + 1 >= kMaxCallDepth) {
         throw EvaluationError("Reusable workflows can be nested up to " + std::to_string(kMaxCallDepth) + " levels");
       }
       const auto where = location(wf_.file, job.node);
       auto called = load_called(job.uses, where);
+      if (std::find(wr_.call_stack.begin(), wr_.call_stack.end(), called.path) != wr_.call_stack.end()) {
+        throw EvaluationError(where + ": reusable workflow call cycle: " + called.display);
+      }
       const auto& cwf = *called.workflow;
       if (cwf.find_trigger("workflow_call") == nullptr) {
         throw EvaluationError(where + ": " + called.display + " is not a reusable workflow (no 'workflow_call' trigger)");
       }
-      auto ctx = job_level_context(inst.needs, inst.matrix, inst.strategy);
       const auto site = scope_for(Site::JobEnv);
       // inputs
       std::map<std::string, Value> given;
@@ -472,10 +552,22 @@ class WorkflowExecutor {
       if (job.secrets != nullptr && job.secrets->is_scalar() && job.secrets->text == "inherit") {
         secrets = wr_.secrets;
       } else if (job.secrets != nullptr && job.secrets->is_mapping()) {
-        for (const auto& [k, v] : evaluate_string_map(job.secrets, ctx, site, wf_.file)) secrets[k] = v;
+        for (const auto& e : job.secrets->entries) {
+          const auto value = evaluate_string(e.value, ctx, site, wf_.file);
+          run_.masker.add(value);
+          const auto it = std::find_if(cwf.call_secrets.begin(), cwf.call_secrets.end(),
+                                      [&](const auto& s) { return util::iequals(s.name, e.key->text); });
+          if (it == cwf.call_secrets.end()) {
+            throw EvaluationError(where + ": invalid secret, " + e.key->text +
+                                  " is not defined in the referenced workflow");
+          }
+          secrets[it->name] = value;
+        }
       }
       for (const auto& s : cwf.call_secrets) {
-        if (s.required && secrets.count(s.name) == 0) {
+        const auto found = std::find_if(secrets.begin(), secrets.end(),
+                                        [&](const auto& e) { return util::iequals(e.first, s.name); });
+        if (s.required && found == secrets.end()) {
           throw EvaluationError(where + ": secret required and not supplied: " + s.name);
         }
       }
@@ -497,9 +589,11 @@ class WorkflowExecutor {
       child.key_prefix = inst.key + " / ";
       child.depth = wr_.depth + 1;
       child.artifacts = wr_.artifacts;
-      child.repo_root = wr_.repo_root;
+      child.repo_root = called.root;
+      child.call_stack = wr_.call_stack;
+      child.call_stack.push_back(called.path);
       std::mutex nested_mutex;
-      WorkflowExecutor nested(run_, child, nested_reports, nested_mutex, nullptr);
+      WorkflowExecutor nested(run_, child, nested_reports, nested_mutex, nullptr, &inst);
       nested.execute();
       std::vector<std::string> results;
       auto jobs = Value::object();
@@ -528,7 +622,7 @@ class WorkflowExecutor {
       caller.reason = e.what();
       run_.console.line(run_.console.paint(run_.masker.mask("[" + inst.name + "] " + e.what()), Color::Red));
     }
-    if (run_.cancelled && caller.result == "success") caller.result = "cancelled";
+    if ((run_.cancelled || inst.cancel) && caller.result == "success") caller.result = "cancelled";
     caller.duration_ms = elapsed_ms(started);
     std::vector<JobReport> out;
     out.push_back(std::move(caller));
@@ -544,6 +638,9 @@ class WorkflowExecutor {
   std::map<std::string, JobNode> nodes_;
   std::mutex mutex_;
   std::condition_variable cv_;
+  JobInstance* parent_;
+  std::mutex active_mutex_;
+  std::vector<JobInstance*> active_;
 };
 
 // Jobs to run: the selected ids and (optionally) their transitive needs.
@@ -742,6 +839,7 @@ RunReport Runner::run(const std::vector<Selection>& selection, const Event& even
     wr.vars = to_object(options.vars);
     wr.artifacts = options.run_dir / "artifacts" / wr.run_id;
     wr.repo_root = git.root.empty() ? fs::current_path() : git.root;
+    wr.call_stack.push_back(fs::weakly_canonical(s.file->path.empty() ? wr.repo_root / wr.file : s.file->path));
     item->jobs = job_selection(wf, options);
     items.push_back(std::move(item));
   }

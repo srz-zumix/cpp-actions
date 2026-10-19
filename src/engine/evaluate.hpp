@@ -43,4 +43,8 @@ std::vector<std::pair<std::string, std::string>> evaluate_string_map(const yaml:
 // objects.
 std::string scalar_to_string(const expr::Value& value, std::string_view where);
 
+// Evaluates concurrency for diagnostics only; no locking or cancellation is applied.
+std::string describe_concurrency(const yaml::Node* node, const expr::EvalContext& context,
+                                 const expr::Scope& scope, const std::string& file);
+
 }  // namespace cpa::engine

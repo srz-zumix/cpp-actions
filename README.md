@@ -195,6 +195,71 @@ python, pwsh, and custom commands containing `{0}`, with `defaults.run`,
 `working-directory`, and scoped environments. Tools must be installed on the host.
 Workflow contexts, step/job outputs, and workspace-relative `hashFiles` are supported.
 
+### Reusable workflows and job settings (Phase 6)
+
+Jobs can call `./.github/workflows/build.yml` or
+`owner/repo/.github/workflows/build.yml@ref`. Remote refs are resolved to a
+commit and cached like actions. Nested local calls resolve relative to the
+repository containing the called workflow. Checkouts still use the caller's
+working-tree snapshot. Calls support typed `workflow_call` inputs and defaults,
+explicit secrets or `secrets: inherit`, and workflow outputs forwarded through
+`needs.<job>.outputs`. Secrets are not forwarded unless requested; inheritance
+applies only to the immediate call. Nesting is limited to ten workflow levels.
+
+For example, a caller can pass an input and consume the returned output:
+
+```yaml
+jobs:
+  build:
+    uses: ./.github/workflows/build.yml
+    with:
+      configuration: release
+    secrets: inherit
+  check:
+    needs: build
+    runs-on: macos-latest
+    steps:
+      - run: echo "${{ needs.build.outputs.result }}"
+```
+
+The called `.github/workflows/build.yml` declares its interface:
+
+```yaml
+on:
+  workflow_call:
+    inputs:
+      configuration: {type: string, default: debug}
+    outputs:
+      result:
+        value: ${{ jobs.compile.outputs.result }}
+jobs:
+  compile:
+    runs-on: macos-latest
+    outputs:
+      result: ${{ steps.build.outputs.result }}
+    steps:
+      - id: build
+        run: echo 'result=${{ inputs.configuration }}' >> "$GITHUB_OUTPUT"
+```
+
+Input values must match the declared string, boolean, or number type; quoted
+`"true"` is not a boolean. Explicitly passed secrets must be declared by the
+callee, whereas `inherit` can forward undeclared secrets.
+
+`strategy.matrix` and `runs-on` are evaluated after `needs` completes, so
+`fromJSON(needs.prepare.outputs.matrix)` and JSON runner-label arrays work.
+Use repeated `--host-label LABEL` options or configuration `host-labels` to
+map custom/self-hosted labels to the local host. These are explicit overrides,
+not operating-system or toolchain emulation.
+
+Jobs selecting an `environment` load that environment's configured secrets and
+variables; environment values override repository values for that job only.
+Environment names are matched case-insensitively. Protection rules, approvals,
+and deployment APIs are not emulated. `concurrency` groups and
+`cancel-in-progress` are evaluated and displayed only: they do not serialize or
+cancel runs. Workflow/job `permissions` emit a warning; they do not reduce the
+permissions of an explicitly supplied token.
+
 Self-repository `actions/checkout` uses a snapshot of the local working tree,
 including uncommitted modifications, deletions, and non-ignored untracked files.
 Git history is copied, including from linked worktrees; any snapshot commit is

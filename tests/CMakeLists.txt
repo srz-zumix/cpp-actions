@@ -23,6 +23,7 @@ add_executable(cpa_unit_tests
   unit/builtin_sandbox_test.cpp
   unit/commands_test.cpp
   unit/engine_test.cpp
+  unit/reusable_workflow_test.cpp
   unit/snapshot_test.cpp
 )
 target_link_libraries(cpa_unit_tests PRIVATE cpa_core cpa_iutest)

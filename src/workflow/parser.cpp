@@ -241,6 +241,84 @@ class Parser {
     }
   }
 
+  void check_call_value(const Node* n, Site site, std::string_view what, std::string_view type = {}) {
+    auto valid_type = [&](const expr::Value& value) {
+      if (type == "string") return value.is_string();
+      if (type == "boolean") return value.is_bool();
+      if (type == "number") return value.is_number();
+      return value.is_string() || value.is_bool() || value.is_number();
+    };
+    const std::string expected = type.empty() ? "a string, boolean or number" : "a " + std::string(type);
+    if (!n->is_scalar() || n->is_null()) {
+      error(n, "'" + std::string(what) + "' must be " + expected);
+      return;
+    }
+    if (n->is_string() && expr::contains_expression(n->text)) {
+      try {
+        const auto expression = expr::Expression::parse(
+            expr::template_to_expression(expr::split_template(n->text)), scope_for(site));
+        // Context-dependent results can only be type-checked when the caller runs.
+        if (expression.root().type == expr::NodeType::NamedValue ||
+            (expression.referenced_named_values().empty() &&
+             !valid_type(expr::evaluate(expression, expr::EvalContext{})))) {
+          error(n, "'" + std::string(what) + "' must be " + expected);
+        }
+      } catch (const std::exception& e) {
+        error(n, e.what());
+      }
+    } else if (!valid_type(yaml::to_value(*n))) {
+      error(n, "'" + std::string(what) + "' must be " + expected);
+    }
+  }
+
+  void check_call_arguments(const Node* n, bool secrets) {
+    if (secrets && n->is_string() && n->text == "inherit") return;
+    const std::string what = secrets ? "secrets" : "with";
+    if (!n->is_mapping()) {
+      error(n, "'" + what + "' must be " + (secrets ? "a mapping or 'inherit'" : "a mapping"));
+      return;
+    }
+    for (const auto& e : n->entries) {
+      if (expr::contains_expression(e.key->text)) {
+        error(e.key, "A template expression is not allowed in a mapping key");
+      }
+      check_call_value(e.value, secrets ? Site::JobEnv : Site::JobGeneral,
+                       what + "." + e.key->text, secrets ? "string" : "");
+    }
+  }
+
+  void check_workflow_uses(const Node* uses) {
+    if (!uses->is_string() || uses->text.empty()) {
+      error(uses, "'uses' must be a non-empty string");
+      return;
+    }
+    const auto& value = uses->text;
+    if (expr::contains_expression(value)) {
+      check_no_expression(uses, "uses");
+      return;
+    }
+    const bool local = value.starts_with("./");
+    const auto at = value.find('@');
+    const auto path = local ? value.substr(2) : value.substr(0, at);
+    const auto parts = util::split(path, '/');
+    const auto offset = local ? 0u : 2u;
+    bool valid = parts.size() == offset + 3;
+    if (valid) {
+      valid = parts[offset] == ".github" && parts[offset + 1] == "workflows" &&
+              (parts.back().ends_with(".yml") || parts.back().ends_with(".yaml"));
+      for (const auto& part : parts) {
+        if (part.empty() || part == "." || part == ".." ||
+            part.find_first_of("\\@ \t\r\n") != std::string::npos) valid = false;
+      }
+    }
+    valid = valid && (local ? at == std::string::npos
+                           : at != std::string::npos && at + 1 < value.size());
+    if (!valid) {
+      error(uses, "Expected reusable workflow format ./.github/workflows/{file}.yml or "
+                  "{owner}/{repo}/.github/workflows/{file}.yml@ref. Actual '" + value + "'");
+    }
+  }
+
   void check_condition(const Node* n, Site site) {
     if (!n->is_scalar()) {
       error(n, "'if' must be a string, boolean or number");
@@ -471,6 +549,8 @@ class Parser {
             in.type = t->scalar_string();
             if (in.type != "string" && in.type != "boolean" && in.type != "number") {
               error(t, "Unexpected input type '" + in.type + "'. Expected string, boolean or number");
+            } else if (in.default_value != nullptr) {
+              check_call_value(in.default_value, Site::RunName, "default", in.type);
             }
           }
           wf.call_inputs.push_back(std::move(in));
@@ -630,7 +710,11 @@ class Parser {
       check_template(n, Site::JobGeneral);
     } else if (n->is_mapping()) {
       check_keys(*n, {"name", "url", "deployment"});
-      if (const Node* name = n->get("name")) check_string_template(name, Site::JobGeneral, "name");
+      if (const Node* name = n->get("name")) {
+        check_string_template(name, Site::JobGeneral, "name");
+      } else {
+        error(n, "Required property is missing: name");
+      }
       if (const Node* url = n->get("url")) check_string_template(url, Site::JobOutputs, "url");
     } else {
       error(n, "'environment' must be a string or a mapping");
@@ -653,7 +737,7 @@ class Parser {
     const Node* uses = n->get("uses");
     if (uses != nullptr) {
       check_keys(*n, {"name", "uses", "with", "secrets", "needs", "if", "permissions", "strategy", "concurrency"});
-      check_no_expression(uses, "uses");
+      check_workflow_uses(uses);
       job.uses = uses->scalar_string();
     } else {
       check_keys(*n, {"name", "needs", "runs-on", "permissions", "environment", "concurrency", "outputs", "env",
@@ -694,8 +778,9 @@ class Parser {
 
     if (uses != nullptr) {
       job.with = n->get("with");
-      if (job.with != nullptr) check_template(job.with, Site::JobEnv);
+      if (job.with != nullptr) check_call_arguments(job.with, false);
       job.secrets = n->get("secrets");
+      if (job.secrets != nullptr) check_call_arguments(job.secrets, true);
       return job;
     }
 

@@ -315,7 +315,9 @@ void JobRunner::build_base_environment() {
 }
 
 void JobRunner::load_environment(const std::string& name) {
-  auto it = run_.options.environments.find(name);
+  auto it = std::find_if(run_.options.environments.begin(), run_.options.environments.end(),
+                         [&](const auto& entry) { return util::iequals(entry.first, name); });
+  log_->info("Environment protection rules and deployment APIs are not emulated", Color::Gray);
   if (it == run_.options.environments.end()) {
     log_->info("Environment '" + name + "' is not configured; using the repository secrets and variables",
                Color::Gray);
@@ -353,11 +355,18 @@ bool JobRunner::evaluate_job_settings() {
   if (job_.container != nullptr || job_.services != nullptr) {
     throw EvaluationError("Jobs with 'container' or 'services' need Docker, which is not supported by cpp-actions");
   }
+  if (job_.permissions != nullptr) {
+    log_->warning("'permissions' are not emulated; explicitly supplied tokens retain their original permissions");
+  }
+  if (job_.concurrency != nullptr) {
+    log_->info(describe_concurrency(job_.concurrency, ctx, general, wf_.file), Color::Gray);
+  }
   if (job_.environment != nullptr) {
-    const auto env = evaluate_token(job_.environment, ctx, general, wf_.file);
-    std::string name = env.is_object() ? env.get("name").to_string() : env.to_string();
+    const auto* name_token = job_.environment->is_mapping() ? job_.environment->get("name") : job_.environment;
+    const auto name = evaluate_string(name_token, ctx, general, wf_.file);
     if (!name.empty()) load_environment(name);
   }
+  ctx = job_context({});
   if (job_.timeout_minutes != nullptr) {
     timeout_minutes_ = evaluate_token(job_.timeout_minutes, ctx, general, wf_.file).to_number();
   }
