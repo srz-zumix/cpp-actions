@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <exception>
+#include <map>
 #include <sstream>
 #include <thread>
 
@@ -273,6 +274,31 @@ jobs:
   IUTEST_EXPECT_EQ("failure", report.result);
   IUTEST_EXPECT_NE(std::string::npos, reusable_job(report, "call").reason.find("secret required and not supplied"));
   IUTEST_EXPECT_EQ(1u, report.workflows.front().jobs.size());
+}
+
+IUTEST(ReusableWorkflowTest, InheritedRequiredSecretNamesAreCaseInsensitiveAndStillRequired) {
+  for (bool supplied : {false, true}) {
+    ReusableRun test;
+    test.options.secrets = supplied ? std::map<std::string, std::string>{{"token", "inherited-case-token"}}
+                                   : std::map<std::string, std::string>{{"OTHER", "unrelated-token"}};
+    test.workflow("leaf.yml", R"(
+on:
+  workflow_call:
+    secrets:
+      TOKEN: {required: true}
+jobs:
+  leaf:
+    runs-on: test-host
+    steps:
+      - run: test '${{ secrets.TOKEN }}' = inherited-case-token
+)");
+    const auto report = test.run(call("./.github/workflows/leaf.yml", "    secrets: inherit\n"));
+    IUTEST_EXPECT_EQ(supplied ? "success" : "failure", report.result) << test.output.str();
+    if (!supplied) {
+      IUTEST_EXPECT_NE(std::string::npos, reusable_job(report, "call").reason.find("secret required and not supplied"));
+      IUTEST_EXPECT_EQ(1u, report.workflows.front().jobs.size());
+    }
+  }
 }
 
 IUTEST(ReusableWorkflowTest, MissingAndUnknownArgumentsFailBeforeJobsStart) {
@@ -637,4 +663,47 @@ jobs:
   IUTEST_EXPECT_EQ("failure", report.result);
   IUTEST_EXPECT_NE(std::string::npos, reusable_job(report, "call").reason.find("concurrency.group"));
   IUTEST_EXPECT_EQ(1u, report.workflows.front().jobs.size());
+}
+
+IUTEST(ReusableWorkflowTest, MatrixOutputsUseLastSuccessfulNonEmptyValue) {
+  ReusableRun test;
+  test.workflow("leaf.yml", R"(
+on:
+  workflow_call:
+    inputs:
+      mode: {type: string}
+    outputs:
+      answer:
+        value: ${{ jobs.leaf.outputs.answer }}
+jobs:
+  leaf:
+    runs-on: test-host
+    outputs:
+      answer: ${{ steps.make.outputs.answer }}
+    steps:
+      - id: make
+        run: |
+          case '${{ inputs.mode }}' in
+            first) echo answer=kept >> "$GITHUB_OUTPUT" ;;
+            second) sleep 0.15; echo answer=kept >> "$GITHUB_OUTPUT" ;;
+            empty) sleep 0.3; echo answer= >> "$GITHUB_OUTPUT" ;;
+            failed) sleep 0.45; echo answer=failed >> "$GITHUB_OUTPUT"; exit 1 ;;
+          esac
+)");
+  const auto report = test.run(call("./.github/workflows/leaf.yml", R"(
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [first, second, empty, failed]
+    with:
+      mode: ${{ matrix.mode }}
+  verify:
+    if: always()
+    needs: call
+    runs-on: test-host
+    steps:
+      - run: test '${{ needs.call.outputs.answer }}' = kept
+)"));
+  IUTEST_EXPECT_EQ("failure", report.result) << test.output.str();
+  IUTEST_EXPECT_EQ("success", reusable_job(report, "verify").result) << test.output.str();
 }

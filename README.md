@@ -245,6 +245,7 @@ jobs:
 Input values must match the declared string, boolean, or number type; quoted
 `"true"` is not a boolean. Explicitly passed secrets must be declared by the
 callee, whereas `inherit` can forward undeclared secrets.
+For matrix calls, each output retains the last successful non-empty value.
 
 `strategy.matrix` and `runs-on` are evaluated after `needs` completes, so
 `fromJSON(needs.prepare.outputs.matrix)` and JSON runner-label arrays work.

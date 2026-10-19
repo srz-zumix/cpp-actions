@@ -428,7 +428,9 @@ class WorkflowExecutor {
         {
           std::lock_guard lock(group_mutex);
           results.push_back(effective);
-          for (const auto& [k, v] : main.outputs) outputs[k] = v;
+          for (const auto& [k, v] : main.outputs) {
+            if (job.uses.empty() || (main.result == "success" && !v.empty())) outputs[k] = v;
+          }
           if (fail_fast && effective == "failure" && !fail_fast_triggered.exchange(true)) {
             for (auto& other : instances) {
               if (other.get() != inst) other->cancel = true;
@@ -522,7 +524,9 @@ class WorkflowExecutor {
       // inputs
       std::map<std::string, Value> given;
       if (job.with != nullptr && job.with->is_mapping()) {
-        for (const auto& e : job.with->entries) given[e.key->text] = evaluate_token(e.value, ctx, site, wf_.file);
+        for (const auto& e : job.with->entries) {
+          given[e.key->text] = evaluate_token(e.value, ctx, scope_for(Site::JobGeneral), wf_.file);
+        }
       }
       auto inputs = Value::object();
       for (const auto& [k, v] : given) {
