@@ -958,7 +958,7 @@ void JobRunner::run_post_steps() {
         }
       } else {
         result = run_node(scope, post.id, *post.action, post.resolved, post.inputs, post.action->post, post.state,
-                          env, std::nullopt, true);
+                          env, std::chrono::minutes(5), true);
       }
     } catch (const std::exception& e) {
       result.outcome = "failure";

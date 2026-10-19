@@ -176,7 +176,11 @@ IUTEST(ActionFetchTest, ExplicitNode) {
 
 IUTEST(ActionTest, ExplicitRuntimeDoesNotExposeParentDirectory) {
   if (!engine::host_is_macos()) IUTEST_SKIP() << "Seatbelt isolation requires macOS";
-  cpa_test::TempDir dir;
+  struct ProtectedFixture {
+    const std::filesystem::path root = util::make_temp_dir("cpa-runtime-test-", util::home_dir());
+    ~ProtectedFixture() { util::remove_tree(root); }
+    std::filesystem::path operator/(const char* path) const { return root / path; }
+  } dir;
   const auto node = dir / "private-runtime/runtime";
   util::write_file(node, "#!/bin/sh\nexec /bin/sh \"$@\"\n");
   util::make_executable(node);
