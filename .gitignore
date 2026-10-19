@@ -43,6 +43,7 @@
 build/
 Build/
 build-*/
+.cpa-engine-build/
 
 # CMake generated files
 CMakeFiles/

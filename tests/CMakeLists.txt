@@ -15,6 +15,13 @@ add_executable(cpa_unit_tests
   unit/event_test.cpp
   unit/catalog_test.cpp
   unit/config_test.cpp
+  unit/action_test.cpp
+  unit/builtin_test.cpp
+  unit/action_runner_test.cpp
 )
 target_link_libraries(cpa_unit_tests PRIVATE cpa_core cpa_iutest)
 add_test(NAME unit COMMAND cpa_unit_tests)
+add_test(NAME cli COMMAND ${CMAKE_COMMAND}
+  -DCLI=$<TARGET_FILE:cpp-actions>
+  -DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/cli-test
+  -P ${CMAKE_CURRENT_SOURCE_DIR}/cli/run.cmake)

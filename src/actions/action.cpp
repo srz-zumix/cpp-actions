@@ -119,15 +119,23 @@ Action load_action(const fs::path& dir, const std::string& display) {
 
   if (const auto* inputs = root->get("inputs"); inputs != nullptr && !inputs->is_null()) {
     if (!inputs->is_mapping()) throw fail(inputs, "'inputs' must be a mapping");
+    std::set<std::string> names;
     for (const auto& e : inputs->entries) {
+      if (!e.key->is_string() || e.key->text.empty()) throw fail(e.key, "Input names must be non-empty strings");
+      if (!names.insert(util::to_lower(e.key->text)).second) throw fail(e.key, "Duplicate input name");
+      if (!e.value->is_mapping()) throw fail(e.value, "Input metadata must be a mapping");
       ActionInput in;
       in.name = e.key->text;
       if (e.value->is_mapping()) {
         if (const auto* d = e.value->get("description")) in.description = d->scalar_string();
         if (const auto* r = e.value->get("required")) {
+          if (r->kind != yaml::NodeKind::Boolean) throw fail(r, "'required' must be a boolean");
           in.required = r->kind == yaml::NodeKind::Boolean ? r->boolean : util::iequals(r->scalar_string(), "true");
         }
         in.default_value = e.value->get("default");
+        if (in.default_value != nullptr && !in.default_value->is_scalar()) {
+          throw fail(in.default_value, "Input defaults must be scalar values");
+        }
         if (const auto* d = e.value->get("deprecationMessage")) in.deprecation_message = d->scalar_string();
       }
       action.inputs.push_back(std::move(in));
@@ -139,14 +147,23 @@ Action load_action(const fs::path& dir, const std::string& display) {
   action.runs = runs;
   const yaml::Node* using_node = runs->get("using");
   if (using_node == nullptr) throw fail(runs, "Required property is missing: using");
+  if (!using_node->is_string()) throw fail(using_node, "'using' must be a string");
   action.runtime = util::to_lower(using_node->scalar_string());
 
   if (const auto* outputs = root->get("outputs"); outputs != nullptr && !outputs->is_null()) {
     if (!outputs->is_mapping()) throw fail(outputs, "'outputs' must be a mapping");
+    std::set<std::string> names;
     for (const auto& e : outputs->entries) {
+      if (!e.key->is_string() || e.key->text.empty()) throw fail(e.key, "Output names must be non-empty strings");
+      if (!names.insert(util::to_lower(e.key->text)).second) throw fail(e.key, "Duplicate output name");
+      if (!e.value->is_mapping()) throw fail(e.value, "Output metadata must be a mapping");
       ActionOutput out;
       out.name = e.key->text;
       if (e.value->is_mapping()) out.value = e.value->get("value");
+      if (out.value != nullptr && !out.value->is_scalar()) throw fail(out.value, "Output values must be scalar");
+      if (action.runtime == "composite" && out.value == nullptr) {
+        throw fail(e.value, "Required property is missing: value");
+      }
       action.outputs.push_back(out);
     }
   }
@@ -175,6 +192,7 @@ Action load_action(const fs::path& dir, const std::string& display) {
   action.kind = ActionKind::Node;
   auto string_of = [&](const char* key) -> std::string {
     const auto* n = runs->get(key);
+    if (n != nullptr && !n->is_string()) throw fail(n, std::string("'") + key + "' must be a string");
     return n != nullptr ? n->scalar_string() : std::string();
   };
   action.main = string_of("main");
@@ -183,6 +201,9 @@ Action load_action(const fs::path& dir, const std::string& display) {
   action.post = string_of("post");
   action.pre_if = runs->get("pre-if");
   action.post_if = runs->get("post-if");
+  for (const auto* condition : {action.pre_if, action.post_if}) {
+    if (condition != nullptr && !condition->is_scalar()) throw fail(condition, "Action conditions must be scalar");
+  }
   return action;
 }
 

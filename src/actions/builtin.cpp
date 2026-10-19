@@ -118,7 +118,7 @@ void safe_copy_tree(const fs::path& from, const fs::path& to) {
   if (fs::is_symlink(top) || (fs::exists(top) && !fs::is_directory(top))) fs::remove(to);
   fs::create_directories(to);
   for (auto it = fs::recursive_directory_iterator(from); it != fs::recursive_directory_iterator(); ++it) {
-    const auto dest = to / fs::relative(it->path(), from);
+    const auto dest = to / it->path().lexically_relative(from);
     const auto dest_status = fs::symlink_status(dest, ec);
     if (it->is_directory() && !it->is_symlink()) {
       if (fs::is_symlink(dest_status) || (fs::exists(dest_status) && !fs::is_directory(dest_status))) {
@@ -183,7 +183,7 @@ BuiltinResult checkout(const Inputs& in, const BuiltinContext& ctx) {
   const bool self = ctx.repository.empty() ? repository.empty() : util::iequals(repository, ctx.repository);
   if (self || repository.empty()) {
     const auto& snapshot = ctx.snapshot();
-    workspace::copy_snapshot(snapshot, target);
+    safe_copy_tree(snapshot.dir, target);
     if (ctx.info) {
       ctx.info(std::string("Copied the working tree") + (snapshot.dirty ? " (including uncommitted changes)" : "") +
                " to " + target.string());
@@ -205,6 +205,7 @@ BuiltinResult checkout(const Inputs& in, const BuiltinContext& ctx) {
         }
       } else if (ref.starts_with("refs/heads/")) {
         sha = rev_parse(target, "refs/remotes/origin/" + name);
+        if (!sha) sha = rev_parse(target, ref);
         branch = sha.has_value();
       } else {
         sha = rev_parse(target, ref);
@@ -294,7 +295,9 @@ std::optional<CacheEntry> find_cache(const fs::path& store, const std::string& k
   for (const auto& e : entries) {
     if (e.key == key && e.version == version) return e;
   }
-  for (const auto& prefix : restore_keys) {
+  auto prefixes = restore_keys;
+  prefixes.insert(prefixes.begin(), key);
+  for (const auto& prefix : prefixes) {
     const CacheEntry* best = nullptr;
     for (const auto& e : entries) {
       if (e.version != version || !e.key.starts_with(prefix)) continue;
@@ -349,10 +352,25 @@ std::vector<fs::path> resolve_paths(const std::vector<std::string>& lines, const
     }
   }
   if (!excludes.empty()) {
+    std::vector<fs::path> expanded;
+    for (const auto& p : result) {
+      if (!fs::is_directory(fs::symlink_status(p))) {
+        expanded.push_back(p);
+        continue;
+      }
+      if (fs::is_empty(p)) expanded.push_back(p);
+      for (const auto& entry : fs::recursive_directory_iterator(p)) {
+        const auto st = entry.symlink_status();
+        if (!fs::is_directory(st) || fs::is_empty(entry.path())) expanded.push_back(entry.path());
+      }
+    }
+    result = std::move(expanded);
     std::erase_if(result, [&](const fs::path& p) {
-      const auto s = p.generic_string();
       for (const auto& ex : excludes) {
-        if (util::glob_match(ex, s) || util::is_subpath(p, ex)) return true;
+        for (auto ancestor = p; !ancestor.empty(); ancestor = ancestor.parent_path()) {
+          if (util::glob_match(ex, ancestor.generic_string())) return true;
+          if (ancestor == ancestor.root_path()) break;
+        }
       }
       return false;
     });
@@ -382,7 +400,12 @@ void restore_cache(const CacheEntry& entry, const BuiltinContext& ctx) {
 BuiltinResult save_cache(const std::string& key, const std::vector<std::string>& lines, const BuiltinContext& ctx) {
   BuiltinResult result;
   const auto version = cache_version(lines);
-  const auto paths = resolve_paths(lines, ctx);
+  auto paths = resolve_paths(lines, ctx);
+  std::erase_if(paths, [&](const fs::path& p) {
+    if (within(p, ctx.writable)) return false;
+    if (ctx.warning) ctx.warning("Skipping path outside of the writable directories: " + p.string());
+    return true;
+  });
   if (paths.empty()) {
     if (ctx.warning) {
       ctx.warning(
@@ -411,10 +434,6 @@ BuiltinResult save_cache(const std::string& key, const std::vector<std::string>&
     meta["paths"] = nlohmann::json::array();
     std::size_t i = 0;
     for (const auto& p : paths) {
-      if (!within(p, ctx.writable)) {
-        if (ctx.warning) ctx.warning("Skipping path outside of the writable directories: " + p.string());
-        continue;
-      }
       const auto cp = cache_path_of(p, ctx);
       safe_copy(p, tmp / "data" / std::to_string(i++));
       meta["paths"].push_back({{"base", cp.base}, {"rel", cp.rel}});
@@ -475,6 +494,7 @@ BuiltinResult cache_main(Builtin kind, const Inputs& in, const BuiltinContext& c
 
 BuiltinResult cache_post(const Inputs& in, const std::map<std::string, std::string>& state,
                          const BuiltinContext& ctx) {
+  if (!ctx.job_succeeded) return {};
   auto it = state.find("CACHE_KEY");
   const std::string key = it != state.end() ? it->second : input(in, "key");
   if (key.empty()) return {};
@@ -490,7 +510,7 @@ BuiltinResult cache_post(const Inputs& in, const std::map<std::string, std::stri
 // ---------------------------------------------------------------- artifacts
 
 bool valid_artifact_name(std::string_view name) {
-  if (name.empty()) return false;
+  if (name.empty() || name == "." || name == "..") return false;
   return name.find_first_of("\":<>|*?\r\n\\/") == std::string_view::npos;
 }
 
@@ -503,6 +523,9 @@ BuiltinResult upload_artifact(const Inputs& in, const BuiltinContext& ctx) {
   const auto lines = input_lines(input(in, "path"));
   if (lines.empty()) return fail("Input required and not supplied: path");
   const auto if_no_files = util::to_lower(input(in, "if-no-files-found", "warn"));
+  if (if_no_files != "warn" && if_no_files != "ignore" && if_no_files != "error") {
+    return fail("Unrecognized if-no-files-found input. Provided: " + if_no_files);
+  }
   const bool include_hidden = input_bool(in, "include-hidden-files", false);
 
   std::vector<fs::path> roots;
@@ -530,9 +553,6 @@ BuiltinResult upload_artifact(const Inputs& in, const BuiltinContext& ctx) {
         "No files were found with the provided path: " + util::join(lines, "\n") + ". No artifacts will be uploaded.";
     if (if_no_files == "error") return fail(message);
     if (if_no_files == "warn" && ctx.warning) ctx.warning(message);
-    if (if_no_files != "warn" && if_no_files != "ignore" && if_no_files != "error") {
-      return fail("Unrecognized if-no-files-found input. Provided: " + if_no_files);
-    }
     return result;
   }
   std::lock_guard lock(store_mutex());
@@ -585,7 +605,7 @@ BuiltinResult download_artifact(const Inputs& in, const BuiltinContext& ctx) {
   std::error_code ec;
   if (!name.empty()) {
     const auto src = ctx.artifact_store / name;
-    if (!valid_artifact_name(name) || !fs::is_directory(src, ec)) {
+    if (!valid_artifact_name(name) || !fs::is_directory(fs::symlink_status(src, ec))) {
       return fail("Unable to download artifact(s): Artifact not found for name: " + name);
     }
     safe_copy_tree(src, dest);
@@ -594,6 +614,7 @@ BuiltinResult download_artifact(const Inputs& in, const BuiltinContext& ctx) {
     std::vector<std::string> names;
     for (const auto& entry : fs::directory_iterator(ctx.artifact_store, ec)) {
       const auto n = entry.path().filename().string();
+      if (!fs::is_directory(entry.symlink_status()) || !valid_artifact_name(n)) continue;
       if (pattern.empty() || util::glob_match(pattern, n)) names.push_back(n);
     }
     std::sort(names.begin(), names.end());

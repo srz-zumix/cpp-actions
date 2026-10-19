@@ -134,6 +134,7 @@ struct PostStep {
   StringMap inputs;
   StringMap state;
   StringMap env;  // env context of the main step
+  const StepScope* scope = nullptr;
   const yaml::Node* condition = nullptr;
   std::string condition_text = "always()";
   std::string file;
@@ -229,11 +230,13 @@ class JobRunner {
   Value runner_ctx_;
   std::string status_ = "success";
   bool timed_out_ = false;
+  bool running_post_ = false;
   std::unique_ptr<sandbox::Sandbox> sandbox_;
   std::mutex pgid_mutex_;
   std::vector<pid_t> pgids_;
   std::vector<PostStep> post_steps_;
   std::vector<std::unique_ptr<actions::Action>> loaded_actions_;
+  std::vector<std::unique_ptr<StepScope>> composite_scopes_;
   bool echo_ = false;
   std::string stop_token_;
   StepScope top_;
@@ -364,7 +367,7 @@ void JobRunner::start_sandbox() {
     return;
   }
   sandbox::SandboxConfig config;
-  config.write = {job_dir_, tool_cache_};
+  config.write = {work_root_, home_, tmp_, tool_cache_};
   for (const auto& d : sandbox::darwin_user_dirs()) config.write.push_back(d);
   for (const auto& d : run_.options.sandbox.allow_write) config.write.push_back(d);
   const auto actions_dir = run_.options.cache_dir / "actions";
@@ -431,17 +434,20 @@ expr::EvalContext JobRunner::job_context(const StringMap& env) { return make_con
 
 std::string JobRunner::current_status(const StepScope* scope) const {
   if (is_cancelled() || status_ == "cancelled") return "cancelled";
-  if (status_ == "failure" || (scope != nullptr && scope->status == "failure")) return "failure";
+  if (status_ == "failure" || top_.status == "failure" || (scope != nullptr && scope->status == "failure")) {
+    return "failure";
+  }
   return "success";
 }
 
 expr::EvalContext JobRunner::make_context(const StepScope& scope, const StringMap& env) {
   expr::EvalContext ctx;
   auto c = Value::object();
-  if (scope.composite) {
+  if (scope.composite || !scope.action_path.empty()) {
     c.set("github", with_fields(github_, {{"action_path", scope.action_path.string()},
                                           {"action_repository", scope.action_repository},
-                                          {"action_ref", scope.action_ref}}));
+                                          {"action_ref", scope.action_ref},
+                                          {"action_status", current_status(&scope)}}));
   } else {
     c.set("github", github_);
   }
@@ -631,7 +637,7 @@ ResolvedAction JobRunner::resolve_action(const actions::ActionRef& ref) {
   ResolvedAction resolved;
   resolved.display = ref.display();
   if (ref.kind == actions::ActionRef::Kind::Local) {
-    resolved.dir = (workspace_ / ref.local_path).lexically_normal();
+    resolved.dir = util::real_path(workspace_ / ref.local_path);
     if (!util::is_subpath(resolved.dir, workspace_)) {
       throw actions::ActionError("The local action path '" + ref.local_path + "' is outside of the workspace");
     }
@@ -641,7 +647,10 @@ ResolvedAction JobRunner::resolve_action(const actions::ActionRef& ref) {
   const auto entry = run_.repositories.fetch(ref.owner, ref.repo, ref.ref, [log](std::string_view m) {
     log->info(std::string(m), Color::Gray);
   });
-  resolved.dir = ref.path.empty() ? entry.dir : entry.dir / ref.path;
+  resolved.dir = util::real_path(ref.path.empty() ? entry.dir : entry.dir / ref.path);
+  if (!util::is_subpath(resolved.dir, util::real_path(entry.dir))) {
+    throw actions::ActionError("The action path is outside of the repository: " + ref.path);
+  }
   resolved.repository = ref.full_name();
   resolved.ref = ref.ref;
   return resolved;
@@ -681,7 +690,7 @@ actions::BuiltinContext JobRunner::builtin_context() {
   actions::BuiltinContext bc;
   bc.workspace = workspace_;
   bc.home = home_;
-  bc.writable = {job_dir_, tool_cache_};
+  bc.writable = {work_root_, home_, tmp_, tool_cache_};
   for (const auto& d : run_.options.sandbox.allow_write) bc.writable.push_back(util::real_path(d));
   bc.cache_store = run_.options.cache_dir / "cache" / run_.repository;
   bc.artifact_store = wr_.artifacts;
@@ -708,6 +717,15 @@ StepResult JobRunner::run_uses(StepScope& scope, const workflow::Step& step, con
                                           scope_for(scope.general_site), scope.file)
                         : step.uses;
   const auto ref = actions::parse_action_ref(uses);
+  StringMap overrides = scope.env;
+  if (step.env != nullptr && step.env->is_mapping()) {
+    for (const auto& e : step.env->entries) overrides[e.key->text] = env.at(e.key->text);
+  }
+  auto action_env = [&]() {
+    auto values = global_env_;
+    for (const auto& [k, v] : overrides) values[k] = v;
+    return values;
+  };
   if (ref.kind == actions::ActionRef::Kind::Docker) {
     throw actions::ActionError("Docker container actions are not supported by cpp-actions: " + uses);
   }
@@ -731,7 +749,8 @@ StepResult JobRunner::run_uses(StepScope& scope, const workflow::Step& step, con
       post.builtin = builtin;
       post.inputs = inputs;
       post.state = r.state;
-      post.env = env;
+      post.env = overrides;
+      post.scope = &scope;
       post.condition_text = "success()";
       post_steps_.push_back(std::move(post));
     }
@@ -748,23 +767,12 @@ StepResult JobRunner::run_uses(StepScope& scope, const workflow::Step& step, con
     case actions::ActionKind::Docker:
       throw actions::ActionError("Docker container actions are not supported by cpp-actions: " + uses);
     case actions::ActionKind::Composite:
-      return run_composite(scope, name, *a, resolved, inputs, env);
+      return run_composite(scope, name, *a, resolved, inputs, overrides);
     case actions::ActionKind::Node:
       break;
   }
   StringMap state;
-  if (!a->pre.empty()) {
-    yaml::Node always;
-    always.kind = yaml::NodeKind::String;
-    always.text = "always()";
-    const auto* cond = a->pre_if != nullptr ? a->pre_if : &always;
-    if (evaluate_condition(cond, ctx, scope_for(Site::StepIf), a->file)) {
-      log_->info("  pre: " + a->pre, Color::Gray);
-      const auto pre = run_node(scope, step.id, *a, resolved, inputs, a->pre, state, env, timeout, after_cancel);
-      if (pre.outcome != "success") return pre;
-    }
-  }
-  result = run_node(scope, step.id, *a, resolved, inputs, a->main, state, env, timeout, after_cancel);
+  std::optional<std::size_t> post_index;
   if (!a->post.empty()) {
     PostStep post;
     post.name = "Post " + name;
@@ -772,12 +780,32 @@ StepResult JobRunner::run_uses(StepScope& scope, const workflow::Step& step, con
     post.action = a;
     post.resolved = resolved;
     post.inputs = inputs;
-    post.state = state;
-    post.env = env;
+    post.env = overrides;
+    post.scope = &scope;
     post.condition = a->post_if;
     post.file = a->file;
+    post_index = post_steps_.size();
     post_steps_.push_back(std::move(post));
   }
+  try {
+    if (!a->pre.empty()) {
+      yaml::Node always;
+      always.kind = yaml::NodeKind::String;
+      always.text = "always()";
+      const auto* cond = a->pre_if != nullptr ? a->pre_if : &always;
+      if (evaluate_condition(cond, ctx, scope_for(scope.if_site), a->file)) {
+        log_->info("  pre: " + a->pre, Color::Gray);
+        result = run_node(scope, step.id, *a, resolved, inputs, a->pre, state, action_env(), timeout, after_cancel);
+      }
+    }
+    if (result.outcome == "success") {
+      result = run_node(scope, step.id, *a, resolved, inputs, a->main, state, action_env(), timeout, after_cancel);
+    }
+  } catch (...) {
+    if (post_index) post_steps_[*post_index].state = state;
+    throw;
+  }
+  if (post_index) post_steps_[*post_index].state = std::move(state);
   return result;
 }
 
@@ -786,10 +814,10 @@ StepResult JobRunner::run_node(const StepScope& scope, const std::string& step_i
                                StringMap& state, const StringMap& env,
                                std::optional<std::chrono::milliseconds> timeout, bool after_cancel) {
   auto* log = log_.get();
+  const auto script = util::real_path(resolved.dir / file);
+  if (!util::is_subpath(script, resolved.dir)) throw actions::ActionError("Invalid action entry point: " + file);
   const auto node = run_.node.get(actions::node_major_version(action.runtime),
                                   [log](std::string_view m) { log->warning(m); });
-  const auto script = (resolved.dir / file).lexically_normal();
-  if (!util::is_subpath(script, resolved.dir)) throw actions::ActionError("Invalid action entry point: " + file);
   const auto files = prepare_file_commands();
   StepScope action_scope = scope;
   action_scope.action_path = resolved.dir;
@@ -816,7 +844,8 @@ StepResult JobRunner::run_composite(StepScope& parent, const std::string& name,
     throw actions::ActionError("Composite actions can be nested up to " + std::to_string(kMaxCompositeDepth) +
                                " levels");
   }
-  StepScope child;
+  composite_scopes_.push_back(std::make_unique<StepScope>());
+  auto& child = *composite_scopes_.back();
   child.composite = true;
   child.depth = parent.depth + 1;
   child.file = action.file;
@@ -828,11 +857,7 @@ StepResult JobRunner::run_composite(StepScope& parent, const std::string& name,
   child.general_site = Site::ActionStepGeneral;
   child.prefix = parent.prefix + name + " / ";
   // The env of the composite step (not the global env, which may change).
-  child.env = parent.env;
-  for (const auto& [k, v] : step_env) {
-    auto it = global_env_.find(k);
-    if (it == global_env_.end() || it->second != v) child.env[k] = v;
-  }
+  child.env = step_env;
   for (const auto& nested : action.steps) run_step(child, nested);
   StepResult result;
   if (child.status == "failure") {
@@ -856,6 +881,7 @@ StepResult JobRunner::run_composite(StepScope& parent, const std::string& name,
 }
 
 void JobRunner::run_post_steps() {
+  running_post_ = true;
   for (auto it = post_steps_.rbegin(); it != post_steps_.rend(); ++it) {
     auto& post = *it;
     StepReport sr;
@@ -863,16 +889,24 @@ void JobRunner::run_post_steps() {
     sr.name = post.name;
     sr.post = true;
     const auto step_started = Clock::now();
-    auto ctx = make_context(top_, post.env);
+    const auto& scope = post.scope != nullptr ? *post.scope : top_;
+    auto env = global_env_;
+    for (const auto& [k, v] : post.env) env[k] = v;
+    auto ctx = make_context(scope, env);
     yaml::Node text;
     text.kind = yaml::NodeKind::String;
     text.text = post.condition_text;
     bool run_it = false;
     try {
-      run_it = evaluate_condition(post.condition != nullptr ? post.condition : &text, ctx, scope_for(Site::StepIf),
+      run_it = evaluate_condition(post.condition != nullptr ? post.condition : &text, ctx, scope_for(scope.if_site),
                                   post.file.empty() ? wf_.file : post.file);
     } catch (const std::exception& e) {
       log_->error(e.what());
+      sr.outcome = sr.conclusion = "failure";
+      sr.error = e.what();
+      status_ = "failure";
+      report_.steps.push_back(std::move(sr));
+      continue;
     }
     if (!run_it) {
       sr.outcome = sr.conclusion = "skipped";
@@ -891,8 +925,8 @@ void JobRunner::run_post_steps() {
           log_->error(r.error);
         }
       } else {
-        result = run_node(top_, post.id, *post.action, post.resolved, post.inputs, post.action->post, post.state,
-                          post.env, std::nullopt, true);
+        result = run_node(scope, post.id, *post.action, post.resolved, post.inputs, post.action->post, post.state,
+                          env, std::nullopt, true);
       }
     } catch (const std::exception& e) {
       result.outcome = "failure";
@@ -908,6 +942,7 @@ void JobRunner::run_post_steps() {
     if (sr.outcome == "failure" && status_ == "success") status_ = "failure";
     report_.steps.push_back(std::move(sr));
   }
+  running_post_ = false;
 }
 
 // -------------------------------------------------------------- processes
@@ -993,7 +1028,7 @@ StepResult JobRunner::execute(std::vector<std::string> argv, util::Environment e
   CommandState cs;
   cs.allow_unsecure = util::iequals(env["ACTIONS_ALLOW_UNSECURE_COMMANDS"], "true");
   bool job_timeout = false;
-  if (deadline_) {
+  if (deadline_ && !running_post_) {
     const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(*deadline_ - Clock::now());
     const auto limit = std::max(remaining, std::chrono::milliseconds(1));
     if (!timeout || limit < *timeout) {
