@@ -275,6 +275,15 @@ void JobRunner::create_directories() {
   file_commands_dir_ = temp_ / "_runner_file_commands";
   event_path_ = temp_ / "_github_workflow" / "event.json";
   tool_cache_ = util::real_path(tool_cache_);
+  const auto control_root = control_dir_.parent_path();
+  for (const auto& d : {workspace_, temp_, home_, tmp_, tool_cache_,
+                        run_.options.cache_dir / "cache" / run_.repository, wr_.artifacts}) {
+    const auto allocated = util::real_path(d);
+    if (util::is_subpath(control_root, allocated) || util::is_subpath(allocated, control_root)) {
+      throw EvaluationError("Allocated action directory overlaps the protected job control directory: " +
+                            allocated.string());
+    }
+  }
   util::write_file(event_path_, wr_.payload.to_json_string(true));
 }
 
@@ -392,6 +401,8 @@ void JobRunner::start_sandbox() {
   config.allow_hosts = run_.options.sandbox.allow_hosts;
   config.allow_localhost = run_.options.sandbox.allow_localhost;
   config.profile_file = control_dir_ / "sandbox.sb";
+  config.extra_rules = "(deny file-read* file-write* (subpath " +
+                       sandbox::sbpl_quote(control_root.string()) + "))";
   auto* log = log_.get();
   sandbox_ = std::make_unique<sandbox::Sandbox>(config, [log](const std::string& host, int port) {
     log->warning("Blocked a connection to " + host + ":" + std::to_string(port) +
@@ -703,7 +714,7 @@ actions::BuiltinContext JobRunner::builtin_context() {
   actions::BuiltinContext bc;
   bc.workspace = workspace_;
   bc.home = home_;
-  bc.writable = {workspace_, temp_, home_, file_commands_dir_};
+  bc.writable = {workspace_, temp_, home_, tmp_, tool_cache_, file_commands_dir_};
   for (const auto& d : run_.options.sandbox.allow_write) {
     const auto writable = util::real_path(d);
     const auto control_root = control_dir_.parent_path();

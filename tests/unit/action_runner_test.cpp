@@ -1,8 +1,10 @@
 #include "iutest.hpp"
 
+#include <functional>
 #include <sstream>
 
 #include "engine/runner.hpp"
+#include "sandbox/profile.hpp"
 #include "test_support.hpp"
 
 using namespace cpa;
@@ -20,7 +22,8 @@ class ActionFixture {
   }
 
   JobReport run(const std::string& body, const std::filesystem::path& node = {},
-                const std::string& settings = {}) {
+                const std::string& settings = {},
+                const std::function<void(RunOptions&)>& configure = {}) {
     file(".github/workflows/test.yml",
          "on: push\njobs:\n  test:\n    runs-on: action-test-host\n" + settings +
              "    steps:\n      - uses: actions/checkout@v4\n" + body);
@@ -38,6 +41,7 @@ class ActionFixture {
     options.sandbox.enabled = false;
     options.node = node;
     options.parallel = 1;
+    if (configure) configure(options);
     std::ostringstream out;
     Console console(out, false);
     Runner runner(options, console);
@@ -352,15 +356,71 @@ IUTEST(ActionRunnerTest, JobTimeoutDoesNotConsumePostCleanupBudget) {
 }
 
 IUTEST(ActionRunnerTest, BuiltinDownloadsCannotWriteProtectedJobControlDirectory) {
-  ActionFixture f;
-  const auto job = f.run(R"(      - run: |
+  for (const auto& target : {"../..", "../../..", "../../../../../control"}) {
+    ActionFixture f;
+    const auto job = f.run(R"(      - run: |
           mkdir payload
           echo data > payload/file
       - uses: actions/upload-artifact@v4
         with: {name: payload, path: payload}
       - uses: actions/download-artifact@v4
-        with: {name: payload, path: ../../..}
-)");
-  IUTEST_EXPECT_EQ("failure", job.result) << f.log;
-  IUTEST_EXPECT_NE(std::string::npos, f.log.find("outside of the writable directories")) << f.log;
+        with: {name: payload, path: ')" + std::string(target) + "'}\n");
+    IUTEST_EXPECT_EQ("failure", job.result) << f.log;
+    IUTEST_EXPECT_NE(std::string::npos, f.log.find("outside of the writable directories")) << f.log;
+  }
+}
+
+IUTEST(ActionRunnerTest, SandboxProfilesUseSeparateProtectedControlDirectory) {
+  ActionFixture f;
+  for (const auto& root : sandbox::darwin_user_dirs()) {
+    if (util::is_subpath(util::real_path(f.dir.path()), util::real_path(root))) {
+      IUTEST_SKIP() << "Fixture root overlaps a system-writable sandbox directory";
+    }
+  }
+  const auto job = f.run("      - run: true\n", {}, {}, [](RunOptions& options) {
+    options.sandbox.enabled = true;
+    options.keep_workdir = true;
+  });
+  (void)job;  // Linux can generate the profile but cannot execute sandbox-exec.
+  const auto control = util::real_path(f.dir / "run/control");
+  IUTEST_ASSERT_TRUE(std::filesystem::is_directory(control));
+  std::size_t profiles = 0;
+  for (const auto& entry : std::filesystem::recursive_directory_iterator(control)) {
+    if (entry.path().extension() != ".sb") continue;
+    ++profiles;
+    const auto profile = util::read_file(entry.path());
+    const auto begin = profile.find("; Writable directories");
+    const auto end = profile.find("; Network", begin);
+    IUTEST_ASSERT_NE(std::string::npos, begin);
+    IUTEST_ASSERT_NE(std::string::npos, end);
+    const auto grants = profile.substr(begin, end - begin);
+    IUTEST_EXPECT_EQ(std::string::npos, grants.find(control.string()));
+    IUTEST_EXPECT_EQ(std::string::npos,
+                     grants.find("/jobs/" + entry.path().parent_path().filename().string() + "\")"));
+    IUTEST_EXPECT_NE(std::string::npos, profile.find(
+        "(deny file-read* file-write* (subpath " + sandbox::sbpl_quote(control.string()) + "))"));
+  }
+  IUTEST_EXPECT_EQ(1u, profiles);
+}
+
+IUTEST(ActionRunnerTest, RejectsWritableRootsOverlappingProtectedControls) {
+  for (const bool sandbox_enabled : {false, true}) {
+    ActionFixture f;
+    const auto job = f.run("      - run: true\n", {}, {}, [sandbox_enabled](RunOptions& options) {
+      options.sandbox.enabled = sandbox_enabled;
+      options.sandbox.allow_write.push_back(options.run_dir);
+    });
+    IUTEST_EXPECT_EQ("failure", job.result);
+    IUTEST_EXPECT_NE(std::string::npos, f.log.find("overlaps the protected job control directory")) << f.log;
+  }
+}
+
+IUTEST(ActionRunnerTest, RejectsCacheAllocationsOverlappingProtectedControls) {
+  ActionFixture f;
+  const auto job = f.run("      - run: true\n", {}, {}, [](RunOptions& options) {
+    options.cache_dir = options.run_dir / "control";
+  });
+  IUTEST_EXPECT_EQ("failure", job.result);
+  IUTEST_EXPECT_NE(std::string::npos,
+                   f.log.find("Allocated action directory overlaps the protected job control directory")) << f.log;
 }
