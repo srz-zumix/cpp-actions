@@ -803,10 +803,10 @@ RunReport Runner::run(const std::vector<Selection>& selection, const Event& even
   if (options.artifact_dir.empty()) options.artifact_dir = options.run_dir / "artifacts";
   options.artifact_dir = fs::weakly_canonical(fs::absolute(options.artifact_dir));
   for (const auto& protected_path : {options.run_dir / "jobs", options.run_dir / "control",
-                                      options.run_dir / "snapshot"}) {
+                                      options.run_dir / "snapshot", options.run_dir / "logs"}) {
     if (util::is_subpath(options.artifact_dir, protected_path) ||
         util::is_subpath(protected_path, options.artifact_dir)) {
-      throw std::invalid_argument("Artifact directory overlaps a job/control/snapshot directory: " +
+      throw std::invalid_argument("Artifact directory overlaps a job/control/snapshot/logs directory: " +
                                   options.artifact_dir.string());
     }
   }

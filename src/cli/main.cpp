@@ -374,6 +374,13 @@ fs::path clean_cache_dir(const CleanCli& o) {
   const bool explicit_config = !o.config_path.empty();
   const auto config_path = explicit_config ? config::expand_user(o.config_path) : config::default_config_path();
   if (explicit_config || fs::exists(config_path)) {
+    if (!explicit_config) {
+      const auto cwd = util::real_path(fs::current_path());
+      const auto root = workspace::find_repo_root(cwd).value_or(cwd);
+      if (util::is_subpath(util::real_path(config_path), root)) {
+        throw std::runtime_error("automatic configuration is inside the repository; use --config to trust it explicitly");
+      }
+    }
     const auto cfg = config::load_config(config_path);
     if (!cfg.cache_dir.empty()) {
       auto path = config::expand_user(cfg.cache_dir);

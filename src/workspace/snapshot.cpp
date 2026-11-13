@@ -120,6 +120,16 @@ Snapshot create_snapshot(const GitInfo& git, const fs::path& dest, const std::st
   } else {
     // Keep the cloned branch refs available for an explicit local checkout.
     must(dest, {"config", "--remove-section", "remote.origin"});
+    // Keep the source URL (without a fetch refspec) so that relative submodule URLs resolve
+    // against the original remote instead of the temporary workspace.
+    if (!git.remote_url.empty()) {
+      std::string url = git.remote_url;
+      const fs::path url_path(url);
+      if (url.find("://") == std::string::npos && url.find(':') == std::string::npos && url_path.is_relative()) {
+        url = (git.root / url_path).lexically_normal().string();
+      }
+      must(dest, {"config", "remote.origin.url", url});
+    }
   }
   return snap;
 }

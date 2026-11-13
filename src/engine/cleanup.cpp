@@ -114,15 +114,20 @@ std::optional<Target> resolve_recorded(const std::string& recorded, const fs::pa
   return Target{dir, true};
 }
 
-std::vector<fs::path> real_subdirectories(const fs::path& dir) {
-  std::vector<fs::path> out;
-  if (!is_real_directory(dir)) return out;
+// Returns false (and records an error) when the directory cannot be fully enumerated.
+bool real_subdirectories(const fs::path& dir, std::vector<fs::path>& out, std::vector<std::string>& errors) {
+  out.clear();
+  if (!is_real_directory(dir)) return true;
   std::error_code ec;
   for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
     if (is_real_directory(it->path())) out.push_back(it->path());
   }
+  if (ec) {
+    errors.push_back("cannot list " + dir.string() + ": " + ec.message());
+    return false;
+  }
   std::sort(out.begin(), out.end());
-  return out;
+  return true;
 }
 
 }  // namespace
@@ -200,8 +205,12 @@ CleanReport clean_retained_run(const fs::path& run_dir, const CleanOptions& opti
 
   std::vector<fs::path> removed_jobs;
   bool failed = false;
-  for (const auto& workflow_dir : real_subdirectories(rd / "jobs")) {
-    for (const auto& job_dir : real_subdirectories(workflow_dir)) {
+  std::vector<fs::path> workflow_dirs;
+  if (!real_subdirectories(rd / "jobs", workflow_dirs, report.errors)) failed = true;
+  for (const auto& workflow_dir : workflow_dirs) {
+    std::vector<fs::path> job_dirs;
+    if (!real_subdirectories(workflow_dir, job_dirs, report.errors)) failed = true;
+    for (const auto& job_dir : job_dirs) {
       std::vector<Target> targets;
       bool job_ok = true;
       for (const auto& [manifest, prefix, nested] :
