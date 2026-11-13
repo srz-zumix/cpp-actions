@@ -6,9 +6,19 @@
 #include <string_view>
 #include <vector>
 
+#include "util/process.hpp"
+
 namespace cpa::workspace {
 
 namespace fs = std::filesystem;
+
+// Hosted-runner defaults, without machine-specific credentials or URL rewrites.
+std::string_view default_git_config();
+// Selects an isolated global config and disables system config.
+void set_git_config_environment(util::Environment& env, const fs::path& global_config);
+// Host environment for internal Git commands, with inherited config overrides
+// removed and a private, process-local global config.
+util::Environment git_environment(util::Environment env = util::current_environment());
 
 struct GitHubRepo {
   std::string owner;

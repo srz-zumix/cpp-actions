@@ -43,6 +43,17 @@ IUTEST(GlobTest, GlobMatch) {
   IUTEST_EXPECT_TRUE(glob_match("./a/b", "a/b"));
 }
 
+IUTEST(GlobTest, GlobStringMatchesAcrossSlashes) {
+  IUTEST_EXPECT_TRUE(glob_match_string("*", "feature/nested/branch"));
+  IUTEST_EXPECT_TRUE(glob_match_string("feature/*", "feature/a/b"));
+  IUTEST_EXPECT_TRUE(glob_match_string("v*", "v"));
+  IUTEST_EXPECT_TRUE(glob_match_string("a**b*c", "ab-c"));
+  IUTEST_EXPECT_TRUE(glob_match_string("v+*", "v+1"));
+  IUTEST_EXPECT_FALSE(glob_match_string("v+*", "vv1"));
+  IUTEST_EXPECT_FALSE(glob_match_string("v1.*", "v1x2"));
+  IUTEST_EXPECT_FALSE(glob_match_string("v*", "release/v1"));
+}
+
 IUTEST(GlobTest, GlobFiles) {
   const auto root = temp_dir() / ("cpa-glob-" + random_hex(6));
   write_file(root / "a.lock", "1");

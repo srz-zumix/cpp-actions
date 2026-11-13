@@ -12,8 +12,12 @@
 #include <cerrno>
 #include <chrono>
 #include <memory>
+#include <cstdio>
+#include <ctime>
+#include <stdexcept>
 #include <system_error>
 
+#include "sandbox/connect.hpp"
 #include "util/strings.hpp"
 
 namespace cpa::sandbox {
@@ -26,8 +30,6 @@ constexpr int kNoSignal = 0;
 #endif
 constexpr std::size_t kMaxHeader = 64 * 1024;
 constexpr std::size_t kMaxBody = 64 * 1024 * 1024;
-constexpr int kMaxWorkers = 32;
-constexpr auto kConnectTimeout = std::chrono::seconds(3);
 
 void configure_socket(int fd) {
   ::fcntl(fd, F_SETFD, FD_CLOEXEC);
@@ -151,18 +153,43 @@ struct Resolution {
   std::mutex mutex;
   std::condition_variable ready;
   bool done = false;
+  int error = 0;
+  int system_error = 0;
   addrinfo* addresses = nullptr;
   ~Resolution() {
     if (addresses) ::freeaddrinfo(addresses);
   }
 };
-std::atomic<int> resolvers{0};
 
 }  // namespace
+
+bool detail::public_addresses(const addrinfo* first) {
+  for (auto* address = first; address; address = address->ai_next) {
+    if (private_address(address->ai_addr)) return false;
+  }
+  return true;
+}
 
 const std::vector<std::string>& default_allowed_hosts() {
   static const std::vector<std::string> hosts = {
       "github.com", "*.github.com", "githubusercontent.com", "*.githubusercontent.com", "ghcr.io", "*.ghcr.io",
+      "builds.dotnet.microsoft.com", "ci.dot.net", "aka.ms", "api.nuget.org",
+      "nugetregistryv2prod.blob.core.windows.net",
+      "rubygems.org", "index.rubygems.org",
+      "dl.google.com", "maven.google.com",
+      "repo.maven.apache.org", "plugins.gradle.org",
+      "api.adoptium.net",
+      "www.apple.com",
+  };
+  return hosts;
+}
+
+const std::vector<std::string>& unity_allowed_hosts() {
+  static const std::vector<std::string> hosts = {
+      "packages.unity.com", "cdn.packages.unity.com", "download.packages.unity.com",
+      "public-cdn.cloud.unity3d.com", "license.unity3d.com", "cdp.cloud.unity3d.com",
+      "config.uca.cloud.unity3d.com",
+      "crl3.digicert.com", "crl4.digicert.com",
   };
   return hosts;
 }
@@ -214,10 +241,42 @@ bool split_host_port(std::string_view authority, std::string& host, int& port, i
   return port > 0 && port <= 65535;
 }
 
-NetworkProxy::NetworkProxy(std::vector<std::string> allowed_hosts, DenyFn on_deny)
-    : allowed_(std::move(allowed_hosts)), on_deny_(std::move(on_deny)) {}
+NetworkProxy::NetworkProxy(std::vector<std::string> allowed_hosts, DenyFn on_deny, WarningFn on_warning,
+                           bool allow_unity_hosts, int max_connections)
+    : allowed_(std::move(allowed_hosts)),
+      on_deny_(std::move(on_deny)),
+      on_warning_(std::move(on_warning)),
+      max_connections_(max_connections) {
+  if (max_connections_ < 1 || max_connections_ > kMaxProxyConnections) {
+    throw std::invalid_argument("proxy max connections must be between 1 and " +
+                                std::to_string(kMaxProxyConnections));
+  }
+  // Only explicit, exact, non-default allowances grant private-address access.
+  // Preset entries are appended afterwards and cannot confer that privilege.
+  for (const auto& pattern : allowed_) {
+    const auto host = util::trim(pattern);
+    if (valid_host(host) && !host_allowed(host, default_allowed_hosts())) private_allowed_.emplace_back(host);
+  }
+  if (allow_unity_hosts)
+    allowed_.insert(allowed_.end(), unity_allowed_hosts().begin(), unity_allowed_hosts().end());
+}
 NetworkProxy::~NetworkProxy() { stop(); }
-std::string NetworkProxy::url() const { return "http://127.0.0.1:" + std::to_string(port_); }
+
+std::string NetworkProxy::status_locked() const {
+  const auto now = std::chrono::system_clock::now();
+  const auto seconds = std::chrono::system_clock::to_time_t(now);
+  const auto millis =
+      std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count() % 1000;
+  std::tm local{};
+  ::localtime_r(&seconds, &local);
+  char time[32];
+  std::strftime(time, sizeof(time), "%H:%M:%S", &local);
+  char fraction[8];
+  std::snprintf(fraction, sizeof(fraction), ".%03d", static_cast<int>(millis));
+  return std::string("; at ") + time + fraction + ", active " + std::to_string(workers_) + "/" +
+         std::to_string(max_connections_) + ", connecting upstream " + std::to_string(connecting_.load());
+}
+std::string NetworkProxy::url() const { return "http://localhost:" + std::to_string(port_); }
 
 void NetworkProxy::start() {
   if (listen_fd_ >= 0) return;
@@ -225,19 +284,40 @@ void NetworkProxy::start() {
   try {
     if (::pipe(wake_pipe_) != 0) throw std::system_error(errno, std::generic_category(), "pipe");
     for (int fd : wake_pipe_) ::fcntl(fd, F_SETFD, FD_CLOEXEC);
-    listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (listen_fd_ < 0) throw std::system_error(errno, std::generic_category(), "socket");
-    configure_socket(listen_fd_);
-    ::fcntl(listen_fd_, F_SETFL, O_NONBLOCK);
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    if (::bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 || ::listen(listen_fd_, 32) != 0)
-      throw std::system_error(errno, std::generic_category(), "bind proxy");
-    socklen_t len = sizeof(addr);
-    if (::getsockname(listen_fd_, reinterpret_cast<sockaddr*>(&addr), &len) != 0)
-      throw std::system_error(errno, std::generic_category(), "proxy address");
-    port_ = ntohs(addr.sin_port);
+    for (int attempt = 0; attempt < 8; ++attempt) {
+      listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
+      if (listen_fd_ < 0) throw std::system_error(errno, std::generic_category(), "IPv4 proxy socket");
+      sockaddr_in addr{};
+      addr.sin_family = AF_INET;
+      addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+      if (::bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0)
+        throw std::system_error(errno, std::generic_category(), "bind IPv4 proxy");
+      socklen_t len = sizeof(addr);
+      if (::getsockname(listen_fd_, reinterpret_cast<sockaddr*>(&addr), &len) != 0)
+        throw std::system_error(errno, std::generic_category(), "proxy address");
+      port_ = ntohs(addr.sin_port);
+      listen_v6_fd_ = ::socket(AF_INET6, SOCK_STREAM, 0);
+      if (listen_v6_fd_ < 0) throw std::system_error(errno, std::generic_category(), "IPv6 proxy socket");
+      const int one = 1;
+      if (::setsockopt(listen_v6_fd_, IPPROTO_IPV6, IPV6_V6ONLY, &one, sizeof(one)) != 0)
+        throw std::system_error(errno, std::generic_category(), "IPv6-only proxy socket");
+      sockaddr_in6 addr6{};
+      addr6.sin6_family = AF_INET6;
+      addr6.sin6_addr = in6addr_loopback;
+      addr6.sin6_port = addr.sin_port;
+      if (::bind(listen_v6_fd_, reinterpret_cast<sockaddr*>(&addr6), sizeof(addr6)) == 0) break;
+      const int error = errno;
+      if (error != EADDRINUSE || attempt == 7)
+        throw std::system_error(error, std::generic_category(), "bind IPv6 loopback proxy");
+      ::close(listen_fd_);
+      ::close(listen_v6_fd_);
+      listen_fd_ = listen_v6_fd_ = -1;
+    }
+    for (int fd : {listen_fd_, listen_v6_fd_}) {
+      configure_socket(fd);
+      if (::fcntl(fd, F_SETFL, O_NONBLOCK) != 0 || ::listen(fd, max_connections_) != 0)
+        throw std::system_error(errno, std::generic_category(), "listen on loopback proxy");
+    }
     accept_thread_ = std::thread([this] { accept_loop(); });
   } catch (...) {
     stop();
@@ -246,7 +326,11 @@ void NetworkProxy::start() {
 }
 
 void NetworkProxy::stop() {
-  if (stopping_.exchange(true)) return;
+  {
+    std::lock_guard lock(mutex_);
+    if (stopping_.exchange(true)) return;
+  }
+  workers_done_.notify_all();
   if (wake_pipe_[1] >= 0) {
     const char c = 0;
     [[maybe_unused]] const auto n = ::write(wake_pipe_[1], &c, 1);
@@ -258,9 +342,10 @@ void NetworkProxy::stop() {
     workers_done_.wait(lock, [this] { return workers_ == 0; });
   }
   if (listen_fd_ >= 0) ::close(listen_fd_);
+  if (listen_v6_fd_ >= 0) ::close(listen_v6_fd_);
   for (int fd : wake_pipe_)
     if (fd >= 0) ::close(fd);
-  listen_fd_ = -1;
+  listen_fd_ = listen_v6_fd_ = -1;
   wake_pipe_[0] = wake_pipe_[1] = -1;
 }
 
@@ -274,120 +359,196 @@ void NetworkProxy::unregister_fd(int fd) {
   active_fds_.erase(fd);
 }
 
-int NetworkProxy::connect_to(const std::string& host, int port, bool& denied) {
+struct NetworkProxy::Connector {
+  NetworkProxy& proxy;
+  const std::vector<const addrinfo*>& addresses;
+  std::string& failure;
+
+  auto now() const { return std::chrono::steady_clock::now(); }
+  bool stopped() const { return proxy.stopping_.load(); }
+
+  detail::ConnectionAttempt start(std::size_t index) {
+    const auto* address = addresses[index];
+    const int fd = ::socket(address->ai_family, address->ai_socktype, address->ai_protocol);
+    if (fd < 0) return {-1, errno};
+    auto cleanup = [](const int* socket) { ::close(*socket); };
+    std::unique_ptr<const int, decltype(cleanup)> owned(&fd, cleanup);
+    configure_socket(fd);
+    proxy.register_fd(fd);
+    owned.release();
+    if (::fcntl(fd, F_SETFL, O_NONBLOCK) != 0) return {fd, errno};
+    if (::connect(fd, address->ai_addr, address->ai_addrlen) == 0) return {fd, 0};
+    return {fd, errno};
+  }
+
+  void wait(std::vector<detail::PendingConnection>& pending, std::chrono::milliseconds timeout) {
+    std::vector<pollfd> fds;
+    fds.reserve(pending.size());
+    for (const auto& socket : pending) fds.push_back({socket.fd, POLLOUT, 0});
+    const int ready = ::poll(fds.data(), fds.size(), static_cast<int>(timeout.count()));
+    if (ready < 0 && errno == EINTR) return;
+    const int poll_error = ready < 0 ? errno : 0;
+    for (std::size_t i = 0; i < pending.size(); ++i) {
+      if (poll_error != 0) {
+        pending[i].error = poll_error;
+      } else if (fds[i].revents != 0) {
+        int error = 0;
+        socklen_t length = sizeof(error);
+        if (::getsockopt(fds[i].fd, SOL_SOCKET, SO_ERROR, &error, &length) != 0) error = errno;
+        pending[i].error = error;
+      }
+    }
+  }
+
+  int finish(int fd) {
+    return ::fcntl(fd, F_SETFL, 0) == 0 ? 0 : errno;
+  }
+
+  void close(int fd) {
+    proxy.unregister_fd(fd);
+    ::close(fd);
+  }
+
+  void record(std::size_t index, int error) {
+    char address[NI_MAXHOST]{};
+    const auto* ai = addresses[index];
+    const int name_error = ::getnameinfo(ai->ai_addr, ai->ai_addrlen, address, sizeof(address), nullptr, 0,
+                                       NI_NUMERICHOST);
+    failure += "; " + (name_error == 0 ? std::string(address) : std::string("address #") + std::to_string(index)) +
+               ": " + std::generic_category().message(error) + " (errno=" + std::to_string(error) + ")";
+  }
+};
+
+int NetworkProxy::connect_to(const std::string& host, int port, bool& denied, std::string& failure) {
   const auto result = std::make_shared<Resolution>();
-  if (resolvers.fetch_add(1) >= kMaxWorkers) {
-    --resolvers;
+  const auto resolvers = resolvers_;
+  if (resolvers->fetch_add(1) >= max_connections_) {
+    --*resolvers;
+    failure = "DNS resolver concurrency limit reached (" + std::to_string(max_connections_) + ")";
     return -1;
   }
   try {
-    std::thread([result, host, port] {
+    std::thread([result, resolvers, host, port] {
       addrinfo hints{};
       hints.ai_family = AF_UNSPEC;
       hints.ai_socktype = SOCK_STREAM;
       addrinfo* addresses = nullptr;
-      ::getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &addresses);
+      const int error = ::getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &addresses);
+      const int system_error = errno;
       {
         std::lock_guard lock(result->mutex);
         result->addresses = addresses;
+        result->error = error;
+        result->system_error = system_error;
         result->done = true;
       }
       result->ready.notify_all();
-      --resolvers;
+      --*resolvers;
     }).detach();
-  } catch (...) {
-    --resolvers;
+  } catch (const std::system_error& error) {
+    --*resolvers;
+    failure = "DNS resolver thread creation failed: " + std::string(error.what());
     return -1;
   }
-  const auto deadline = std::chrono::steady_clock::now() + kConnectTimeout;
+  const auto deadline = std::chrono::steady_clock::now() + detail::kDnsTimeout;
   {
     std::unique_lock lock(result->mutex);
     while (!result->done) {
-      if (stopping_ || std::chrono::steady_clock::now() >= deadline) return -1;
+      if (stopping_) return -1;
+      if (std::chrono::steady_clock::now() >= deadline) {
+        failure = "DNS resolution timed out (DNS deadline: " +
+                  std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(detail::kDnsTimeout).count()) +
+                  " ms)";
+        return -1;
+      }
       result->ready.wait_for(lock, std::chrono::milliseconds(50));
     }
   }
-  bool exact = false;
-  for (const auto& pattern : allowed_) {
-    // Built-in GitHub allowances are not permission to follow a poisoned DNS
-    // answer into the local network. Explicit local names/literals still work.
-    if (canonical(util::trim(pattern)) == canonical(host) && !host_allowed(host, default_allowed_hosts())) exact = true;
+  if (result->error != 0) {
+    failure = "DNS resolution failed: " + std::string(::gai_strerror(result->error)) +
+              " (getaddrinfo=" + std::to_string(result->error) + ")";
+    if (result->error == EAI_SYSTEM)
+      failure += ": " + std::generic_category().message(result->system_error) +
+                 " (errno=" + std::to_string(result->system_error) + ")";
+    return -1;
   }
+  failure = "TCP connection failed";
+  if (!result->addresses) {
+    failure = "DNS resolution returned no addresses";
+    return -1;
+  }
+  const bool exact = host_allowed(host, private_allowed_);
   // Validate every answer before dialing any; connect the checked sockaddr
   // directly, never perform a second DNS lookup.
-  for (auto* ai = result->addresses; ai; ai = ai->ai_next) {
-    if (!exact && private_address(ai->ai_addr)) {
-      denied = true;
-      return -1;
-    }
+  if (!exact && !detail::public_addresses(result->addresses)) {
+    denied = true;
+    return -1;
   }
-  for (auto* ai = result->addresses; ai && !stopping_; ai = ai->ai_next) {
-    const int fd = ::socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-    if (fd < 0) continue;
-    configure_socket(fd);
-    register_fd(fd);
-    ::fcntl(fd, F_SETFL, O_NONBLOCK);
-    bool connected = ::connect(fd, ai->ai_addr, ai->ai_addrlen) == 0;
-    if (!connected && errno == EINPROGRESS) {
-      while (!stopping_ && std::chrono::steady_clock::now() < deadline) {
-        pollfd pfd{fd, POLLOUT, 0};
-        const int ready = ::poll(&pfd, 1, 50);
-        if (ready < 0 && errno == EINTR) continue;
-        if (ready == 0) continue;
-        int error = 0;
-        socklen_t len = sizeof(error);
-        connected = ready > 0 && ::getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &len) == 0 && error == 0;
-        break;
-      }
-    }
-    if (connected && !stopping_) {
-      ::fcntl(fd, F_SETFL, 0);
-      return fd;
-    }
-    unregister_fd(fd);
-    ::close(fd);
-  }
-  return -1;
+  const auto addresses = detail::interleave_addresses(result->addresses);
+  Connector connector{*this, addresses, failure};
+  const auto started = connector.now();
+  const int fd = detail::race_connections(addresses.size(), connector);
+  if (fd < 0 && !stopping_ && connector.now() - started >= detail::kTcpTimeout)
+    failure += "; TCP deadline exceeded (" +
+               std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(detail::kTcpTimeout).count()) +
+               " ms)";
+  return fd;
 }
 
 void NetworkProxy::accept_loop() {
   while (!stopping_) {
-    pollfd fds[2] = {{listen_fd_, POLLIN, 0}, {wake_pipe_[0], POLLIN, 0}};
-    if (::poll(fds, 2, -1) < 0) {
+    pollfd fds[3] = {{listen_fd_, POLLIN, 0}, {listen_v6_fd_, POLLIN, 0}, {wake_pipe_[0], POLLIN, 0}};
+    if (::poll(fds, 3, -1) < 0) {
       if (errno == EINTR) continue;
       return;
     }
-    if (fds[1].revents != 0 || stopping_) return;
-    if (!(fds[0].revents & POLLIN)) continue;
-    const int client = ::accept(listen_fd_, nullptr, nullptr);
-    if (client < 0) continue;
-    const int flags = ::fcntl(client, F_GETFL, 0);
-    if (flags >= 0) ::fcntl(client, F_SETFL, flags & ~O_NONBLOCK);
-    configure_socket(client);
-    {
-      std::lock_guard lock(mutex_);
-      if (workers_ >= kMaxWorkers) {
-        ::close(client);
-        continue;
-      }
-      ++workers_;
-    }
-    try {
-      std::thread([this, client] {
-        register_fd(client);
-        try {
-          handle(client);
-        } catch (...) {
+    if (fds[2].revents != 0 || stopping_) return;
+    for (const auto& listener : {fds[0], fds[1]}) {
+      if (stopping_) return;
+      if (!(listener.revents & POLLIN)) continue;
+      {
+        std::unique_lock lock(mutex_);
+        if (workers_ >= max_connections_ && !stopping_) {
+          const auto status = status_locked();
+          lock.unlock();
+          if (on_warning_) {
+            on_warning_("Network proxy at capacity (" + std::to_string(max_connections_) + " active connections" +
+                        status + "); waiting for a connection slot");
+          }
+          lock.lock();
+          // Leave excess connections in the bounded kernel listen backlog.
+          workers_done_.wait(lock, [this] { return stopping_ || workers_ < max_connections_; });
         }
-        unregister_fd(client);
+        if (stopping_) return;
+      }
+      const int client = ::accept(listener.fd, nullptr, nullptr);
+      if (client < 0) continue;
+      const int flags = ::fcntl(client, F_GETFL, 0);
+      if (flags >= 0) ::fcntl(client, F_SETFL, flags & ~O_NONBLOCK);
+      configure_socket(client);
+      {
+        std::lock_guard lock(mutex_);
+        ++workers_;
+      }
+      try {
+        std::thread([this, client] {
+          register_fd(client);
+          try {
+            handle(client);
+          } catch (...) {
+          }
+          unregister_fd(client);
+          ::close(client);
+          std::lock_guard lock(mutex_);
+          --workers_;
+          workers_done_.notify_all();
+        }).detach();
+      } catch (...) {
         ::close(client);
         std::lock_guard lock(mutex_);
-        if (--workers_ == 0) workers_done_.notify_all();
-      }).detach();
-    } catch (...) {
-      ::close(client);
-      std::lock_guard lock(mutex_);
-      if (--workers_ == 0) workers_done_.notify_all();
+        --workers_;
+        workers_done_.notify_all();
+      }
     }
   }
 }
@@ -479,9 +640,31 @@ void NetworkProxy::handle(int client) {
   };
   if (!host_allowed(host, allowed_)) return deny();
   bool denied = false;
-  const int upstream = connect_to(host, port, denied);
+  std::string failure;
+  const auto started = std::chrono::steady_clock::now();
+  ++connecting_;
+  int upstream = -1;
+  try {
+    upstream = connect_to(host, port, denied, failure);
+  } catch (...) {
+    --connecting_;
+    throw;
+  }
+  --connecting_;
   if (upstream < 0) {
     if (denied) return deny();
+    if (!stopping_ && on_warning_) {
+      const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - started).count();
+      std::string status;
+      {
+        std::lock_guard lock(mutex_);
+        status = status_locked();
+      }
+      on_warning_("Network proxy upstream connection failed for " + host + ":" + std::to_string(port) +
+                  " after " + std::to_string(elapsed) + " ms: " + failure + "; returning HTTP 502 (" +
+                  status.substr(2) + ")");
+    }
     send_all(client, kBadGateway);
     return;
   }
@@ -515,9 +698,9 @@ void NetworkProxy::handle(int client) {
       remaining -= static_cast<std::size_t>(n);
       ok = send_all(upstream, std::string_view(buf, static_cast<std::size_t>(n)));
     }
-    // HTTP is deliberately one request per connection. Never relay arbitrary
-    // client bytes after its framed body, even if the upstream ignores close.
-    ::shutdown(upstream, SHUT_WR);
+    // HTTP is deliberately one request per connection. relay() never reads
+    // client bytes after the framed body. Do not half-close the upstream:
+    // some servers drop a request without responding once they see EOF.
   }
   if (ok) relay(client, upstream, tunnel);
   int flags = ::fcntl(client, F_GETFL, 0);

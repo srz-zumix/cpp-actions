@@ -3,6 +3,7 @@
 #include <cctype>
 #include <set>
 
+#include "util/glob.hpp"
 #include "util/strings.hpp"
 
 namespace cpa::actions {
@@ -77,6 +78,42 @@ ActionRef parse_action_ref(std::string_view uses) {
     throw ActionError("Invalid ref in '" + std::string(uses) + "'");
   }
   return ref;
+}
+
+bool is_setup_python_root(const ActionRef& ref) {
+  return ref.kind == ActionRef::Kind::Remote && ref.path.empty() && util::iequals(ref.owner, "actions") &&
+         util::iequals(ref.repo, "setup-python");
+}
+
+namespace {
+
+ActionRef parse_action_permission_selector(std::string_view selector) {
+  auto ref = parse_action_ref(selector);
+  bool invalid = ref.kind == ActionRef::Kind::Docker || selector.find_first_of("?[]") != std::string_view::npos ||
+                 selector.find("${{") != std::string_view::npos;
+  for (char c : selector) invalid = invalid || std::iscntrl(static_cast<unsigned char>(c));
+  if (ref.kind == ActionRef::Kind::Local) {
+    invalid = invalid || selector.find('*') != std::string_view::npos;
+    for (const auto& part : fs::path(ref.local_path)) invalid = invalid || part == "..";
+  }
+  if (invalid) throw ActionError("Invalid action permission selector '" + std::string(selector) +
+                                 "': use an exact local path or owner/repo[/path]@ref; only '*' in ref is supported");
+  return ref;
+}
+
+}  // namespace
+
+void validate_action_permission_selector(std::string_view selector) {
+  (void)parse_action_permission_selector(selector);
+}
+
+bool matches_action_permission(std::string_view selector, const ActionRef& action) {
+  const auto allowed = parse_action_permission_selector(selector);
+  if (allowed.kind == ActionRef::Kind::Local) {
+    return action.kind == ActionRef::Kind::Local && allowed.local_path == action.local_path;
+  }
+  return allowed.kind == ActionRef::Kind::Remote && action.kind == ActionRef::Kind::Remote &&
+         allowed.name() == action.name() && util::glob_match_string(allowed.ref, action.ref);
 }
 
 const ActionInput* Action::find_input(std::string_view input) const {

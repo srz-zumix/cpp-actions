@@ -230,7 +230,12 @@ ProcessResult run_process(const ProcessSpec& spec) {
       }
       if (deadline && now >= *deadline) {
         if (!result.cancelled) result.timed_out = true;
-        want_kill = true;
+        if (spec.hard_timeout) {
+          ::killpg(pid, SIGKILL);
+          kill_stage = 3;
+        } else {
+          want_kill = true;
+        }
       }
       if (want_kill) {
         if (kill_stage == 0) {

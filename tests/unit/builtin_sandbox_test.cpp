@@ -99,6 +99,24 @@ IUTEST_F(BuiltinSandboxTest, AllowsExplicitReadOnlyRoots) {
   IUTEST_EXPECT_EQ("host secret", util::read_file(cache_entry() / "data" / "0"));
 }
 
+IUTEST_F(BuiltinSandboxTest, ScopedReadOnlyRootsDoNotFollowReplacementSymlinks) {
+  const auto installation = root / "hostedtoolcache/Python/3.11.9/arm64";
+  util::write_file(installation / "file", "selected Python");
+  ctx.scoped_readable = {installation};
+  const auto allowed =
+      run(actions::Builtin::UploadArtifact, {{"path", (installation / "file").string()}, {"name", "python"}});
+  IUTEST_ASSERT_TRUE(allowed.ok) << allowed.error;
+  const auto download = run(actions::Builtin::DownloadArtifact, {{"name", "python"}, {"path", installation.string()}});
+  IUTEST_EXPECT_FALSE(download.ok);
+
+  fs::rename(installation, installation.parent_path() / "original");
+  fs::create_directory_symlink(secret.parent_path(), installation);
+  const auto escaped =
+      run(actions::Builtin::UploadArtifact, {{"path", (installation / "secret").string()}, {"name", "escaped"}});
+  IUTEST_EXPECT_FALSE(escaped.ok);
+  IUTEST_EXPECT_NE(std::string::npos, escaped.error.find("Read denied")) << escaped.error;
+}
+
 IUTEST_F(BuiltinSandboxTest, EmptyReadableLeavesDebugReadsUnconfined) {
   ctx.readable.clear();
   const auto upload = run(actions::Builtin::UploadArtifact, {{"path", secret.string()}});

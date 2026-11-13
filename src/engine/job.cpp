@@ -22,6 +22,7 @@
 #include "util/strings.hpp"
 #include "workflow/matrix.hpp"
 #include "workflow/scopes.hpp"
+#include "workspace/git.hpp"
 
 namespace cpa::engine {
 
@@ -90,10 +91,16 @@ struct StepScope {
   Value inputs = Value::object();
   std::string status = "success";  // failures of the steps of this scope
   bool composite = false;
+  bool setup = false;
   std::string file;
   fs::path action_path;
   std::string action_repository;
   std::string action_ref;
+  bool allow_apple_security = false;
+  bool allow_docker = false;
+  bool allow_msbuild = false;
+  bool allow_unity = false;
+  bool allow_xcode = false;
   StringMap env;  // env of the composite step (inherited by the nested steps)
   int depth = 0;
   std::string prefix;
@@ -104,6 +111,8 @@ struct StepScope {
 struct StepResult {
   std::string outcome = "success";
   StringMap outputs;
+  StringMap environment;
+  std::vector<std::string> paths;
   std::string error;
 };
 
@@ -118,15 +127,24 @@ struct FileCommands {
 struct CommandState {
   StringMap outputs;
   StringMap state;
+  StringMap environment;
+  std::vector<std::string> paths;
   bool failed = false;
   bool allow_unsecure = false;
 };
 
 struct ResolvedAction {
   fs::path dir;
+  fs::path repository_root;
   std::string repository;  // owner/repo ("" for local actions)
   std::string ref;
   std::string display;
+  bool allow_apple_security = false;
+  bool allow_docker = false;
+  bool allow_msbuild = false;
+  bool allow_unity = false;
+  bool allow_xcode = false;
+  bool hosted_python = false;
 };
 
 struct PostStep {
@@ -156,10 +174,15 @@ class JobRunner {
   bool setup();
   void create_directories();
   void build_base_environment();
+  void inherit_unity_editor_prefs();
   bool evaluate_job_settings();
   void load_environment(const std::string& name);
   void start_sandbox();
   void prefetch_actions();
+  std::vector<fs::path> writable_directories() const;
+  void prepare_hosted_python_action(const ResolvedAction& resolved, const actions::Action& action);
+  void validate_hosted_python_action(const ResolvedAction& resolved) const;
+  void register_hosted_python_installations(const StepResult& result);
 
   // Contexts
   expr::EvalContext make_context(const StepScope& scope, const StringMap& env);
@@ -189,7 +212,9 @@ class JobRunner {
   // Processes
   StepResult execute(std::vector<std::string> argv, util::Environment env, const fs::path& cwd,
                      std::optional<std::chrono::milliseconds> timeout, bool after_cancel, const FileCommands& files,
-                     StringMap* state, const std::vector<fs::path>& extra_read = {});
+                     StringMap* state, const std::vector<fs::path>& extra_read = {},
+                     bool allow_apple_security = false, bool allow_msbuild = false, bool allow_unity = false,
+                     bool allow_docker = false, bool hosted_python = false, bool allow_xcode = false);
   util::Environment step_environment(const StringMap& env, const FileCommands& files, const StepScope& scope,
                                      const std::string& action_id);
   FileCommands prepare_file_commands();
@@ -213,14 +238,17 @@ class JobRunner {
   std::optional<Clock::time_point> deadline_;
   double timeout_minutes_ = kDefaultJobTimeoutMinutes;
   bool continue_on_error_ = false;
+  bool setup_failed_ = false;
 
   fs::path job_dir_;
   fs::path control_dir_;
   fs::path work_root_;
+  fs::path short_work_dir_;
   fs::path workspace_;
   fs::path temp_;
   fs::path home_;
   fs::path tmp_;
+  fs::path unity_tmp_;
   fs::path file_commands_dir_;
   fs::path event_path_;
   fs::path tool_cache_;
@@ -228,6 +256,7 @@ class JobRunner {
   util::Environment base_env_;
   StringMap global_env_;
   std::vector<std::string> path_prepend_;
+  std::vector<fs::path> hosted_python_reads_;
   Value secrets_ = Value::object();
   Value vars_ = Value::object();
   StringMap secret_values_;
@@ -239,6 +268,7 @@ class JobRunner {
   std::unique_ptr<sandbox::Sandbox> sandbox_;
   std::vector<PostStep> post_steps_;
   std::vector<std::unique_ptr<actions::Action>> loaded_actions_;
+  std::map<fs::path, fs::path> action_copies_;
   std::vector<std::unique_ptr<StepScope>> composite_scopes_;
   bool echo_ = false;
   std::string stop_token_;
@@ -252,7 +282,12 @@ void JobRunner::create_directories() {
   job_dir_ = run_.options.run_dir / "jobs" / wr_.run_id / key;
   control_dir_ = run_.options.run_dir / "control" / wr_.run_id / key;
   const std::string repo_name = run_.repository.substr(run_.repository.find('/') + 1);
-  work_root_ = job_dir_ / "work";
+#if defined(__APPLE__)
+  short_work_dir_ = util::make_temp_dir("cpa-w-", "/private/tmp");
+#else
+  short_work_dir_ = util::make_temp_dir("cpa-w-", "/tmp");
+#endif
+  work_root_ = short_work_dir_ / "work";
   workspace_ = work_root_ / repo_name / repo_name;
   temp_ = work_root_ / "_temp";
   home_ = job_dir_ / "home";
@@ -267,10 +302,13 @@ void JobRunner::create_directories() {
                         job_dir_ / "scripts"}) {
     fs::create_directories(d);
   }
+#if defined(__APPLE__)
+  fs::create_directories(home_ / "Library" / "Preferences");
+#endif
   // Canonical paths (e.g. /var -> /private/var on macOS) for the sandbox rules.
   job_dir_ = util::real_path(job_dir_);
   control_dir_ = util::real_path(control_dir_);
-  work_root_ = job_dir_ / "work";
+  work_root_ = short_work_dir_ / "work";
   workspace_ = work_root_ / repo_name / repo_name;
   temp_ = work_root_ / "_temp";
   home_ = job_dir_ / "home";
@@ -288,12 +326,89 @@ void JobRunner::create_directories() {
     }
   }
   util::write_file(event_path_, wr_.payload.to_json_string(true));
+  util::write_file(job_dir_ / "work-path", work_root_.string() + "\n");
+  util::write_file(home_ / ".gitconfig", workspace::default_git_config());
+  // Stop Node's package-scope lookup before it reaches host directories.
+  util::write_file(job_dir_ / "package.json", "{}\n");
+  util::write_file(short_work_dir_ / "package.json", "{}\n");
+#if defined(__APPLE__)
+  if (run_.options.sandbox.enabled) {
+    const auto wrapper = job_dir_ / "scripts/bin/mktemp";
+    util::write_file(wrapper, R"sh(#!/bin/bash
+set -e
+original=("$@")
+args=()
+operands=false
+prefix_template=""
+while (($#)); do
+  case "$1" in
+    --tmpdir|--tmpdir=*)
+      exec /usr/bin/mktemp "${original[@]}"
+      ;;
+    --)
+      args+=("$1")
+      shift
+      operands=true
+      break
+      ;;
+    --directory) args+=("-d") ;;
+    --quiet) args+=("-q") ;;
+    --dry-run) args+=("-u") ;;
+    -?*)
+      option=${1#-}
+      while test -n "$option"; do
+        flag=${option:0:1}
+        option=${option:1}
+        case "$flag" in
+          d|q|u) args+=("-$flag") ;;
+          p) exec /usr/bin/mktemp "${original[@]}" ;;
+          t)
+            if test -n "$option"; then
+              prefix=$option
+            else
+              shift
+              if (($# == 0)); then
+                exec /usr/bin/mktemp "${original[@]}"
+              fi
+              prefix=$1
+            fi
+            prefix_template="${TMPDIR:?TMPDIR must be set}/${prefix}.XXXXXXXXXX"
+            option=""
+            ;;
+          *) exec /usr/bin/mktemp "${original[@]}" ;;
+        esac
+      done
+      ;;
+    *)
+      operands=true
+      break
+      ;;
+  esac
+  shift
+done
+if "$operands"; then
+  args+=("$@")
+fi
+if test -n "$prefix_template"; then
+  args+=("$prefix_template")
+elif ! "$operands"; then
+  args+=("${TMPDIR:?TMPDIR must be set}/tmp.XXXXXXXXXX")
+fi
+exec /usr/bin/mktemp "${args[@]}"
+)sh");
+    util::make_executable(wrapper);
+  }
+#endif
 }
 
 void JobRunner::build_base_environment() {
   const auto host = util::current_environment();
   base_env_["PATH"] = default_path();
   base_env_["HOME"] = home_.string();
+#if defined(__APPLE__)
+  base_env_["CFFIXED_USER_HOME"] = home_.string();
+#endif
+  base_env_["GRADLE_USER_HOME"] = (home_ / ".gradle").string();
   base_env_["TMPDIR"] = tmp_.string();
 #if defined(__APPLE__)
   base_env_["LANG"] = "en_US.UTF-8";
@@ -386,14 +501,85 @@ bool JobRunner::evaluate_job_settings() {
   return true;
 }
 
+std::vector<fs::path> JobRunner::writable_directories() const {
+  std::vector<fs::path> paths = {workspace_.parent_path(), temp_, home_, tmp_, file_commands_dir_, tool_cache_};
+  paths.insert(paths.end(), run_.options.sandbox.allow_write.begin(), run_.options.sandbox.allow_write.end());
+  return paths;
+}
+
+void JobRunner::prepare_hosted_python_action(const ResolvedAction& resolved, const actions::Action& action) {
+  const auto& cache = run_.options.sandbox.hosted_python_tool_cache;
+  auto writable = writable_directories();
+  sandbox::validate_hosted_python_cache_path(cache);
+  sandbox::require_disjoint_from_writable(cache, writable, "setup-python host tool cache");
+  auto action_writable = writable;
+  action_writable.push_back(cache);
+  sandbox::require_disjoint_from_writable(resolved.repository_root, action_writable, "setup-python cached action");
+  sandbox::require_disjoint_from_writable(cache, {run_.options.run_dir / "control", wr_.artifacts},
+                                          "setup-python host tool cache");
+  auto* log = log_.get();
+  const auto node = run_.node.get(actions::node_major_version(action.runtime),
+                                  [log](std::string_view message) { log->warning(message); });
+  sandbox::require_disjoint_from_writable(node, action_writable, "setup-python Node.js executable");
+  if (sandbox::ensure_hosted_python_cache(cache, writable)) {
+    log_->info("Created setup-python host tool cache: " + cache.string(), Color::Gray);
+  }
+  validate_hosted_python_action(resolved);
+}
+
+void JobRunner::validate_hosted_python_action(const ResolvedAction& resolved) const {
+  auto writable = writable_directories();
+  sandbox::validate_hosted_python_cache(run_.options.sandbox.hosted_python_tool_cache, writable);
+  writable.push_back(run_.options.sandbox.hosted_python_tool_cache);
+  sandbox::require_disjoint_from_writable(resolved.repository_root, writable, "setup-python cached action");
+}
+
+void JobRunner::register_hosted_python_installations(const StepResult& result) {
+  std::vector<fs::path> candidates(result.paths.begin(), result.paths.end());
+  if (const auto it = result.environment.find("pythonLocation"); it != result.environment.end()) {
+    candidates.emplace_back(it->second);
+  }
+  if (const auto it = result.outputs.find("python-path"); it != result.outputs.end()) {
+    candidates.emplace_back(it->second);
+    if (!it->second.empty() &&
+        !util::is_subpath(fs::path(it->second).lexically_normal(), run_.options.sandbox.hosted_python_tool_cache)) {
+      log_->warning(
+          "setup-python reported a Python path outside the host tool cache; no additional read access "
+          "was granted: " +
+          it->second);
+    }
+  }
+  std::vector<fs::path> selected;
+  for (const auto& candidate : candidates) {
+    const auto installation =
+        sandbox::hosted_python_installation(run_.options.sandbox.hosted_python_tool_cache, candidate);
+    if (installation && std::find(selected.begin(), selected.end(), *installation) == selected.end()) {
+      selected.push_back(*installation);
+    }
+  }
+  for (const auto& installation : selected) {
+    if (std::find(hosted_python_reads_.begin(), hosted_python_reads_.end(), installation) ==
+        hosted_python_reads_.end()) {
+      hosted_python_reads_.push_back(installation);
+      log_->info("Read-only access enabled for selected Python installation: " + installation.string(), Color::Gray);
+    }
+  }
+}
+
 void JobRunner::start_sandbox() {
   if (!run_.options.sandbox.enabled) {
     log_->warning("The sandbox is disabled: steps can access all files and the network");
     return;
   }
   sandbox::SandboxConfig config;
-  config.write = {workspace_, temp_, home_, tmp_, file_commands_dir_, tool_cache_};
-  for (const auto& d : run_.options.sandbox.allow_write) config.write.push_back(d);
+  if (!run_.options.sandbox.allow_unity_for.empty() || !run_.options.sandbox.allow_unity_step.empty()) {
+    unity_tmp_ = util::make_temp_dir("cpa-u-", "/private/tmp");
+    util::write_file(job_dir_ / "unity-tmp-path", unity_tmp_.string() + "\n");
+    log_->info("Unity TMPDIR: " + unity_tmp_.string(), Color::Gray);
+    config.unity_tmp = unity_tmp_;
+  }
+  config.docker_socket = run_.options.sandbox.docker_socket;
+  config.write = writable_directories();
   const auto control_root = util::real_path(run_.options.run_dir / "control");
   for (const auto& d : config.write) {
     const auto writable = util::real_path(d);
@@ -401,23 +587,40 @@ void JobRunner::start_sandbox() {
       throw EvaluationError("Writable sandbox path overlaps the protected job control directory: " +
                             writable.string());
     }
+    if (util::is_subpath(wr_.artifacts, writable) || util::is_subpath(writable, wr_.artifacts)) {
+      throw EvaluationError("Writable sandbox path overlaps the artifact store: " + writable.string());
+    }
   }
   const auto actions_dir = run_.options.cache_dir / "actions";
   const auto node_dir = run_.options.cache_dir / "node";
   fs::create_directories(actions_dir);
   fs::create_directories(node_dir);
-  config.read = {actions_dir, node_dir, job_dir_ / "scripts"};
+  config.read = {actions_dir, node_dir, job_dir_ / "scripts", job_dir_ / "package.json",
+                 short_work_dir_ / "package.json"};
   for (const auto& d : run_.options.sandbox.allow_read) config.read.push_back(d);
   config.allow_hosts = run_.options.sandbox.allow_hosts;
+  config.allow_unity_hosts = run_.options.sandbox.allow_unity_hosts;
+  if (run_.options.sandbox.proxy_max_connections > 0)
+    config.proxy_max_connections = run_.options.sandbox.proxy_max_connections;
+  if (config.allow_unity_hosts) {
+    log_->warning("Unity host preset enabled for all steps in this job (proxy only): " +
+                  util::join(sandbox::unity_allowed_hosts(), ", "));
+  }
   config.allow_localhost = run_.options.sandbox.allow_localhost;
+  config.allow_xcode_simulator = run_.options.sandbox.allow_xcode_simulator;
+  if (config.allow_xcode_simulator) {
+    log_->warning("Xcode/Simulator compatibility enabled for all steps in this job; processes can read the OS user's "
+                  "DeveloperDiskImages and contact CoreSimulator services, including host Simulator operations");
+  }
   config.profile_file = control_dir_ / "sandbox.sb";
+  config.unity_home = home_;
   config.extra_rules = "(deny file-read* file-write* (subpath " +
                        sandbox::sbpl_quote(control_root.string()) + "))";
   auto* log = log_.get();
   sandbox_ = std::make_unique<sandbox::Sandbox>(config, [log](const std::string& host, int port) {
     log->warning("Blocked a connection to " + host + ":" + std::to_string(port) +
                  " (not allowed). Use --allow-host " + host + " to allow it.");
-  });
+  }, [log](std::string_view message) { log->warning(message); });
   log_->info("Sandbox: " + config.profile_file.string(), Color::Gray);
 }
 
@@ -432,12 +635,32 @@ void JobRunner::prefetch_actions() {
   }
 }
 
+void JobRunner::inherit_unity_editor_prefs() {
+  if (!run_.options.inherit_unity_editor_prefs) return;
+#if defined(__APPLE__)
+  const fs::path relative = "Library/Preferences/com.unity3d.UnityEditor5.x.plist";
+  const auto source = util::home_dir() / relative;
+  const auto destination = home_ / relative;
+  if (!fs::is_regular_file(fs::symlink_status(source))) {
+    throw EvaluationError("Cannot inherit Unity EditorPrefs: expected a regular file at " + source.string());
+  }
+  fs::create_directories(destination.parent_path());
+  fs::copy_file(source, destination);
+  fs::permissions(destination, fs::perms::owner_read | fs::perms::owner_write);
+  log_->warning("Inherited host Unity EditorPrefs into the job HOME; preferences may contain sensitive values "
+                "and host paths. Changes will not be copied back to the host");
+#else
+  throw EvaluationError("--inherit-unity-editor-prefs is only supported on macOS");
+#endif
+}
+
 bool JobRunner::setup() {
   create_directories();
   build_base_environment();
   report_.log_file = (run_.options.run_dir / "logs" / wr_.run_id / (sanitize_key(inst_.key) + ".log")).string();
   log_ = std::make_unique<JobLog>(run_.console, run_.masker, inst_.name, report_.log_file, run_.options.debug);
   log_->info("Set up job", Color::Bold);
+  log_->info("Job work directory: " + work_root_.string(), Color::Gray);
 
   for (const auto& [k, v] : wr_.secrets) secrets_.set(k, v);
   if (wr_.vars.is_object()) {
@@ -457,6 +680,7 @@ bool JobRunner::setup() {
   top_.inputs = wr_.inputs.is_object() ? wr_.inputs : Value::object();
 
   if (!evaluate_job_settings()) return false;
+  inherit_unity_editor_prefs();
   start_sandbox();
   prefetch_actions();
   return true;
@@ -536,7 +760,7 @@ void JobRunner::record_step(StepScope& scope, const workflow::Step& step, StepRe
 
 void JobRunner::run_step(StepScope& scope, const workflow::Step& step) {
   StepReport sr;
-  sr.id = step.id;
+  sr.id = scope.setup ? "__cpp_actions_setup_" + step.id : step.id;
   const auto step_started = Clock::now();
   if (inst_.cancel && status_ != "cancelled") status_ = "cancelled";
   const bool after_cancel = is_cancelled();
@@ -565,7 +789,7 @@ void JobRunner::run_step(StepScope& scope, const workflow::Step& step) {
 
   bool run_it = false;
   try {
-    run_it = evaluate_condition(step.condition, ctx, scope_for(scope.if_site), scope.file);
+    run_it = !setup_failed_ && evaluate_condition(step.condition, ctx, scope_for(scope.if_site), scope.file);
   } catch (const std::exception& e) {
     fail_step(e.what());
     return;
@@ -635,7 +859,7 @@ StepResult JobRunner::run_script(StepScope& scope, const workflow::Step& step, e
   if (step.working_directory != nullptr) {
     working_directory = evaluate_string(step.working_directory, ctx, general, scope.file);
   }
-  if (!scope.composite) {
+  if (!scope.composite && !scope.setup) {
     // defaults.run of the job, then of the workflow.
     for (const auto* defaults : {job_.defaults, wf_.defaults}) {
       if (defaults == nullptr || !defaults->is_mapping()) continue;
@@ -650,8 +874,13 @@ StepResult JobRunner::run_script(StepScope& scope, const workflow::Step& step, e
       }
     }
   }
+  if (scope.setup && shell_name.empty()) shell_name = "bash";
   auto process_env = step_environment(env, files, scope, step.id);
-  const auto shell = resolve_shell(shell_name, process_env["PATH"]);
+  auto shell = resolve_shell(shell_name, process_env["PATH"]);
+  if (run_.options.ignore_interactive_shell && shell.ignore_interactive()) {
+    log_->warning("Interactive shell options ignored (--ignore-interactive-shell); interactive startup behavior "
+                  "is disabled");
+  }
   fs::path cwd = workspace_;
   if (!working_directory.empty()) {
     const fs::path wd(working_directory);
@@ -670,15 +899,43 @@ StepResult JobRunner::run_script(StepScope& scope, const workflow::Step& step, e
   }
   const auto script = job_dir_ / "scripts" / (util::random_uuid() + shell.extension);
   util::write_file(script, shell.script(body));
-  return execute(shell.argv(script), std::move(process_env), cwd, timeout, after_cancel, files, nullptr);
+  const auto selector = wf_.file + "::" + job_.id + "::" + step.id;
+  const auto& docker_steps = run_.options.sandbox.allow_docker_step;
+  const bool allow_docker = scope.allow_docker ||
+      (!scope.composite && !scope.setup && step.explicit_id &&
+       std::find(docker_steps.begin(), docker_steps.end(), selector) != docker_steps.end());
+  if (sandbox_ && allow_docker) {
+    log_->warning("Docker daemon access enabled for '" + (scope.composite ? scope.file : selector) +
+                  "'; Docker can access host files and networks and bypass the sandbox");
+  }
+  const auto& allowed_steps = run_.options.sandbox.allow_msbuild_step;
+  const bool allow_msbuild = scope.allow_msbuild ||
+      (!scope.composite && !scope.setup && step.explicit_id &&
+       std::find(allowed_steps.begin(), allowed_steps.end(), selector) != allowed_steps.end());
+  if (sandbox_ && allow_msbuild) {
+    log_->warning("MSBuild worker IPC enabled for '" + (scope.composite ? scope.file : selector) +
+                  "'; host MSBuild sockets may be accessible to this process and its children");
+  }
+  const auto& unity_steps = run_.options.sandbox.allow_unity_step;
+  const bool allow_unity = scope.allow_unity ||
+      (!scope.composite && !scope.setup && step.explicit_id &&
+       std::find(unity_steps.begin(), unity_steps.end(), selector) != unity_steps.end());
+  if (sandbox_ && allow_unity) {
+    log_->warning("Unity compatibility enabled for '" + (scope.composite ? scope.file : selector) +
+                  "'; host Unity temporary files and licensing IPC may be accessible to this process and its children");
+  }
+  return execute(shell.argv(script), std::move(process_env), cwd, timeout, after_cancel, files, nullptr, {},
+                 scope.allow_apple_security, allow_msbuild, allow_unity, allow_docker, false, scope.allow_xcode);
 }
 
 ResolvedAction JobRunner::resolve_action(const actions::ActionRef& ref) {
   ResolvedAction resolved;
   resolved.display = ref.display();
   if (ref.kind == actions::ActionRef::Kind::Local) {
+    resolved.repository_root = util::real_path(workspace_);
     resolved.dir = util::real_path(workspace_ / ref.local_path);
-    if (!util::is_subpath(resolved.dir, workspace_)) {
+    if (!util::is_subpath(resolved.repository_root, workspace_.parent_path()) ||
+        !util::is_subpath(resolved.dir, resolved.repository_root)) {
       throw actions::ActionError("The local action path '" + ref.local_path + "' is outside of the workspace");
     }
     return resolved;
@@ -687,12 +944,29 @@ ResolvedAction JobRunner::resolve_action(const actions::ActionRef& ref) {
   const auto entry = run_.repositories.fetch(ref.owner, ref.repo, ref.ref, [log](std::string_view m) {
     log->info(std::string(m), Color::Gray);
   });
-  resolved.dir = util::real_path(ref.path.empty() ? entry.dir : entry.dir / ref.path);
-  if (!util::is_subpath(resolved.dir, util::real_path(entry.dir))) {
+  const auto source = util::real_path(ref.path.empty() ? entry.dir : entry.dir / ref.path);
+  if (!util::is_subpath(source, util::real_path(entry.dir))) {
     throw actions::ActionError("The action path is outside of the repository: " + ref.path);
   }
   resolved.repository = ref.full_name();
   resolved.ref = ref.ref;
+  resolved.hosted_python = sandbox_ && actions::is_setup_python_root(ref);
+  if (resolved.hosted_python) {
+    resolved.repository_root = util::real_path(entry.dir);
+    resolved.dir = source;
+    return resolved;
+  }
+  auto copy = action_copies_.find(entry.dir);
+  if (copy == action_copies_.end()) {
+    const auto dir = util::make_temp_dir("action-", temp_);
+    fs::copy(entry.dir, dir, fs::copy_options::recursive | fs::copy_options::copy_symlinks);
+    copy = action_copies_.emplace(entry.dir, dir).first;
+  }
+  resolved.repository_root = util::real_path(copy->second);
+  resolved.dir = util::real_path(ref.path.empty() ? resolved.repository_root : resolved.repository_root / ref.path);
+  if (!util::is_subpath(resolved.dir, resolved.repository_root)) {
+    throw actions::ActionError("The action path is outside of the repository: " + ref.path);
+  }
   return resolved;
 }
 
@@ -730,7 +1004,7 @@ actions::BuiltinContext JobRunner::builtin_context() {
   actions::BuiltinContext bc;
   bc.workspace = workspace_;
   bc.home = home_;
-  bc.writable = {workspace_, temp_, home_, tmp_, tool_cache_, file_commands_dir_};
+  bc.writable = {workspace_.parent_path(), temp_, home_, tmp_, tool_cache_, file_commands_dir_};
   for (const auto& d : run_.options.sandbox.allow_write) {
     const auto writable = util::real_path(d);
     const auto control_root = util::real_path(run_.options.run_dir / "control");
@@ -743,8 +1017,10 @@ actions::BuiltinContext JobRunner::builtin_context() {
   if (run_.options.sandbox.enabled) {
     bc.readable = bc.writable;
     for (const auto& d : run_.options.sandbox.allow_read) bc.readable.push_back(util::real_path(d));
+    bc.scoped_readable = hosted_python_reads_;
   }
   bc.cache_store = run_.options.cache_dir / "cache" / run_.repository;
+  bc.lfs_store = run_.options.cache_dir / "lfs" / "github.com";
   bc.artifact_store = wr_.artifacts;
   bc.repository = run_.repository;
   bc.ref = run_.event.info.ref;
@@ -809,8 +1085,59 @@ StepResult JobRunner::run_uses(StepScope& scope, const workflow::Step& step, con
     return result;
   }
 
-  const auto resolved = resolve_action(ref);
+  auto resolved = resolve_action(ref);
+  const auto permitted = [&](const std::vector<std::string>& selectors) {
+    return std::any_of(selectors.begin(), selectors.end(), [&](const auto& selector) {
+      return actions::matches_action_permission(selector, ref);
+    });
+  };
+  resolved.allow_docker = permitted(run_.options.sandbox.allow_docker_for);
+  if (sandbox_ && resolved.allow_docker) {
+    log_->warning("Docker daemon access enabled for action '" + resolved.display +
+                  "'; Docker can access host files and networks and bypass the sandbox");
+  }
+  resolved.allow_unity = permitted(run_.options.sandbox.allow_unity_for);
+  if (sandbox_ && resolved.allow_unity) {
+    log_->warning("Unity compatibility enabled for action '" + resolved.display +
+                  "'; host Unity temporary files and licensing IPC may be accessible to its processes and children");
+  }
+  resolved.allow_msbuild = permitted(run_.options.sandbox.allow_msbuild_for);
+  if (sandbox_ && resolved.allow_msbuild) {
+    log_->warning("MSBuild worker IPC enabled for action '" + resolved.display +
+                  "'; host MSBuild sockets may be accessible to its processes and children");
+  }
+  resolved.allow_xcode = permitted(run_.options.sandbox.allow_xcode_for);
+  if (sandbox_ && resolved.allow_xcode) {
+    log_->warning("Xcode temporary-file access enabled for action '" + resolved.display +
+                  "'; matching host " + (run_.options.sandbox.allow_xcode_simulator ? "Xcode/Simulator" : "Xcode") +
+                  " temporary entries may be accessible to its processes and children, including unrelated "
+                  "distribution-pipeline and UUID-named entries");
+  }
+  resolved.allow_apple_security = permitted(run_.options.sandbox.allow_apple_security_for);
+  if (sandbox_ && resolved.allow_apple_security) {
+    log_->warning("Apple security services enabled for '" + resolved.display +
+                  "'; its processes can contact SecurityServer and trustd.agent, including Keychain-related services");
+  }
+  if (resolved.hosted_python) {
+    for (const auto* metadata_name : {"action.yml", "action.yaml"}) {
+      const auto metadata = resolved.dir / metadata_name;
+      if (!fs::is_regular_file(metadata)) continue;
+      if (!util::is_subpath(util::real_path(metadata), resolved.repository_root)) {
+        throw actions::ActionError("setup-python action metadata is outside its cached repository");
+      }
+      break;
+    }
+  }
   auto action = std::make_unique<actions::Action>(actions::load_action(resolved.dir, resolved.display));
+  if (resolved.hosted_python) {
+    if (action->kind != actions::ActionKind::Node) {
+      throw actions::ActionError("Hosted Python tool cache access requires a JavaScript setup-python action");
+    }
+    prepare_hosted_python_action(resolved, *action);
+    log_->warning("Host Python tool cache read/write enabled for '" + resolved.display +
+                  "': " + run_.options.sandbox.hosted_python_tool_cache.string() +
+                  "; the action and its child processes can modify this shared host cache");
+  }
   for (const auto& w : action->warnings) log_->warning(w.to_string());
   const auto inputs = action_inputs(*action, step, scope, ctx);
   const auto* a = action.get();
@@ -852,6 +1179,7 @@ StepResult JobRunner::run_uses(StepScope& scope, const workflow::Step& step, con
     }
     if (result.outcome == "success") {
       result = run_node(scope, step.id, *a, resolved, inputs, a->main, state, action_env(), timeout, after_cancel);
+      if (result.outcome == "success" && resolved.hosted_python) register_hosted_python_installations(result);
     }
   } catch (...) {
     if (post_index) post_steps_[*post_index].state = state;
@@ -867,14 +1195,25 @@ StepResult JobRunner::run_node(const StepScope& scope, const std::string& step_i
                                std::optional<std::chrono::milliseconds> timeout, bool after_cancel) {
   auto* log = log_.get();
   const auto script = util::real_path(resolved.dir / file);
-  if (!util::is_subpath(script, resolved.dir)) throw actions::ActionError("Invalid action entry point: " + file);
+  if (!util::is_subpath(script, resolved.repository_root)) throw actions::ActionError("Invalid action entry point: " + file);
   const auto node = run_.node.get(actions::node_major_version(action.runtime),
                                   [log](std::string_view m) { log->warning(m); });
+  if (resolved.hosted_python) {
+    validate_hosted_python_action(resolved);
+    auto writable = writable_directories();
+    writable.push_back(run_.options.sandbox.hosted_python_tool_cache);
+    sandbox::require_disjoint_from_writable(node, writable, "setup-python Node.js executable");
+  }
   const auto files = prepare_file_commands();
   StepScope action_scope = scope;
   action_scope.action_path = resolved.dir;
   action_scope.action_repository = resolved.repository;
   action_scope.action_ref = resolved.ref;
+  action_scope.allow_apple_security = resolved.allow_apple_security;
+  action_scope.allow_docker = resolved.allow_docker;
+  action_scope.allow_msbuild = resolved.allow_msbuild;
+  action_scope.allow_unity = resolved.allow_unity;
+  action_scope.allow_xcode = resolved.allow_xcode;
   auto process_env = step_environment(env, files, action_scope, step_id);
   process_env["GITHUB_ACTION_PATH"] = resolved.dir.string();
   process_env["GITHUB_ACTION_REPOSITORY"] = resolved.repository;
@@ -883,15 +1222,29 @@ StepResult JobRunner::run_node(const StepScope& scope, const std::string& step_i
     process_env["INPUT_" + util::to_upper(util::replace_all(k, " ", "_"))] = v;
   }
   for (const auto& [k, v] : state) process_env["STATE_" + k] = v;
-  // Cached installations are already readable; an explicit binary must not
+  // Cached installations are already readable; a host or explicit binary must not
   // implicitly grant access to its parent directories (e.g. the host HOME).
-  return execute({node.string(), script.string()}, std::move(process_env), workspace_, timeout, after_cancel, files,
-                 &state, {node});
+  auto result = execute({node.string(), script.string()}, std::move(process_env), workspace_, timeout, after_cancel,
+                        files, &state, {node}, resolved.allow_apple_security, resolved.allow_msbuild,
+                        resolved.allow_unity, resolved.allow_docker, resolved.hosted_python, resolved.allow_xcode);
+  if (resolved.hosted_python && result.outcome == "failure") {
+    const auto version = inputs.find("python-version");
+    const auto architecture = inputs.find("architecture");
+    const auto freethreaded = inputs.find("freethreaded");
+    const bool standard = freethreaded == inputs.end() || !util::iequals(freethreaded->second, "true");
+    log_->warning(
+        "setup-python failed; a macOS cache miss may require privileged installation, which the "
+        "sandbox does not permit. " +
+        sandbox::hosted_python_provisioning_hint(
+            standard && version != inputs.end() ? std::string_view(version->second) : std::string_view{},
+            architecture != inputs.end() ? std::string_view(architecture->second) : std::string_view{}));
+  }
+  return result;
 }
 
-StepResult JobRunner::run_composite(StepScope& parent, const std::string& name,
-                                    const actions::Action& action, const ResolvedAction& resolved,
-                                    const StringMap& inputs, const StringMap& step_env) {
+StepResult JobRunner::run_composite(StepScope& parent, const std::string& name, const actions::Action& action,
+                                    const ResolvedAction& resolved, const StringMap& inputs,
+                                    const StringMap& step_env) {
   if (parent.depth + 1 > kMaxCompositeDepth) {
     throw actions::ActionError("Composite actions can be nested up to " + std::to_string(kMaxCompositeDepth) +
                                " levels");
@@ -904,6 +1257,11 @@ StepResult JobRunner::run_composite(StepScope& parent, const std::string& name,
   child.action_path = resolved.dir;
   child.action_repository = resolved.repository;
   child.action_ref = resolved.ref;
+  child.allow_apple_security = resolved.allow_apple_security;
+  child.allow_docker = resolved.allow_docker;
+  child.allow_msbuild = resolved.allow_msbuild;
+  child.allow_unity = resolved.allow_unity;
+  child.allow_xcode = resolved.allow_xcode;
   child.inputs = to_object(inputs);
   child.if_site = Site::ActionStepIf;
   child.general_site = Site::ActionStepGeneral;
@@ -1019,6 +1377,8 @@ util::Environment JobRunner::step_environment(const StringMap& env, const FileCo
   auto type = ref_type(ev.info.ref);
   if (type.empty() && !ev.info.ref.empty()) type = "branch";
   const StringMap runtime = {
+      {"CPP_ACTIONS", "true"},
+      {"CPP_ACTIONS_VERSION", CPA_VERSION},
       {"GITHUB_ACTIONS", "true"},
       {"GITHUB_ACTION", action_id},
       {"GITHUB_ACTOR", ev.actor},
@@ -1066,19 +1426,46 @@ util::Environment JobRunner::step_environment(const StringMap& env, const FileCo
   for (const auto& [k, v] : runtime) out[k] = v;
   if (run_.options.debug) out["RUNNER_DEBUG"] = "1";
   if (scope.composite || !scope.action_path.empty()) out["GITHUB_ACTION_PATH"] = scope.action_path.string();
+  workspace::set_git_config_environment(out, home_ / ".gitconfig");
   if (sandbox_) {
     out["HOME"] = home_.string();
     out["TMPDIR"] = tmp_.string();
+#if defined(__APPLE__)
+    out["CFFIXED_USER_HOME"] = home_.string();
+    out["PATH"] = (job_dir_ / "scripts/bin").string() + ":" + out["PATH"];
+#endif
     for (const auto& [k, v] : sandbox_->environment()) out[k] = v;
   }
+  auto& java_options = out["JDK_JAVA_OPTIONS"];
+  if (!java_options.empty()) java_options += " ";
+  // The Java launcher's option tokenizer supports quotes, not shell backslash escapes.
+  const auto java_home = util::replace_all(home_.string(), "\"", "\"'\"'\"");
+  java_options += "\"-Duser.home=" + java_home + "\" \"-Dmaven.repo.local=" + java_home + "/.m2/repository\"";
   return out;
 }
 
 StepResult JobRunner::execute(std::vector<std::string> argv, util::Environment env, const fs::path& cwd,
                               std::optional<std::chrono::milliseconds> timeout, bool after_cancel,
-                              const FileCommands& files, StringMap* state, const std::vector<fs::path>& extra_read) {
+                              const FileCommands& files, StringMap* state, const std::vector<fs::path>& extra_read,
+                              bool allow_apple_security, bool allow_msbuild, bool allow_unity, bool allow_docker,
+                              bool hosted_python, bool allow_xcode) {
   StepResult result;
-  if (sandbox_) argv = sandbox_->wrap(argv, extra_read);
+  if (sandbox_) env.try_emplace("DOTNET_USE_POLLING_FILE_WATCHER", "1");
+  if (sandbox_ && allow_unity) {
+    env["DOTNET_USE_POLLING_FILE_WATCHER"] = "1";
+    auto& java_options = env["JDK_JAVA_OPTIONS"];
+    if (!java_options.empty()) java_options += " ";
+    java_options += "-Djava.net.preferIPv4Stack=true " + sandbox_->java_proxy_options();
+    env["TMPDIR"] = unity_tmp_.string() + "/";
+  }
+  const auto java_tmp = sandbox_ && allow_unity ? unity_tmp_.string() + "/" : tmp_.string();
+  env["JDK_JAVA_OPTIONS"] += " \"-Djava.io.tmpdir=" + util::replace_all(java_tmp, "\"", "\"'\"'\"") + "\"";
+  if (sandbox_) {
+    const std::vector<fs::path> scoped_write =
+        hosted_python ? std::vector<fs::path>{run_.options.sandbox.hosted_python_tool_cache} : std::vector<fs::path>{};
+    argv = sandbox_->wrap(argv, extra_read, allow_apple_security, allow_msbuild, allow_unity, hosted_python_reads_,
+                          scoped_write, allow_docker, allow_xcode);
+  }
   CommandState cs;
   cs.allow_unsecure = util::iequals(env["ACTIONS_ALLOW_UNSECURE_COMMANDS"], "true");
   bool job_timeout = false;
@@ -1116,6 +1503,8 @@ StepResult JobRunner::execute(std::vector<std::string> argv, util::Environment e
   }
   process_file_commands(files, result, state);
   for (const auto& [k, v] : cs.outputs) result.outputs.emplace(k, v);
+  for (const auto& [k, v] : cs.environment) result.environment.emplace(k, v);
+  result.paths.insert(result.paths.end(), cs.paths.begin(), cs.paths.end());
   if (state != nullptr) {
     for (const auto& [k, v] : cs.state) (*state)[k] = v;
   }
@@ -1154,11 +1543,13 @@ void JobRunner::process_file_commands(const FileCommands& files, StepResult& res
         continue;
       }
       global_env_[k] = v;
+      result.environment[k] = v;
     }
     for (const auto& [k, v] : parse_key_value_file(read_command_file(files.output))) result.outputs[k] = v;
     for (const auto& p : parse_path_file(read_command_file(files.path))) {
       std::erase(path_prepend_, p);
       path_prepend_.push_back(p);
+      result.paths.push_back(p);
     }
     for (const auto& [k, v] : parse_key_value_file(read_command_file(files.state))) {
       if (state != nullptr) (*state)[k] = v;
@@ -1268,8 +1659,10 @@ void JobRunner::handle_line(std::string_view line, CommandState& cs) {
     if (name == "add-path") {
       std::erase(path_prepend_, cmd->message);
       path_prepend_.push_back(cmd->message);
+      cs.paths.push_back(cmd->message);
     } else if (auto it = cmd->properties.find("name"); it != cmd->properties.end()) {
       global_env_[it->second] = cmd->message;
+      cs.environment[it->second] = cmd->message;
     }
   } else {
     log_->debug("Ignoring the workflow command '" + name + "'");
@@ -1297,6 +1690,28 @@ void JobRunner::evaluate_outputs() {
 
 void JobRunner::finish() {
   sandbox_.reset();
+  if (!short_work_dir_.empty()) {
+    if (run_.options.keep_workdir) {
+      if (log_) log_->info("Retained job work directory: " + work_root_.string(), Color::Gray);
+    } else {
+      try {
+        util::remove_tree(short_work_dir_);
+      } catch (const std::exception& e) {
+        if (log_) log_->warning(std::string("Failed to remove the job work directory: ") + e.what());
+      }
+    }
+  }
+  if (!unity_tmp_.empty()) {
+    if (run_.options.keep_workdir) {
+      if (log_) log_->info("Retained Unity TMPDIR: " + unity_tmp_.string(), Color::Gray);
+    } else {
+      try {
+        util::remove_tree(unity_tmp_);
+      } catch (const std::exception& e) {
+        if (log_) log_->warning(std::string("Failed to remove Unity temporary directory: ") + e.what());
+      }
+    }
+  }
   if (!run_.options.keep_workdir && !job_dir_.empty()) {
     try {
       util::remove_tree(job_dir_);
@@ -1326,6 +1741,19 @@ JobReport JobRunner::run() {
     report_.duration_ms = elapsed_ms(started_);
     finish();
     return report_;
+  }
+  if (!run_.options.setup_steps.empty()) {
+    StepScope setup_scope;
+    setup_scope.setup = true;
+    setup_scope.file = run_.options.setup_document ? run_.options.setup_document->file : "<setup-steps>";
+    setup_scope.inputs = top_.inputs;
+    setup_scope.prefix = "cpp-actions setup / ";
+    for (const auto& step : run_.options.setup_steps) run_step(setup_scope, step);
+    setup_failed_ = setup_scope.status == "failure";
+    if (setup_failed_) {
+      status_ = "failure";
+      log_->error("cpp-actions setup failed; workflow steps will be skipped");
+    }
   }
   for (const auto& step : job_.steps) run_step(top_, step);
   if (top_.status == "failure" && status_ == "success") status_ = "failure";

@@ -2,6 +2,8 @@ if(NOT DEFINED CPP_ACTIONS OR NOT DEFINED TEST_ROOT)
   message(FATAL_ERROR "CPP_ACTIONS and TEST_ROOT are required")
 endif()
 
+include("${CMAKE_CURRENT_LIST_DIR}/../cleanup_workspaces.cmake")
+cleanup_workspaces("${TEST_ROOT}")
 file(REMOVE_RECURSE "${TEST_ROOT}")
 file(MAKE_DIRECTORY "${TEST_ROOT}/repo/.github/workflows")
 execute_process(COMMAND git -C "${TEST_ROOT}/repo" init -q -b main
@@ -186,4 +188,80 @@ if(NOT status EQUAL 2 OR NOT error MATCHES "invalid workflow" OR EXISTS "${TEST_
   message(FATAL_ERROR "Invalid workflows must not succeed silently: ${status}\n${output}\n${error}")
 endif()
 
+file(MAKE_DIRECTORY "${TEST_ROOT}/snapshot-repo/.github/workflows")
+file(WRITE "${TEST_ROOT}/snapshot-repo/source.txt" "committed\n")
+file(WRITE "${TEST_ROOT}/snapshot-repo/.github/workflows/checkout.yml" [=[
+on: workflow_dispatch
+jobs:
+  checkout:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          test "$(cat source.txt)" = "modified"
+          git fsck --no-dangling
+          test "$(git config --global --get safe.directory)" = '*'
+          test "$(git config --global --get filter.lfs.required)" = true
+          if git config --get runner.host; then exit 1; fi
+]=])
+execute_process(
+  COMMAND git -C "${TEST_ROOT}/snapshot-repo" init -q -b main
+  RESULT_VARIABLE status ERROR_VARIABLE error)
+if(NOT status EQUAL 0)
+  message(FATAL_ERROR "Cannot initialize snapshot test repository: ${error}")
+endif()
+execute_process(
+  COMMAND git -C "${TEST_ROOT}/snapshot-repo" add --all
+  RESULT_VARIABLE status ERROR_VARIABLE error)
+if(NOT status EQUAL 0)
+  message(FATAL_ERROR "Cannot stage snapshot test files: ${error}")
+endif()
+execute_process(
+  COMMAND git -C "${TEST_ROOT}/snapshot-repo"
+          -c user.name=test -c user.email=test@example.com -c commit.gpgsign=false
+          -c core.hooksPath=/dev/null -c maintenance.auto=false -c gc.auto=0
+          commit -q -m initial
+  RESULT_VARIABLE status ERROR_VARIABLE error)
+if(NOT status EQUAL 0)
+  message(FATAL_ERROR "Cannot commit snapshot test files: ${error}")
+endif()
+file(WRITE "${TEST_ROOT}/snapshot-repo/source.txt" "modified\n")
+file(READ "${TEST_ROOT}/snapshot-repo/.git/config" source_config)
+file(WRITE "${TEST_ROOT}/snapshot-git-config"
+     "[maintenance]\n\tauto = true\n[gc]\n\tauto = 1\n[runner]\n\thost = true\n")
+file(WRITE "${TEST_ROOT}/snapshot-system-config" "invalid host system configuration\n")
+execute_process(
+  COMMAND "${CMAKE_COMMAND}" -E env
+          GIT_CONFIG_NOSYSTEM=0 "GIT_CONFIG_GLOBAL=${TEST_ROOT}/snapshot-git-config"
+          "GIT_CONFIG_SYSTEM=${TEST_ROOT}/snapshot-system-config"
+          GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.bare GIT_CONFIG_VALUE_0=true
+          "GIT_CONFIG_PARAMETERS='core.bare=true'"
+          "GIT_TRACE=${TEST_ROOT}/snapshot-git-trace"
+          "${CPP_ACTIONS}" run --no-sandbox -C "${TEST_ROOT}/snapshot-repo"
+          -e workflow_dispatch --run-dir "${TEST_ROOT}/snapshot-run" --cache-dir "${TEST_ROOT}/cache"
+          --host-label macos-latest --no-color --keep-workdir
+  RESULT_VARIABLE status OUTPUT_VARIABLE output ERROR_VARIABLE error TIMEOUT 30)
+if(NOT status EQUAL 0 OR NOT output MATCHES "Result: success")
+  message(FATAL_ERROR "Snapshot checkout failed: ${status}\n${output}\n${error}")
+endif()
+file(READ "${TEST_ROOT}/snapshot-git-trace" trace)
+if(trace MATCHES "maintenance run --auto|gc --auto|pack-objects")
+  message(FATAL_ERROR "Snapshot creation started automatic Git maintenance")
+endif()
+if(NOT trace MATCHES "built-in: git commit")
+  message(FATAL_ERROR "Maintenance regression test did not exercise a snapshot commit")
+endif()
+file(READ "${TEST_ROOT}/snapshot-run/snapshot/.git/config" snapshot_config)
+file(READ "${TEST_ROOT}/snapshot-repo/.git/config" config_after)
+if(NOT source_config STREQUAL config_after OR snapshot_config MATCHES "\\[maintenance\\]|\\[gc\\]")
+  message(FATAL_ERROR "Snapshot maintenance overrides must not change repository configuration")
+endif()
+execute_process(
+  COMMAND git -C "${TEST_ROOT}/snapshot-run/snapshot" fsck --no-dangling
+  RESULT_VARIABLE status ERROR_VARIABLE error)
+if(NOT status EQUAL 0)
+  message(FATAL_ERROR "Snapshot Git objects are invalid: ${error}")
+endif()
+
+cleanup_workspaces("${TEST_ROOT}")
 file(REMOVE_RECURSE "${TEST_ROOT}")

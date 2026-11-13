@@ -53,6 +53,55 @@ std::vector<std::string> Shell::argv(const std::filesystem::path& script_path) c
   return out;
 }
 
+bool Shell::ignore_interactive() {
+  const auto name = base_name(program);
+  if (name != "bash" && name != "sh") return false;
+  std::vector<std::string> filtered;
+  bool options = true;
+  bool operand = false;
+  bool changed = false;
+  for (const auto& arg : args) {
+    if (!options || operand) {
+      filtered.push_back(arg);
+      operand = false;
+      continue;
+    }
+    if (arg.empty() || arg == "-" || arg == "+" || arg == "--" ||
+        (arg.front() != '-' && arg.front() != '+')) {
+      options = false;
+      filtered.push_back(arg);
+      continue;
+    }
+    if (arg == "--interactive") {
+      changed = true;
+      continue;
+    }
+    if (arg.starts_with("--")) {
+      operand = arg == "--rcfile" || arg == "--init-file";
+      filtered.push_back(arg);
+      continue;
+    }
+    std::string flags(1, arg.front());
+    for (std::size_t i = 1; i < arg.size(); ++i) {
+      const char flag = arg[i];
+      if (flag == 'i' && arg.front() == '-') {
+        changed = true;
+      } else {
+        flags += flag;
+      }
+      // Option names and command strings are operands, not shell switches.
+      if (flag == 'o' || flag == 'O') operand = true;
+      if (flag == 'c') options = false;
+    }
+    if (flags.size() > 1) filtered.push_back(std::move(flags));
+  }
+  if (!changed) return false;
+  args = std::move(filtered);
+  display = util::shell_quote(program);
+  for (const auto& arg : args) display += " " + util::shell_quote(arg);
+  return true;
+}
+
 std::string Shell::script(std::string_view body) const {
   if (!powershell) return std::string(body);
   return "$ErrorActionPreference = 'stop'\n" + std::string(body) +

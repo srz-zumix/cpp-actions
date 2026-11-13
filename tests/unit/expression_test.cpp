@@ -21,8 +21,8 @@ EvalContext make_context() {
     "ref": "refs/heads/main",
     "event": {
       "commits": [
-        {"message": "first", "author": {"name": "alice"}},
-        {"message": "second", "author": {"name": "bob"}}
+        {"message": "first", "author": {"name": "fixture-author-a"}},
+        {"message": "second", "author": {"name": "fixture-author-b"}}
       ],
       "labels": [{"name": "bug"}, {"name": "docs"}]
     }
@@ -102,7 +102,7 @@ IUTEST(ExpressionTest, PropertyAccess) {
 }
 
 IUTEST(ExpressionTest, Wildcards) {
-  IUTEST_EXPECT_EQ("alice,bob", eval_str("join(github.event.commits.*.author.name)"));
+  IUTEST_EXPECT_EQ("fixture-author-a,fixture-author-b", eval_str("join(github.event.commits.*.author.name)"));
   IUTEST_EXPECT_EQ("first|second", eval_str("join(github.event.commits[*].message, '|')"));
   IUTEST_EXPECT_EQ("true", eval_str("contains(github.event.labels.*.name, 'BUG')"));
   IUTEST_EXPECT_EQ("false", eval_str("contains(github.event.labels.*.name, 'feature')"));

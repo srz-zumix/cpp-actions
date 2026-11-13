@@ -241,15 +241,17 @@ class Parser {
     }
   }
 
-  void check_call_value(const Node* n, Site site, std::string_view what, std::string_view type = {}) {
+  void check_call_value(const Node* n, Site site, std::string_view what, std::string_view type = {},
+                        bool allow_null = false) {
     auto valid_type = [&](const expr::Value& value) {
+      if (value.is_null()) return allow_null;
       if (type == "string") return value.is_string();
       if (type == "boolean") return value.is_bool();
       if (type == "number") return value.is_number();
       return value.is_string() || value.is_bool() || value.is_number();
     };
     const std::string expected = type.empty() ? "a string, boolean or number" : "a " + std::string(type);
-    if (!n->is_scalar() || n->is_null()) {
+    if (!n->is_scalar()) {
       error(n, "'" + std::string(what) + "' must be " + expected);
       return;
     }
@@ -283,7 +285,7 @@ class Parser {
         error(e.key, "A template expression is not allowed in a mapping key");
       }
       check_call_value(e.value, secrets ? Site::JobEnv : Site::JobGeneral,
-                       what + "." + e.key->text, secrets ? "string" : "");
+                       what + "." + e.key->text, secrets ? "string" : "", !secrets);
     }
   }
 
@@ -550,7 +552,7 @@ class Parser {
             if (in.type != "string" && in.type != "boolean" && in.type != "number") {
               error(t, "Unexpected input type '" + in.type + "'. Expected string, boolean or number");
             } else if (in.default_value != nullptr) {
-              check_call_value(in.default_value, Site::RunName, "default", in.type);
+              check_call_value(in.default_value, Site::RunName, "default", in.type, in.type == "string");
             }
           }
           wf.call_inputs.push_back(std::move(in));
@@ -1006,7 +1008,7 @@ class Parser {
     general_site_ = Site::ActionStepGeneral;
     if_site_ = Site::ActionStepIf;
   }
-  void parse_composite_steps(const Node& steps, Job& job) { parse_steps(steps, job); }
+  void parse_step_list(const Node& steps, Job& job) { parse_steps(steps, job); }
 
  private:
   bool composite_ = false;
@@ -1032,10 +1034,34 @@ std::vector<Step> parse_action_steps(const yaml::Node& steps, std::string file, 
   parser.set_composite();
   Job job;
   job.id = "composite";
-  parser.parse_composite_steps(steps, job);
+  parser.parse_step_list(steps, job);
   if (warnings != nullptr) {
     warnings->insert(warnings->end(), parser.warnings().begin(), parser.warnings().end());
   }
+  if (!parser.errors().empty()) throw WorkflowError(parser.errors());
+  return std::move(job.steps);
+}
+
+std::vector<Step> parse_setup_steps(const yaml::Node& steps, const std::string& file) {
+  if (!steps.is_sequence()) {
+    throw WorkflowError({{file, steps.mark, "'setup-steps' must be a list", false}});
+  }
+  std::vector<Diagnostic> errors;
+  for (const auto* step : steps.items) {
+    if (!step->is_mapping()) continue;  // Reported by the regular step parser.
+    if (step->get("run") == nullptr) {
+      errors.push_back({file, step->mark, "Every setup step must define 'run'", false});
+    }
+    for (const auto* key : {"uses", "with", "continue-on-error"}) {
+      if (const auto* value = step->get(key)) {
+        errors.push_back({file, value->mark, "'" + std::string(key) + "' is not supported in setup-steps", false});
+      }
+    }
+  }
+  if (!errors.empty()) throw WorkflowError(std::move(errors));
+  Parser parser(file);
+  Job job;
+  parser.parse_step_list(steps, job);
   if (!parser.errors().empty()) throw WorkflowError(parser.errors());
   return std::move(job.steps);
 }

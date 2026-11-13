@@ -14,6 +14,7 @@
 
 #include "config/config.hpp"
 #include "engine/catalog.hpp"
+#include "engine/cleanup.hpp"
 #include "engine/event.hpp"
 #include "engine/runner.hpp"
 #include "sandbox/sandbox.hpp"
@@ -125,6 +126,7 @@ struct RunCli {
   std::vector<std::string> vars;
   std::vector<std::string> var_files;
   int parallel = -1;
+  int proxy_max_connections = 0;
   bool no_sandbox = false;
   bool dry_run = false;
   bool no_needs = false;
@@ -184,19 +186,47 @@ engine::RunOptions run_options(const RunCli& o, const fs::path& root) {
     return (path.is_absolute() ? path : config_dir / path).lexically_normal();
   };
   options.sandbox.enabled = !o.no_sandbox;
+  options.setup_document = cfg.setup_document;
+  options.setup_steps = cfg.setup_steps;
   options.sandbox.allow_hosts.insert(options.sandbox.allow_hosts.begin(), cfg.allow_hosts.begin(),
                                      cfg.allow_hosts.end());
+  options.sandbox.allow_apple_security_for.insert(options.sandbox.allow_apple_security_for.begin(),
+                                                 cfg.allow_apple_security_for.begin(),
+                                                 cfg.allow_apple_security_for.end());
+  options.sandbox.allow_docker_for.insert(options.sandbox.allow_docker_for.begin(),
+                                          cfg.allow_docker_for.begin(), cfg.allow_docker_for.end());
+  options.sandbox.allow_docker_step.insert(options.sandbox.allow_docker_step.begin(),
+                                           cfg.allow_docker_step.begin(), cfg.allow_docker_step.end());
   for (const auto& path : cfg.allow_read) options.sandbox.allow_read.push_back(config_file(path));
+  options.sandbox.allow_msbuild_for.insert(options.sandbox.allow_msbuild_for.begin(),
+                                           cfg.allow_msbuild_for.begin(), cfg.allow_msbuild_for.end());
+  options.sandbox.allow_msbuild_step.insert(options.sandbox.allow_msbuild_step.begin(),
+                                            cfg.allow_msbuild_step.begin(), cfg.allow_msbuild_step.end());
+  options.sandbox.allow_unity_for.insert(options.sandbox.allow_unity_for.begin(),
+                                         cfg.allow_unity_for.begin(), cfg.allow_unity_for.end());
+  options.sandbox.allow_unity_step.insert(options.sandbox.allow_unity_step.begin(),
+                                          cfg.allow_unity_step.begin(), cfg.allow_unity_step.end());
+  options.sandbox.allow_xcode_for.insert(options.sandbox.allow_xcode_for.begin(),
+                                         cfg.allow_xcode_for.begin(), cfg.allow_xcode_for.end());
   for (const auto& path : o.allow_read) options.sandbox.allow_read.push_back(config::expand_user(path));
   for (auto& path : options.sandbox.allow_write) path = config::expand_user(path.string());
   for (const auto& path : cfg.allow_write) options.sandbox.allow_write.push_back(config_file(path));
   options.sandbox.allow_localhost = options.sandbox.allow_localhost || cfg.allow_localhost.value_or(false);
+  options.sandbox.allow_xcode_simulator =
+      options.sandbox.allow_xcode_simulator || cfg.allow_xcode_simulator.value_or(false);
+  options.sandbox.allow_unity_hosts = options.sandbox.allow_unity_hosts || cfg.allow_unity_hosts.value_or(false);
+  options.ignore_interactive_shell = options.ignore_interactive_shell || cfg.ignore_interactive_shell.value_or(false);
+  options.inherit_unity_editor_prefs =
+      options.inherit_unity_editor_prefs || cfg.inherit_unity_editor_prefs.value_or(false);
   options.pass_env.insert(options.pass_env.begin(), cfg.pass_env.begin(), cfg.pass_env.end());
   options.host_labels.insert(options.host_labels.begin(), cfg.host_labels.begin(), cfg.host_labels.end());
   options.parallel = o.parallel >= 0 ? o.parallel : cfg.parallel.value_or(0);
+  options.sandbox.proxy_max_connections =
+      o.proxy_max_connections > 0 ? o.proxy_max_connections : cfg.proxy_max_connections.value_or(0);
   if (options.cache_dir.empty() && !cfg.cache_dir.empty()) options.cache_dir = config_file(cfg.cache_dir);
   if (!options.cache_dir.empty()) options.cache_dir = config::expand_user(options.cache_dir.string());
   if (!options.run_dir.empty()) options.run_dir = config::expand_user(options.run_dir.string());
+  if (!options.artifact_dir.empty()) options.artifact_dir = config::expand_user(options.artifact_dir.string());
   if (options.node.empty() && !cfg.node.empty()) options.node = config_file(cfg.node);
   if (!options.node.empty()) options.node = config::expand_user(options.node.string());
   options.with_needs = !o.no_needs;
@@ -330,6 +360,71 @@ int cmd_run(RunCli& o) {
   return report.result == "failure" ? 1 : 0;
 }
 
+struct CleanCli {
+  std::vector<std::string> runs;
+  std::string cache_dir;
+  std::string config_path;
+  bool all = false;
+  bool dry_run = false;
+  bool force = false;
+};
+
+fs::path clean_cache_dir(const CleanCli& o) {
+  if (!o.cache_dir.empty()) return config::expand_user(o.cache_dir);
+  const bool explicit_config = !o.config_path.empty();
+  const auto config_path = explicit_config ? config::expand_user(o.config_path) : config::default_config_path();
+  if (explicit_config || fs::exists(config_path)) {
+    const auto cfg = config::load_config(config_path);
+    if (!cfg.cache_dir.empty()) {
+      auto path = config::expand_user(cfg.cache_dir);
+      return (path.is_absolute() ? path : fs::absolute(config_path).parent_path() / path).lexically_normal();
+    }
+  }
+  return engine::default_cache_dir();
+}
+
+int cmd_clean(const CleanCli& o) {
+  if (o.runs.empty() == !o.all) throw std::runtime_error("specify run directories or --all (but not both)");
+  const auto runs_root = clean_cache_dir(o) / "runs";
+  std::vector<fs::path> runs;
+  for (const auto& run : o.runs) {
+    const bool is_path = run.find('/') != std::string::npos || run == "." || run == ".." || run.starts_with("~");
+    if (!is_path && (run.empty() || run.find('\0') != std::string::npos))
+      throw std::runtime_error("invalid run name '" + run + "'");
+    const auto path = is_path ? fs::absolute(config::expand_user(run)) : runs_root / run;
+    if (!fs::exists(fs::symlink_status(path))) throw std::runtime_error("run directory not found: " + path.string());
+    runs.push_back(path.lexically_normal());
+  }
+  if (o.all && fs::is_directory(runs_root)) {
+    for (const auto& entry : fs::directory_iterator(runs_root)) {
+      if (!entry.is_symlink() && entry.is_directory() && engine::has_retained_data(entry.path()))
+        runs.push_back(entry.path());
+    }
+    std::sort(runs.begin(), runs.end());
+  }
+  if (runs.empty()) {
+    std::cout << "No retained work directories under " << runs_root.string() << "\n";
+    return 0;
+  }
+  engine::CleanOptions options;
+  options.dry_run = o.dry_run;
+  options.force = o.force;
+  const std::string verb = o.dry_run ? "would remove " : "removed ";
+  int status = 0;
+  for (const auto& run : runs) {
+    const auto report = engine::clean_retained_run(run, options);
+    const auto name = report.run_dir.string();
+    for (const auto& path : report.removed) std::cout << name << ": " << verb << path.string() << "\n";
+    if (report.skipped) {
+      std::cout << name << ": skipped: " << report.skip_reason << "\n";
+      if (!o.all) status = 1;
+    }
+    for (const auto& error : report.errors) std::cerr << name << ": error: " << error << "\n";
+    if (!report.errors.empty()) status = 1;
+  }
+  return status;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -374,19 +469,49 @@ int main(int argc, char** argv) {
   run->add_option("--matrix", run_opts.matrix, "Matrix filter (NAME=VALUE)");
   run->add_option("--github-token,--token", run_opts.options.github_token, "Explicit GitHub API token");
   run->add_option("--allow-write", run_opts.options.sandbox.allow_write, "Additional sandbox writable path");
-  run->add_flag("--allow-localhost", run_opts.options.sandbox.allow_localhost, "Allow sandbox localhost access");
+  run->add_flag("--allow-localhost", run_opts.options.sandbox.allow_localhost, "Allow loopback connections and listening on any port (listeners are not limited to loopback)");
+  run->add_flag("--allow-xcode-simulator", run_opts.options.sandbox.allow_xcode_simulator,
+                "Allow Xcode/Simulator services for all jobs (permits host Simulator operations)");
   run->add_option("--config", run_opts.config_path,
                   "Explicit trusted configuration file (never auto-load repository config)");
   run->add_flag("--no-sandbox", run_opts.no_sandbox, "DANGER: disable filesystem and network isolation");
   run->add_option("--allow-host", run_opts.options.sandbox.allow_hosts, "Additional allowed network host (repeatable)");
+  run->add_flag("--allow-unity-hosts", run_opts.options.sandbox.allow_unity_hosts,
+                "Allow the fixed public Unity/TLS host preset through the proxy for all jobs");
+  run->add_option("--allow-apple-security-for", run_opts.options.sandbox.allow_apple_security_for,
+                  "Allow Apple security services for an action selector (ref permits '*'; repeatable; expands Keychain access)");
   run->add_option("--allow-read", run_opts.allow_read, "Additional readable host path (repeatable)");
+  run->add_option("--allow-docker-for", run_opts.options.sandbox.allow_docker_for,
+                  "Allow host Docker daemon access for an action selector (ref permits '*'; repeatable; bypasses sandbox)");
+  run->add_option("--allow-docker-step", run_opts.options.sandbox.allow_docker_step,
+                  "Allow host Docker daemon access for workflow-path::job-id::step-id (run steps only; repeatable; bypasses sandbox)");
+  run->add_option("--allow-msbuild-for", run_opts.options.sandbox.allow_msbuild_for,
+                  "Allow MSBuild Unix sockets for an action selector (ref permits '*'; repeatable)");
+  run->add_option("--allow-msbuild-step", run_opts.options.sandbox.allow_msbuild_step,
+                  "Allow MSBuild Unix sockets for workflow-path::job-id::step-id (run steps only; repeatable)");
+  run->add_option("--allow-unity-for", run_opts.options.sandbox.allow_unity_for,
+                  "Allow Unity temporary files and IPC for an action selector (ref permits '*'; repeatable)");
+  run->add_option("--allow-unity-step", run_opts.options.sandbox.allow_unity_step,
+                  "Allow Unity temporary files and IPC for workflow-path::job-id::step-id (run steps only; repeatable)");
+  run->add_option("--allow-xcode-for", run_opts.options.sandbox.allow_xcode_for,
+                  "Allow Xcode temporary files for an action selector (ref permits '*'; repeatable)");
   run->add_option("--pass-env,--env-pass,--env", run_opts.options.pass_env,
                   "Pass host variable NAME or explicit NAME=VALUE (repeatable)");
   run->add_flag("--keep-workdir", run_opts.options.keep_workdir, "Keep job workspaces after execution");
+  run->add_flag("--ignore-interactive-shell", run_opts.options.ignore_interactive_shell,
+                "Ignore bash/sh interactive options in run steps (warns when changed)");
+  run->add_flag("--inherit-unity-editor-prefs", run_opts.options.inherit_unity_editor_prefs,
+                "Copy host Unity EditorPrefs into each job HOME (macOS only; may expose sensitive preferences)");
   run->add_option("--run-dir", run_opts.options.run_dir,
                   "Run output directory (must not already exist; default: a unique directory under the cache)");
+  run->add_option("--artifact-dir", run_opts.options.artifact_dir,
+                  "Artifact output root (files are saved under <directory>/<workflow-run-id>/<artifact-name>)");
   run->add_option("--cache-dir", run_opts.options.cache_dir, "Shared cache directory");
   run->add_option("--parallel", run_opts.parallel, "Concurrent jobs (0 = CPU count)")->check(CLI::NonNegativeNumber);
+  run->add_option("--proxy-max-connections", run_opts.proxy_max_connections,
+                  "Concurrent connections per job network proxy (default: " +
+                      std::to_string(cpa::sandbox::kDefaultProxyConnections) + ")")
+      ->check(CLI::Range(1, cpa::sandbox::kMaxProxyConnections));
   run->add_option("--host-label", run_opts.options.host_labels,
                   "Explicit runs-on label to execute on this host (repeatable)");
   run->add_option("-s,--secret", run_opts.secrets, "Secret NAME from host environment or NAME=VALUE (repeatable)");
@@ -396,6 +521,16 @@ int main(int argc, char** argv) {
   run->add_flag("--debug", run_opts.options.debug, "Show workflow debug commands");
   run->add_flag("--no-color", run_opts.no_color, "Disable colored logs");
 
+  CleanCli clean_opts;
+  auto* clean = app.add_subcommand("clean", "Remove work directories retained by run --keep-workdir");
+  clean->add_option("run", clean_opts.runs, "Run directory path, or run name under <cache>/runs");
+  clean->add_flag("-a,--all", clean_opts.all, "Clean every completed run under <cache>/runs");
+  clean->add_option("--cache-dir", clean_opts.cache_dir, "Shared cache directory");
+  clean->add_option("--config", clean_opts.config_path, "Explicit trusted configuration file (for cache-dir)");
+  clean->add_flag("-n,--dry-run", clean_opts.dry_run, "Show what would be removed without removing it");
+  clean->add_flag("--force", clean_opts.force,
+                  "Also clean runs without report.json (interrupted runs; never runs that are still in progress)");
+
   CLI11_PARSE(app, argc, argv);
 
   try {
@@ -403,6 +538,7 @@ int main(int argc, char** argv) {
     if (list->parsed()) return cmd_list(list_opts);
     if (graph->parsed()) return cmd_graph(graph_opts, graph_selectors, graph_format);
     if (run->parsed()) return cmd_run(run_opts);
+    if (clean->parsed()) return cmd_clean(clean_opts);
   } catch (const std::exception& e) {
     std::cerr << "error: " << e.what() << "\n";
     return 2;

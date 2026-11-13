@@ -130,6 +130,34 @@ std::string replace_all(std::string_view s, std::string_view from, std::string_v
   return r;
 }
 
+std::string base64_encode(std::string_view s) {
+  static constexpr char kTable[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  std::string out;
+  std::size_t i = 0;
+  while (i + 2 < s.size()) {
+    const auto n = (static_cast<unsigned char>(s[i]) << 16) | (static_cast<unsigned char>(s[i + 1]) << 8) |
+                   static_cast<unsigned char>(s[i + 2]);
+    out += kTable[(n >> 18) & 63];
+    out += kTable[(n >> 12) & 63];
+    out += kTable[(n >> 6) & 63];
+    out += kTable[n & 63];
+    i += 3;
+  }
+  if (i + 1 == s.size()) {
+    const auto n = static_cast<unsigned char>(s[i]) << 16;
+    out += kTable[(n >> 18) & 63];
+    out += kTable[(n >> 12) & 63];
+    out += "==";
+  } else if (i + 2 == s.size()) {
+    const auto n = (static_cast<unsigned char>(s[i]) << 16) | (static_cast<unsigned char>(s[i + 1]) << 8);
+    out += kTable[(n >> 18) & 63];
+    out += kTable[(n >> 12) & 63];
+    out += kTable[(n >> 6) & 63];
+    out += '=';
+  }
+  return out;
+}
+
 std::string format_number(double value) {
   if (std::isnan(value)) return "NaN";
   if (std::isinf(value)) return value > 0 ? "Infinity" : "-Infinity";

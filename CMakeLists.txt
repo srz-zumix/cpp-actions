@@ -9,6 +9,10 @@ option(CPA_BUILD_TESTS "Build cpp-actions tests" ${PROJECT_IS_TOP_LEVEL})
 option(CPA_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" OFF)
 option(CPA_ENABLE_SANITIZERS "Build with AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
 
+if(APPLE AND CPA_BUILD_TESTS)
+  enable_language(OBJC)
+endif()
+
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE Debug CACHE STRING "Build type" FORCE)
 endif()
@@ -48,3 +52,5 @@ endif()
 
 include(GNUInstallDirs)
 install(TARGETS cpp-actions RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(PROGRAMS scripts/install-hosted-python.sh
+  DESTINATION ${CMAKE_INSTALL_DATADIR}/cpp-actions/scripts)

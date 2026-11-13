@@ -2,11 +2,14 @@
 
 #include <filesystem>
 #include <map>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include "workflow/model.hpp"
 
 namespace cpa::config {
 
@@ -26,10 +29,25 @@ struct EnvironmentConfig {
 // User configuration (~/.config/cpp-actions/config.yml). It is never read from
 // the repository unless given explicitly, because it relaxes the sandbox.
 struct Config {
+  std::shared_ptr<yaml::Document> setup_document;
+  std::vector<workflow::Step> setup_steps;
   std::vector<std::string> allow_hosts;
+  std::vector<std::string> allow_apple_security_for;
+  std::vector<std::string> allow_docker_for;
+  std::vector<std::string> allow_docker_step;
+  std::vector<std::string> allow_msbuild_for;
+  std::vector<std::string> allow_msbuild_step;
+  std::vector<std::string> allow_unity_for;
+  std::vector<std::string> allow_unity_step;
+  std::vector<std::string> allow_xcode_for;
   std::vector<std::string> allow_read;
   std::vector<std::string> allow_write;
   std::optional<bool> allow_localhost;
+  std::optional<bool> allow_xcode_simulator;
+  std::optional<bool> allow_unity_hosts;
+  std::optional<bool> ignore_interactive_shell;
+  std::optional<bool> inherit_unity_editor_prefs;
+  std::optional<int> proxy_max_connections;
   std::vector<std::string> pass_env;
   std::vector<std::string> host_labels;
   std::optional<int> parallel;

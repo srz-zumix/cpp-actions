@@ -15,7 +15,7 @@ workflow::Workflow parse(const std::string& text) {
 
 workspace::GitInfo make_repo(const cpa_test::TempDir& dir) {
   cpa_test::init_repo(dir.path(), {{"a.txt", "a\n"}, {"src/b.cpp", "b\n"}});
-  cpa_test::git(dir.path(), {"remote", "add", "origin", "https://github.com/octo/hello.git"});
+  cpa_test::git(dir.path(), {"remote", "add", "origin", "https://github.com/fixture-owner/hello.git"});
   return workspace::read_git_info(dir.path());
 }
 
@@ -43,16 +43,16 @@ IUTEST(EventTest, Push) {
   cpa_test::TempDir dir;
   const auto git = make_repo(dir);
   EventOptions o;
-  o.actor = "octocat";
+  o.actor = "fixture-user";
   auto ev = build_event(o, git);
   IUTEST_EXPECT_EQ("push", ev.info.name);
   IUTEST_EXPECT_EQ("refs/heads/main", ev.info.ref);
   IUTEST_EXPECT_EQ(git.head_sha, ev.sha);
-  IUTEST_EXPECT_EQ("octocat", ev.actor);
+  IUTEST_EXPECT_EQ("fixture-user", ev.actor);
   IUTEST_EXPECT_EQ("refs/heads/main", ev.info.payload.get("ref").as_string());
   IUTEST_EXPECT_EQ(git.head_sha, ev.info.payload.get("after").as_string());
-  IUTEST_EXPECT_EQ("octo/hello", ev.info.payload.get("repository").get("full_name").as_string());
-  IUTEST_EXPECT_EQ("octocat", ev.info.payload.get("sender").get("login").as_string());
+  IUTEST_EXPECT_EQ("fixture-owner/hello", ev.info.payload.get("repository").get("full_name").as_string());
+  IUTEST_EXPECT_EQ("fixture-user", ev.info.payload.get("sender").get("login").as_string());
   // No pending changes: the files of the HEAD commit.
   IUTEST_ASSERT_TRUE(ev.info.changed_files.has_value());
   IUTEST_EXPECT_EQ(2u, ev.info.changed_files->size());

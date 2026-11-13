@@ -28,6 +28,17 @@ IUTEST(ActionTest, References) {
   }
 }
 
+IUTEST(ActionTest, SetupPythonHostCacheMatchesOnlyTheOfficialRootAction) {
+  for (const auto* ref :
+       {"actions/setup-python@v7", "Actions/Setup-Python@v6", "actions/setup-python@feature/branch"}) {
+    IUTEST_EXPECT_TRUE(is_setup_python_root(parse_action_ref(ref))) << ref;
+  }
+  for (const auto* ref : {"./setup-python", "example/setup-python@v7", "actions/setup-python-extra@v7",
+                          "actions/setup-python/subdir@v7", "docker://actions/setup-python"}) {
+    IUTEST_EXPECT_FALSE(is_setup_python_root(parse_action_ref(ref))) << ref;
+  }
+}
+
 IUTEST(ActionTest, JavaScriptMetadata) {
   cpa_test::TempDir dir;
   util::write_file(dir / "action.yaml", R"(name: Example
@@ -59,6 +70,82 @@ runs:
   IUTEST_ASSERT_NE(nullptr, action.post_if);
   IUTEST_EXPECT_EQ("always()", action.post_if->scalar_string());
   IUTEST_EXPECT_EQ("./example/action.yaml", action.file);
+}
+
+IUTEST(ActionTest, ActionPermissionSelectorsValidateRefWildcardsOnly) {
+  for (const auto* selector : {"./local", "./local/", "./local/./", ".", "owner/repo@v1",
+                               "owner/repo/subpath@feature/branch", "./name..suffix", "owner/repo@*",
+                               "owner/repo@v*", "owner/repo/subpath@feature/*"}) {
+    IUTEST_EXPECT_NO_THROW(validate_action_permission_selector(selector)) << selector;
+  }
+  for (const auto* selector : {"", "*", "./../escape", "./local/../other", "./local\n", "./local/*",
+                               "./local@*", "owner/repo", "owner/*@v1", "owner/repo/*@*",
+                               "owner/repo@v?", "owner/repo@v[12]",
+                               "owner/repo@${{ inputs.ref }}", "docker://alpine:3"}) {
+    IUTEST_EXPECT_THROW(validate_action_permission_selector(selector), ActionError) << selector;
+  }
+}
+
+IUTEST(ActionTest, ActionPermissionSelectorsMatchRefsAndPreserveIdentity) {
+  const struct {
+    const char* selector;
+    const char* uses;
+    bool matches;
+  } cases[] = {
+      {"owner/repo@v1", "owner/repo@v1", true},
+      {"owner/repo@v1", "owner/repo@v1.0", false},
+      {"owner/repo@*", "owner/repo@v2", true},
+      {"owner/repo@*", "owner/repo@feature/nested/branch", true},
+      {"owner/repo@*", "owner/repo@0123456789abcdef0123456789abcdef01234567", true},
+      {"owner/repo@v*", "owner/repo@v", true},
+      {"owner/repo@v*", "owner/repo@v2.1", true},
+      {"owner/repo@v*", "owner/repo@main", false},
+      {"owner/repo@v1.*", "owner/repo@v1.2", true},
+      {"owner/repo@v1.*", "owner/repo@v1x2", false},
+      {"owner/repo@v+*", "owner/repo@v+2", true},
+      {"owner/repo@v+*", "owner/repo@vv2", false},
+      {"owner/repo@a**b*c", "owner/repo@ab-c", true},
+      {"owner/repo@a*b*c", "owner/repo@ab-d", false},
+      {"owner/repo@release/*", "owner/repo@release/nested/branch", true},
+      {"owner/repo@*", "owner/other@v1", false},
+      {"owner/repo@*", "other/repo@v1", false},
+      {"owner/repo@*", "Owner/repo@v1", false},
+      {"owner/repo@*", "owner/repo/subpath@v1", false},
+      {"owner/repo/subpath@*", "owner/repo/subpath/nested@v1", false},
+      {"owner/repo@*", "./local", false},
+      {"owner/repo@*", "docker://alpine:3", false},
+      {"./local", "./local", true},
+      {"./local", "./local/", false},
+      {"./local/./", "./local", false},
+  };
+  for (const auto& test : cases) {
+    IUTEST_EXPECT_EQ(test.matches, matches_action_permission(test.selector, parse_action_ref(test.uses)))
+        << test.selector << " vs " << test.uses;
+  }
+  IUTEST_EXPECT_THROW(matches_action_permission("owner/*@*", parse_action_ref("owner/repo@v1")), ActionError);
+  IUTEST_EXPECT_THROW(matches_action_permission("./local/*", parse_action_ref("./local/action")), ActionError);
+}
+
+IUTEST(ActionTest, InvalidPermissionFailsBeforeCreatingRunDirectory) {
+  for (int permission = 0; permission < 5; ++permission) {
+    cpa_test::TempDir dir;
+    engine::RunOptions options;
+    options.sandbox.enabled = false;
+    switch (permission) {
+      case 0: options.sandbox.allow_apple_security_for = {"owner/*@v1"}; break;
+      case 1: options.sandbox.allow_docker_for = {"owner/*@v1"}; break;
+      case 2: options.sandbox.allow_msbuild_for = {"owner/*@v1"}; break;
+      case 3: options.sandbox.allow_unity_for = {"owner/*@v1"}; break;
+      case 4: options.sandbox.allow_xcode_for = {"owner/*@v1"}; break;
+    }
+    options.run_dir = dir / "run";
+    options.cache_dir = dir / "cache";
+    std::ostringstream out;
+    engine::Console console(out, false);
+    engine::Runner runner(options, console);
+    IUTEST_EXPECT_THROW(runner.run({}, {}, {}), ActionError) << permission;
+    IUTEST_EXPECT_FALSE(std::filesystem::exists(options.run_dir)) << permission;
+  }
 }
 
 IUTEST(ActionTest, CompositeMetadata) {
@@ -161,6 +248,46 @@ IUTEST(ActionFetchTest, PrivateCurlConfiguration) {
                    permissions & (std::filesystem::perms::group_all | std::filesystem::perms::others_all));
   IUTEST_EXPECT_THROW(write_curl_auth_config(dir.path(), "again"), std::system_error);
   IUTEST_EXPECT_THROW(write_curl_auth_config(dir.path(), "value\noutput=elsewhere"), ActionError);
+}
+
+IUTEST(ActionFetchTest, GitHelpersUseRunnerConfigAndExplicitToken) {
+  cpa_test::TempDir dir;
+  IUTEST_EXPECT_EQ("https://github.com/owner/repo\n",
+                   run_tool({"git", "ls-remote", "--get-url", "https://github.com/owner/repo"}, dir.path()));
+  IUTEST_EXPECT_EQ("*\n", run_tool({"git", "config", "--global", "--get", "safe.directory"}, dir.path()));
+  IUTEST_EXPECT_EQ("git-lfs filter-process\n",
+                   run_tool({"git", "config", "--global", "--get", "filter.lfs.process"}, dir.path()));
+  const auto token_env = git_token_env("test-token");
+  IUTEST_EXPECT_EQ("AUTHORIZATION: basic eC1hY2Nlc3MtdG9rZW46dGVzdC10b2tlbg==",
+                   token_env.at("GIT_CONFIG_VALUE_0"));
+  IUTEST_EXPECT_EQ(token_env.at("GIT_CONFIG_VALUE_0") + "\n",
+                   run_tool({"git", "config", "--get", "http.https://github.com/.extraheader"},
+                            dir.path(), token_env));
+}
+
+IUTEST(ActionFetchTest, SubmoduleSshMappingIsProcessScopedAndLimitedToGitHub) {
+  cpa_test::TempDir dir;
+  for (const auto& token : {std::string(), std::string("test-token")}) {
+    const auto env = git_submodule_env(token);
+    for (const auto* url : {"git@github.com:owner/repo.git", "ssh://git@github.com/owner/repo.git"}) {
+      IUTEST_EXPECT_EQ("https://github.com/owner/repo.git\n",
+                       run_tool({"git", "ls-remote", "--get-url", url}, dir.path(), env));
+      IUTEST_EXPECT_EQ(std::string(url) + "\n",
+                       run_tool({"git", "ls-remote", "--get-url", url}, dir.path()));
+    }
+    for (const auto* url : {"git@github.enterprise.example.test:fixture-owner/repo.git",
+                            "ssh://git@github.enterprise.example.test/fixture-owner/repo.git",
+                            "git@github.com.evil:owner/repo.git", "ssh://git@github.com.evil/owner/repo.git",
+                            "https://github.com/owner/repo.git", "git@other.example:owner/repo.git"}) {
+      IUTEST_EXPECT_EQ(std::string(url) + "\n",
+                       run_tool({"git", "ls-remote", "--get-url", url}, dir.path(), env));
+    }
+    if (!token.empty()) {
+      IUTEST_EXPECT_EQ(git_token_env(token).at("GIT_CONFIG_VALUE_0") + "\n",
+                       run_tool({"git", "config", "--get", "http.https://github.com/.extraheader"},
+                                dir.path(), env));
+    }
+  }
 }
 
 IUTEST(ActionFetchTest, ExplicitNode) {

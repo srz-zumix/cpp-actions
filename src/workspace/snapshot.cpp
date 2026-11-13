@@ -10,7 +10,10 @@ namespace {
 const std::string kZeroSha(40, '0');
 
 void must(const fs::path& dir, const std::vector<std::string>& args) {
-  if (!git_ok(dir, args)) throw SnapshotError("git " + util::join(args, " ") + " failed in " + dir.string());
+  // Background repacking must not race with copy_snapshot().
+  std::vector<std::string> command = {"-c", "maintenance.auto=false", "-c", "gc.auto=0"};
+  command.insert(command.end(), args.begin(), args.end());
+  if (!git_ok(dir, command)) throw SnapshotError("git " + util::join(args, " ") + " failed in " + dir.string());
 }
 
 void copy_tree(const fs::path& from, const fs::path& to) {

@@ -43,12 +43,21 @@ void Masker::add_one(std::string value) {
   values_.push_back(std::move(value));
 }
 
+void Masker::add_value(std::string_view value) {
+  if (util::trim(value).empty()) return;
+  add_one(std::string(value));
+  // Match GitHub's byte shifts for Base64(user:secret), regardless of user length.
+  for (std::size_t shift = 0; shift < 3 && shift < value.size(); ++shift) {
+    add_one(util::base64_encode(value.substr(shift)));
+  }
+}
+
 void Masker::add(std::string_view value) {
   if (util::trim(value).empty()) return;
   std::lock_guard lock(mutex_);
-  add_one(std::string(value));
+  add_value(value);
   if (value.find_first_of("\r\n") != std::string_view::npos) {
-    for (const auto& line : util::split_lines(value)) add_one(std::string(util::trim(line)));
+    for (const auto& line : util::split_lines(value)) add_value(util::trim(line));
   }
   const auto escaped = json_escape(value);
   if (escaped != value) add_one(escaped);

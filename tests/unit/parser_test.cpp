@@ -219,28 +219,28 @@ IUTEST(ParserTest, ReusableWorkflowJob) {
 on: push
 jobs:
   call:
-    uses: octo/repo/.github/workflows/x.yml@main
+    uses: fixture-owner/repo/.github/workflows/x.yml@main
     with:
       a: 1
 )");
-  IUTEST_EXPECT_EQ("octo/repo/.github/workflows/x.yml@main", wf.jobs[0].uses);
+  IUTEST_EXPECT_EQ("fixture-owner/repo/.github/workflows/x.yml@main", wf.jobs[0].uses);
 }
 
 IUTEST(ParserTest, ReusableWorkflowReferences) {
   for (const auto* uses : {"./.github/workflows/build.yml", "./.github/workflows/build.yaml",
-                           "octo/repo/.github/workflows/build.yaml@feature/build",
-                           "octo/repo/.github/workflows/build.yml@0123456789"}) {
+                           "fixture-owner/repo/.github/workflows/build.yaml@feature/build",
+                           "fixture-owner/repo/.github/workflows/build.yml@0123456789"}) {
     const auto text = std::string("on: push\njobs:\n  call:\n    uses: ") + uses + "\n";
     IUTEST_EXPECT_TRUE(errors_of(text.c_str()).empty()) << uses;
   }
   for (const auto* uses : {"''", "null", "true", "[]", "{}", "actions/checkout@v4",
                            "./other/build.yml", "./.github/workflows/nested/build.yml",
                            "./.github/workflows/../build.yml", "./.github/workflows/build.yml@main",
-                           "octo/repo/.github/workflows/build.yml",
-                           "octo/repo/.github/workflows/build.yml@",
-                           "octo/repo/.github/workflows/nested/build.yml@main",
+                           "fixture-owner/repo/.github/workflows/build.yml",
+                           "fixture-owner/repo/.github/workflows/build.yml@",
+                           "fixture-owner/repo/.github/workflows/nested/build.yml@main",
                            "../repo/.github/workflows/build.yml@main",
-                           "octo/repo/.github/workflows/build.txt@main",
+                           "fixture-owner/repo/.github/workflows/build.txt@main",
                            "${{ inputs.workflow }}", "./.github/workflows/${{ inputs.file }}.yml"}) {
     const auto text = std::string("on: push\njobs:\n  call:\n    uses: ") + uses + "\n";
     IUTEST_EXPECT_FALSE(errors_of(text.c_str()).empty()) << uses;
@@ -259,6 +259,10 @@ jobs:
       number: 42
       expression: ${{ false }}
       numeric-expression: ${{ fromJSON('42') }}
+      null-literal: null
+      null-blank:
+      null-tilde: ~
+      null-expression: ${{ null }}
       contexts: ${{ github.ref }}-${{ needs.build.outputs.x }}-${{ strategy.job-index }}-${{ matrix.os }}-${{ inputs.x }}-${{ vars.X }}
     secrets:
       token: ${{ secrets.TOKEN }}
@@ -274,7 +278,7 @@ jobs:
     secrets: inherit
 )").empty());
   for (const auto* value : {"[]", "null", "hello", "${{ inputs.values }}", "{a: []}", "{a: {x: y}}",
-                            "{a: null}", "{a: '${{ fromJSON(\"[]\") }}'}", "{a: '${{ null }}'}",
+                            "{a: '${{ fromJSON(\"[]\") }}'}",
                             "{a: '${{ github }}'}", "{a: '${{ secrets.TOKEN }}'}", "{a: '${{ env.X }}'}",
                             "{a: '${{ steps.x.outputs.y }}'}", "{'${{ inputs.key }}': text}"}) {
     const auto text = std::string("on: push\njobs:\n  call:\n    uses: ./.github/workflows/build.yml\n    with: ") +
@@ -307,6 +311,9 @@ on:
       count: {type: number, default: 2.5}
       expression: {type: boolean, default: '${{ true }}'}
       optional: {type: string}
+      null-literal: {type: string, default: null}
+      null-blank: {type: string, default:}
+      null-expression: {type: string, default: '${{ null }}'}
     outputs:
       result: {description: Result, value: '${{ jobs.build.outputs.result }}'}
     secrets:
@@ -315,12 +322,14 @@ on:
 jobs:
   build: {runs-on: x, steps: [{run: a}]}
 )");
-  IUTEST_EXPECT_EQ(5u, wf.call_inputs.size());
+  IUTEST_EXPECT_EQ(8u, wf.call_inputs.size());
   IUTEST_EXPECT_EQ(1u, wf.call_outputs.size());
   IUTEST_EXPECT_EQ(2u, wf.call_secrets.size());
   for (const auto* definition : {"{type: string, default: true}", "{type: string, default: 1}",
                                  "{type: boolean, default: 'false'}", "{type: number, default: '2'}",
-                                 "{type: string, default: null}", "{type: string, default: []}",
+                                 "{type: boolean, default: null}", "{type: number, default: null}",
+                                 "{type: boolean, default: '${{ null }}'}",
+                                 "{type: number, default: '${{ null }}'}", "{type: string, default: []}",
                                  "{type: string, default: {x: y}}",
                                  "{type: boolean, default: '${{ 1 }}'}",
                                  "{type: number, default: '${{ fromJSON(\"[]\") }}'}",

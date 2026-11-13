@@ -40,6 +40,13 @@ struct ActionRef {
 // Parses "./path", "docker://image" or "owner/repo[/path]@ref".
 ActionRef parse_action_ref(std::string_view uses);
 
+// Only the root action in the official repository receives hosted Python cache access.
+bool is_setup_python_root(const ActionRef& ref);
+
+// Non-Docker action selector; '*' is allowed only in a remote ref.
+void validate_action_permission_selector(std::string_view selector);
+bool matches_action_permission(std::string_view selector, const ActionRef& action);
+
 struct ActionInput {
   std::string name;
   std::string description;

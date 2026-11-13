@@ -69,8 +69,16 @@ bool within(const fs::path& path, const std::vector<fs::path>& roots) {
   return false;
 }
 
+bool within_scoped(const fs::path& path, const std::vector<fs::path>& roots) {
+  const auto real = resolve_existing(path);
+  for (const auto& root : roots) {
+    if (util::is_subpath(real, root)) return true;
+  }
+  return false;
+}
+
 void require_readable(const fs::path& path, const BuiltinContext& ctx) {
-  if (!ctx.readable.empty() && !within(path, ctx.readable)) {
+  if (!ctx.readable.empty() && !within(path, ctx.readable) && !within_scoped(path, ctx.scoped_readable)) {
     throw std::runtime_error("Read denied: path is outside of the readable directories: " + path.string());
   }
 }
@@ -179,12 +187,71 @@ std::optional<std::string> rev_parse(const fs::path& dir, const std::string& rev
   return workspace::git_output(dir, {"rev-parse", "--verify", "--quiet", rev + "^{commit}"});
 }
 
+void checkout_submodules(const Inputs& in, const BuiltinContext& ctx, const fs::path& target) {
+  const bool recursive = util::iequals(input(in, "submodules"), "recursive");
+  if (!recursive && !input_bool(in, "submodules", false)) return;
+  const auto env = git_submodule_env(input(in, "token", ctx.token));
+  std::vector<std::string> sync = {"git", "-C", target.string(), "submodule", "sync"};
+  if (recursive) sync.push_back("--recursive");
+  run_tool(sync, {}, env);
+  std::vector<std::string> update = {"git", "-C", target.string(), "submodule", "update", "--init",
+                                    "--force", "--checkout"};
+  if (recursive) update.push_back("--recursive");
+  const auto depth = util::parse_int(input(in, "fetch-depth", "1")).value_or(1);
+  if (depth > 0) update.push_back("--depth=" + std::to_string(depth));
+  if (ctx.info) ctx.info(recursive ? "Checking out submodules recursively" : "Checking out submodules");
+  run_tool(update, {}, env);
+}
+
+void checkout_with_lfs_cache(const fs::path& target, const fs::path& storage,
+                             const std::map<std::string, std::string>& auth, const BuiltinContext& ctx) {
+  fs::create_directories(storage);
+  fs::permissions(storage, fs::perms::owner_all);
+  auto env = auth;
+  const auto count = env.contains("GIT_CONFIG_COUNT") ? std::stoi(env.at("GIT_CONFIG_COUNT")) : 0;
+  env["GIT_CONFIG_COUNT"] = std::to_string(count + 1);
+  env["GIT_CONFIG_KEY_" + std::to_string(count)] = "lfs.storage";
+  env["GIT_CONFIG_VALUE_" + std::to_string(count)] = fs::absolute(storage).string();
+  if (ctx.info) ctx.info("Using repository LFS cache: " + storage.string());
+  run_tool({"git", "-C", target.string(), "checkout", "--quiet", "--force", "--detach", "FETCH_HEAD"}, {}, env);
+
+  // Keep job-local objects independent so later resets need no shared-cache access.
+  const auto listing = nlohmann::json::parse(
+      run_tool({"git", "-C", target.string(), "lfs", "ls-files", "--json"}, {}, env));
+  std::size_t copied = 0;
+  for (const auto& file : listing.at("files")) {
+    if (!file.at("downloaded").get<bool>()) continue;
+    const auto oid = file.at("oid").get<std::string>();
+    if (oid.size() != 64 || !std::all_of(oid.begin(), oid.end(), [](unsigned char c) {
+          return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+        })) {
+      throw ActionError("Invalid object ID in Git LFS file listing");
+    }
+    const auto rel = fs::path("objects") / oid.substr(0, 2) / oid.substr(2, 2) / oid;
+    const auto source = storage / rel;
+    const auto destination = target / ".git" / "lfs" / rel;
+    if (!fs::is_regular_file(fs::symlink_status(source))) {
+      throw ActionError("Missing or non-regular cached Git LFS object: " + source.string());
+    }
+    if (fs::exists(destination)) continue;
+    fs::create_directories(destination.parent_path());
+    util::copy_entry(source, destination);
+    ++copied;
+  }
+  if (ctx.info) ctx.info("Materialized " + std::to_string(copied) + " Git LFS objects in the job");
+}
+
 BuiltinResult checkout(const Inputs& in, const BuiltinContext& ctx) {
   const auto repository = input(in, "repository", ctx.repository);
   const auto ref = input(in, "ref");
   const auto rel = input(in, "path");
-  const fs::path target = rel.empty() ? ctx.workspace : (ctx.workspace / rel).lexically_normal();
-  if (!within(target, {util::real_path(ctx.workspace)})) {
+  const auto workspace = util::real_path(ctx.workspace);
+  if (!ctx.writable.empty() && !within(workspace, ctx.writable)) {
+    return fail("Workspace path is outside of the writable directories: " + ctx.workspace.string());
+  }
+  // Preserve a workspace-root symlink installed by a workspace setup action.
+  const fs::path target = rel.empty() ? workspace : (workspace / rel).lexically_normal();
+  if (!within(target, {workspace})) {
     return fail("Repository path '" + target.string() + "' is not under '" + ctx.workspace.string() + "'");
   }
   for (auto parent = fs::absolute(target).parent_path(); parent != parent.root_path(); parent = parent.parent_path()) {
@@ -254,8 +321,10 @@ BuiltinResult checkout(const Inputs& in, const BuiltinContext& ctx) {
       commit = *sha;
       out_ref = ref;
     }
-    if (input_bool(in, "submodules", false) || util::iequals(input(in, "submodules"), "recursive")) {
-      if (ctx.warning) ctx.warning("Submodules are not checked out by cpp-actions");
+    try {
+      checkout_submodules(in, ctx, target);
+    } catch (const std::exception& e) {
+      return fail(e.what());
     }
     result.outputs["ref"] = out_ref;
     result.outputs["commit"] = commit;
@@ -275,7 +344,12 @@ BuiltinResult checkout(const Inputs& in, const BuiltinContext& ctx) {
     fetch.push_back(ref.empty() ? "HEAD" : ref);
     if (ctx.info) ctx.info("Fetching " + repository + (ref.empty() ? "" : "@" + ref) + " from GitHub");
     run_tool(fetch, {}, env);
-    run_tool({"git", "-C", target.string(), "checkout", "--quiet", "--force", "--detach", "FETCH_HEAD"});
+    if (input_bool(in, "lfs", false) && !ctx.lfs_store.empty()) {
+      checkout_with_lfs_cache(target, ctx.lfs_store / util::to_lower(repository), env, ctx);
+    } else {
+      run_tool({"git", "-C", target.string(), "checkout", "--quiet", "--force", "--detach", "FETCH_HEAD"}, {}, env);
+    }
+    checkout_submodules(in, ctx, target);
   } catch (const std::exception& e) {
     return fail(e.what());
   }
@@ -613,6 +687,7 @@ BuiltinResult upload_artifact(const Inputs& in, const BuiltinContext& ctx) {
   const int id = ctx.next_artifact_id ? ctx.next_artifact_id() : 1;
   if (ctx.info) {
     ctx.info("Artifact " + name + " has been successfully uploaded (" + std::to_string(files.size()) + " files)");
+    ctx.info("Artifact saved to: " + dest.string());
   }
   result.outputs["artifact-id"] = std::to_string(id);
   result.outputs["artifact-url"] = "";

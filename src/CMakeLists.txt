@@ -6,6 +6,7 @@ add_library(cpa_core STATIC
   actions/fetch.cpp
   config/config.cpp
   engine/catalog.cpp
+  engine/cleanup.cpp
   engine/commands.cpp
   engine/console.cpp
   engine/evaluate.cpp
@@ -23,6 +24,7 @@ add_library(cpa_core STATIC
   expr/expression.cpp
   expr/template.cpp
   expr/value.cpp
+  sandbox/hosted_python.cpp
   sandbox/profile.cpp
   sandbox/proxy.cpp
   sandbox/sandbox.cpp

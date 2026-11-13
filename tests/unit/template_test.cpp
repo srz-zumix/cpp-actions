@@ -14,7 +14,7 @@ Scope scope() {
 
 EvalContext context() {
   EvalContext ctx;
-  ctx.contexts.set("github", Value::parse_json(R"({"actor": "octocat", "run_number": 7})"));
+  ctx.contexts.set("github", Value::parse_json(R"({"actor": "fixture-user", "run_number": 7})"));
   ctx.contexts.set("matrix", Value::parse_json(R"({"include": [1, 2], "flag": true})"));
   return ctx;
 }
@@ -48,7 +48,7 @@ IUTEST(TemplateTest, ToExpression) {
 
 IUTEST(TemplateTest, Evaluate) {
   const auto ctx = context();
-  IUTEST_EXPECT_EQ("Hello octocat #7", evaluate_template("Hello ${{ github.actor }} #${{ github.run_number }}", ctx,
+  IUTEST_EXPECT_EQ("Hello fixture-user #7", evaluate_template("Hello ${{ github.actor }} #${{ github.run_number }}", ctx,
                                                          scope())
                                            .to_string());
   // A single expression keeps its type.

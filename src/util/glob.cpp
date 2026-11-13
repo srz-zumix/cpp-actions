@@ -204,6 +204,10 @@ bool glob_match(std::string_view pattern, std::string_view path) {
   return match_segments(split_path(pattern), 0, split_path(path), 0);
 }
 
+bool glob_match_string(std::string_view pattern, std::string_view value) {
+  return match_segment(pattern, value);
+}
+
 std::vector<std::filesystem::path> glob_files(const std::filesystem::path& root,
                                               const std::vector<std::string>& patterns) {
   namespace fs = std::filesystem;

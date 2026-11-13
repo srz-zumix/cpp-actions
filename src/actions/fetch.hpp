@@ -45,8 +45,8 @@ class RepositoryCache {
   std::mutex mutex_;
 };
 
-// Provides the Node.js runtime for JavaScript actions: an explicit binary, a
-// cached or downloaded build of actions/node-versions, or the host `node`.
+// Provides a per-major Node.js runtime for JavaScript actions, bypassing a
+// nodenv shim when a matching installed or cached executable is available.
 class NodeProvider {
  public:
   NodeProvider(fs::path explicit_node, fs::path cache_root);
@@ -62,14 +62,17 @@ class NodeProvider {
   std::map<int, fs::path> resolved_;
 };
 
-// Runs a helper command (git, curl, tar) with the host environment plus
-// `extra_env`; throws ActionError with the stderr output on failure.
+// Runs a helper command with the host environment plus `extra_env`. Git uses
+// isolated runner configuration. Throws ActionError with stderr on failure.
 std::string run_tool(const std::vector<std::string>& argv, const fs::path& cwd = {},
                      const std::map<std::string, std::string>& extra_env = {});
 
 // Environment that makes git send the token to github.com (not visible in
 // the process arguments).
 std::map<std::string, std::string> git_token_env(const std::string& token);
+
+// Submodule authentication also maps GitHub.com SSH URLs to HTTPS, process-locally.
+std::map<std::string, std::string> git_submodule_env(const std::string& token);
 
 // Writes a curl config file (0600) with the authorization header.
 fs::path write_curl_auth_config(const fs::path& dir, const std::string& token);

@@ -2,9 +2,11 @@
 
 #include <cstdlib>
 
+#include "sandbox/proxy.hpp"
 #include "util/fs.hpp"
 #include "util/strings.hpp"
 #include "workflow/yaml.hpp"
+#include "workflow/parser.hpp"
 
 namespace cpa::config {
 
@@ -190,8 +192,31 @@ Config load_config(const fs::path& path) {
   for (const auto& e : root->entries) {
     const std::string& key = e.key->text;
     const auto* v = e.value;
-    if (key == "allow-hosts") {
+    if (key == "setup-steps") {
+      try {
+        c.setup_steps = workflow::parse_setup_steps(*v, file);
+      } catch (const workflow::WorkflowError& error) {
+        throw ConfigError(error.what());
+      }
+      c.setup_document = doc;
+    } else if (key == "allow-hosts") {
       c.allow_hosts = node_strings(v, file, key);
+    } else if (key == "allow-apple-security-for") {
+      c.allow_apple_security_for = node_strings(v, file, key);
+    } else if (key == "allow-docker-for") {
+      c.allow_docker_for = node_strings(v, file, key);
+    } else if (key == "allow-docker-step") {
+      c.allow_docker_step = node_strings(v, file, key);
+    } else if (key == "allow-msbuild-for") {
+      c.allow_msbuild_for = node_strings(v, file, key);
+    } else if (key == "allow-msbuild-step") {
+      c.allow_msbuild_step = node_strings(v, file, key);
+    } else if (key == "allow-unity-for") {
+      c.allow_unity_for = node_strings(v, file, key);
+    } else if (key == "allow-unity-step") {
+      c.allow_unity_step = node_strings(v, file, key);
+    } else if (key == "allow-xcode-for") {
+      c.allow_xcode_for = node_strings(v, file, key);
     } else if (key == "allow-read") {
       c.allow_read = node_strings(v, file, key);
     } else if (key == "allow-write") {
@@ -201,10 +226,40 @@ Config load_config(const fs::path& path) {
         throw ConfigError(file + ":" + std::to_string(e.key->mark.line) + ": 'allow-localhost' must be a boolean");
       }
       c.allow_localhost = v->boolean;
+    } else if (key == "allow-xcode-simulator") {
+      if (v == nullptr || v->kind != yaml::NodeKind::Boolean) {
+        throw ConfigError(file + ":" + std::to_string(e.key->mark.line) + ": 'allow-xcode-simulator' must be a boolean");
+      }
+      c.allow_xcode_simulator = v->boolean;
+    } else if (key == "allow-unity-hosts") {
+      if (v == nullptr || v->kind != yaml::NodeKind::Boolean) {
+        throw ConfigError(file + ":" + std::to_string(e.key->mark.line) + ": 'allow-unity-hosts' must be a boolean");
+      }
+      c.allow_unity_hosts = v->boolean;
+    } else if (key == "inherit-unity-editor-prefs") {
+      if (v == nullptr || v->kind != yaml::NodeKind::Boolean) {
+        throw ConfigError(file + ":" + std::to_string(e.key->mark.line) +
+                          ": 'inherit-unity-editor-prefs' must be a boolean");
+      }
+      c.inherit_unity_editor_prefs = v->boolean;
+    } else if (key == "ignore-interactive-shell") {
+      if (v == nullptr || v->kind != yaml::NodeKind::Boolean) {
+        throw ConfigError(file + ":" + std::to_string(e.key->mark.line) +
+                          ": 'ignore-interactive-shell' must be a boolean");
+      }
+      c.ignore_interactive_shell = v->boolean;
     } else if (key == "env-pass") {
       c.pass_env = node_strings(v, file, key);
     } else if (key == "host-labels") {
       c.host_labels = node_strings(v, file, key);
+    } else if (key == "proxy-max-connections") {
+      const auto n = util::parse_int(node_string(v, file, key));
+      if (!n || *n < 1 || *n > sandbox::kMaxProxyConnections) {
+        throw ConfigError(file + ":" + std::to_string(e.key->mark.line) +
+                          ": 'proxy-max-connections' must be an integer from 1 to " +
+                          std::to_string(sandbox::kMaxProxyConnections));
+      }
+      c.proxy_max_connections = static_cast<int>(*n);
     } else if (key == "parallel") {
       const auto n = util::parse_int(node_string(v, file, key));
       if (!n || *n < 1) {

@@ -13,6 +13,7 @@
 #include "engine/shell.hpp"
 #include "test_support.hpp"
 #include "util/sha256.hpp"
+#include "util/strings.hpp"
 #include "workflow/parser.hpp"
 #include "workflow/scopes.hpp"
 
@@ -23,6 +24,7 @@ namespace {
 
 class EngineRun {
  public:
+  ~EngineRun() { cpa_test::remove_retained_workspaces(options.run_dir); }
   EngineRun() : console(output, false) {
     options.run_dir = dir / "run";
     options.cache_dir = dir / "cache";
@@ -31,12 +33,12 @@ class EngineRun {
     options.parallel = 4;
     git.root = dir / "repository";
     fs::create_directories(git.root);
-    git.github = workspace::GitHubRepo{"octo", "hello"};
+    git.github = workspace::GitHubRepo{"fixture-owner", "hello"};
     git.head_sha = std::string(40, 'a');
     event.info.name = "push";
     event.info.ref = "refs/heads/main";
     event.sha = git.head_sha;
-    event.actor = "octocat";
+    event.actor = "fixture-user";
     event.info.payload = expr::Value::parse_json(R"({"custom":"payload"})");
   }
 
@@ -48,6 +50,14 @@ class EngineRun {
   }
 
   std::vector<Selection> selection() const { return {{&file, {true, "test"}}}; }
+
+  void setup_steps(const std::string& text) {
+    const auto path = dir / "config.yml";
+    util::write_file(path, text);
+    const auto config = config::load_config(path);
+    options.setup_document = config.setup_document;
+    options.setup_steps = config.setup_steps;
+  }
 
   RunReport run(const std::string& text) {
     load(text);
@@ -63,6 +73,70 @@ class EngineRun {
   Console console;
   WorkflowFile file;
 };
+
+IUTEST(EngineTest, ArtifactDirectoryRejectsProtectedPathsAndFiles) {
+  for (const auto* name : {"jobs/nested", "control", "snapshot", "invalid-file"}) {
+    EngineRun test;
+    test.options.artifact_dir = test.options.run_dir / name;
+    if (std::string(name) == "invalid-file") {
+      test.options.artifact_dir = test.dir / name;
+      util::write_file(test.options.artifact_dir, "preserve");
+    }
+    IUTEST_EXPECT_THROW(test.run(R"(
+on: push
+jobs:
+  test:
+    runs-on: test-host
+    steps:
+      - run: "true"
+)"), std::exception);
+    if (std::string(name) == "invalid-file")
+      IUTEST_EXPECT_EQ("preserve", util::read_file(test.options.artifact_dir));
+  }
+}
+
+IUTEST(EngineTest, CustomArtifactDirectorySupportsUploadDownloadAndPersistsAfterFailure) {
+  for (const bool custom : {false, true}) {
+    EngineRun test;
+    const auto root = custom ? test.dir / "export" : test.options.run_dir / "artifacts";
+    if (custom) {
+      test.options.artifact_dir = root;
+      fs::create_directories(root);
+      util::write_file(root / "existing", "preserve");
+    }
+    const auto report = test.run(R"yaml(
+on: push
+jobs:
+  upload:
+    runs-on: test-host
+    steps:
+      - run: echo payload > output.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build
+          path: output.txt
+  download:
+    needs: upload
+    runs-on: test-host
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: build
+          path: received
+      - run: test "$(cat received/output.txt)" = payload
+      - run: exit 7
+)yaml");
+    IUTEST_EXPECT_EQ("failure", report.result) << test.output.str();
+    const auto file = root / report.workflows.front().run_id / "build/output.txt";
+    IUTEST_EXPECT_EQ("payload\n", util::read_file(file));
+    IUTEST_EXPECT_FALSE(fs::exists(test.options.run_dir / "jobs"));
+    IUTEST_EXPECT_NE(std::string::npos, test.output.str().find("Artifact saved to: " + file.parent_path().string()));
+    if (custom) {
+      IUTEST_EXPECT_EQ("preserve", util::read_file(root / "existing"));
+      IUTEST_EXPECT_FALSE(fs::exists(test.options.run_dir / "artifacts"));
+    }
+  }
+}
 
 const JobReport& job(const RunReport& report, std::string_view id) {
   for (const auto& workflow : report.workflows) {
@@ -91,6 +165,260 @@ bool wait_for_file(const fs::path& path) {
 
 }  // namespace
 
+IUTEST(EngineTest, GradleHomeDefaultsToEachJobHome) {
+  EngineRun test;
+  test.setup_steps(R"yaml(
+setup-steps:
+  - run: test "$GRADLE_USER_HOME" = "$HOME/.gradle"
+)yaml");
+  const auto report = test.run(R"yaml(
+on: push
+jobs:
+  test:
+    runs-on: test-host
+    strategy:
+      matrix:
+        instance: [first, second]
+    steps:
+      - run: |
+          test "$GRADLE_USER_HOME" = "$HOME/.gradle"
+          test ! -e "$GRADLE_USER_HOME/marker"
+          mkdir -p "$GRADLE_USER_HOME"
+          echo '${{ matrix.instance }}' > "$GRADLE_USER_HOME/marker"
+      - run: test "$(cat "$GRADLE_USER_HOME/marker")" = '${{ matrix.instance }}'
+)yaml");
+  IUTEST_EXPECT_EQ("success", report.result) << test.output.str();
+}
+
+#if defined(__APPLE__)
+IUTEST(EngineTest, CreatesMacOSJobPreferencesDirectory) {
+  EngineRun test;
+  const auto report = test.run(R"yaml(
+on: push
+jobs:
+  test:
+    runs-on: test-host
+    steps:
+      - run: test -d "$HOME/Library/Preferences"
+)yaml");
+  IUTEST_EXPECT_EQ("success", report.result) << test.output.str();
+}
+#endif
+
+IUTEST(EngineTest, GradleHomeExplicitOverridesArePreserved) {
+  EngineRun test;
+  test.options.pass_env = {"GRADLE_USER_HOME=/passed/gradle"};
+  const auto report = test.run(R"yaml(
+on: push
+jobs:
+  passed:
+    runs-on: test-host
+    steps:
+      - run: test "$GRADLE_USER_HOME" = /passed/gradle
+  layered:
+    runs-on: test-host
+    env:
+      GRADLE_USER_HOME: /job/gradle
+    steps:
+      - run: test "$GRADLE_USER_HOME" = /job/gradle
+      - env:
+          GRADLE_USER_HOME: /step/gradle
+        run: test "$GRADLE_USER_HOME" = /step/gradle
+      - run: echo "GRADLE_USER_HOME=$HOME/custom-gradle" >> "$GITHUB_ENV"
+      - run: test "$GRADLE_USER_HOME" = "$HOME/custom-gradle"
+)yaml");
+  IUTEST_EXPECT_EQ("success", report.result) << test.output.str();
+
+  EngineRun workflow_test;
+  workflow_test.options.pass_env = {"GRADLE_USER_HOME=/passed/gradle"};
+  const auto workflow_report = workflow_test.run(R"yaml(
+on: push
+env:
+  GRADLE_USER_HOME: /workflow/gradle
+jobs:
+  test:
+    runs-on: test-host
+    steps:
+      - run: test "$GRADLE_USER_HOME" = /workflow/gradle
+)yaml");
+  IUTEST_EXPECT_EQ("success", workflow_report.result) << workflow_test.output.str();
+}
+
+IUTEST(EngineTest, JavaHomeOptionsAreAppendedAfterEnvironmentOverrides) {
+  EngineRun test;
+  test.options.pass_env = {"JDK_JAVA_OPTIONS=-Dprobe=passed",
+                          "JAVA_TOOL_OPTIONS=-Dtool=preserved"};
+  test.setup_steps(R"yaml(
+setup-steps:
+  - env:
+      JDK_JAVA_OPTIONS: -Dprobe=setup
+    run: |
+      expected="-Dprobe=setup \"-Duser.home=$HOME\" \"-Dmaven.repo.local=$HOME/.m2/repository\" \"-Djava.io.tmpdir=$TMPDIR\""
+      test "$JDK_JAVA_OPTIONS" = "$expected"
+)yaml");
+  const auto report = test.run(R"yaml(
+on: push
+jobs:
+  passed:
+    runs-on: test-host
+    steps:
+      - run: |
+          expected="-Dprobe=passed \"-Duser.home=$HOME\" \"-Dmaven.repo.local=$HOME/.m2/repository\" \"-Djava.io.tmpdir=$TMPDIR\""
+          test "$JDK_JAVA_OPTIONS" = "$expected"
+          test "$JAVA_TOOL_OPTIONS" = "-Dtool=preserved"
+  layered:
+    runs-on: test-host
+    env:
+      JDK_JAVA_OPTIONS: -Dprobe=job
+    steps:
+      - run: |
+          expected="-Dprobe=job \"-Duser.home=$HOME\" \"-Dmaven.repo.local=$HOME/.m2/repository\" \"-Djava.io.tmpdir=$TMPDIR\""
+          test "$JDK_JAVA_OPTIONS" = "$expected"
+      - env:
+          JDK_JAVA_OPTIONS: -Dprobe=step
+        run: |
+          expected="-Dprobe=step \"-Duser.home=$HOME\" \"-Dmaven.repo.local=$HOME/.m2/repository\" \"-Djava.io.tmpdir=$TMPDIR\""
+          test "$JDK_JAVA_OPTIONS" = "$expected"
+      - run: echo 'JDK_JAVA_OPTIONS=-Dprobe=file' >> "$GITHUB_ENV"
+      - run: |
+          expected="-Dprobe=file \"-Duser.home=$HOME\" \"-Dmaven.repo.local=$HOME/.m2/repository\" \"-Djava.io.tmpdir=$TMPDIR\""
+          test "$JDK_JAVA_OPTIONS" = "$expected"
+)yaml");
+  IUTEST_EXPECT_EQ("success", report.result) << test.output.str();
+
+  EngineRun workflow_test;
+  const auto workflow_report = workflow_test.run(R"yaml(
+on: push
+env:
+  JDK_JAVA_OPTIONS: -Dprobe=workflow
+jobs:
+  test:
+    runs-on: test-host
+    steps:
+      - run: |
+          expected="-Dprobe=workflow \"-Duser.home=$HOME\" \"-Dmaven.repo.local=$HOME/.m2/repository\" \"-Djava.io.tmpdir=$TMPDIR\""
+          test "$JDK_JAVA_OPTIONS" = "$expected"
+)yaml");
+  IUTEST_EXPECT_EQ("success", workflow_report.result) << workflow_test.output.str();
+}
+
+IUTEST(EngineTest, JavaAndMavenHomesAndTempAreIsolatedForEachJob) {
+  const auto host = util::current_environment();
+  const auto path = host.find("PATH");
+  auto java = util::find_executable("java", path == host.end() ? "" : path->second);
+#if defined(__APPLE__)
+  const auto java_home = util::capture({"/usr/libexec/java_home"});
+  if (java_home.exit_code == 0) java = fs::path(util::trim(java_home.out)) / "bin/java";
+#endif
+  if (!java || util::capture({java->string(), "--source", "11", "-version"}).exit_code != 0)
+    IUTEST_SKIP() << "No host Java 11+ source launcher";
+  for (const bool sandbox : {false, true}) {
+    if (sandbox && !host_is_macos()) continue;
+    EngineRun test;
+    test.options.sandbox.enabled = sandbox;
+    test.options.sandbox.allow_unity_step = {".github/workflows/test.yml::test::unity"};
+    test.options.run_dir = test.dir / "java home 'and \"quotes\"";
+    test.options.pass_env = {"JAVA=" + java->string(),
+                            "JDK_JAVA_OPTIONS=-Dprobe=preserved -Duser.home=/host/java "
+                            "-Dmaven.repo.local=/host/maven -Djava.io.tmpdir=/host/tmp"};
+    test.setup_steps(R"yaml(
+setup-steps:
+  - run: |
+      cat > Probe.java <<'JAVA'
+      import java.nio.file.*;
+      class Probe {
+        public static void main(String[] args) throws Exception {
+          Path home = Path.of(System.getenv("HOME"));
+          Path repository = Path.of(System.getProperty("maven.repo.local"));
+          Path temporary = Path.of(System.getenv("TMPDIR"));
+          if (!System.getProperty("user.home").equals(home.toString())
+              || !repository.equals(home.resolve(".m2/repository"))
+              || !Path.of(System.getProperty("java.io.tmpdir")).equals(temporary)
+              || !System.getProperty("probe").equals("preserved")) {
+            throw new AssertionError("Java/Maven home and temp properties were not isolated");
+          }
+          Path tempDirectory = Files.createTempDirectory("java-probe-");
+          Path tempFile = Files.createTempFile("java-probe-", ".tmp");
+          if (!Files.isSameFile(temporary, tempDirectory.getParent())
+              || !Files.isSameFile(temporary, tempFile.getParent())) {
+            throw new AssertionError("Java temporary files escaped the job directory");
+          }
+          Files.delete(tempFile);
+          Files.delete(tempDirectory);
+          Path marker = repository.resolve("marker");
+          if (args[0].equals("write")) {
+            Files.createDirectories(repository);
+            Files.writeString(marker, args[1], StandardOpenOption.CREATE_NEW);
+          } else if (!Files.readString(marker).equals(args[1])) {
+            throw new AssertionError("Maven repository was not shared within the job");
+          }
+        }
+      }
+      JAVA
+)yaml");
+    const auto report = test.run(R"yaml(
+on: push
+jobs:
+  test:
+    runs-on: test-host
+    strategy:
+      matrix:
+        instance: [first, second]
+    steps:
+      - run: '"$JAVA" Probe.java write ${{ matrix.instance }}'
+      - run: '"$JAVA" Probe.java read ${{ matrix.instance }}'
+      - id: unity
+        run: '"$JAVA" Probe.java read ${{ matrix.instance }}'
+)yaml");
+    IUTEST_EXPECT_EQ("success", report.result) << test.output.str();
+  }
+}
+
+IUTEST(EngineTest, JobsHaveIndependentWritableGitConfiguration) {
+  EngineRun test;
+  test.options.pass_env = {"GIT_CONFIG_GLOBAL=/host/global", "GIT_CONFIG_SYSTEM=/host/system",
+                          "GIT_CONFIG_NOSYSTEM=0", "GIT_CONFIG=/host/config"};
+  const auto report = test.run(R"yaml(
+on: push
+jobs:
+  first:
+    runs-on: test-host
+    env:
+      GIT_CONFIG_GLOBAL: /workflow/global
+      GIT_CONFIG_SYSTEM: /workflow/system
+      GIT_CONFIG_NOSYSTEM: "0"
+    steps:
+      - run: |
+          test "$GIT_CONFIG_GLOBAL" = "$HOME/.gitconfig"
+          test "$GIT_CONFIG_SYSTEM" = /dev/null
+          test "$GIT_CONFIG_NOSYSTEM" = 1
+          test "${GIT_CONFIG-unset}" = unset
+          test "$(git config --global --get safe.directory)" = '*'
+          test "$(git config --global --get filter.lfs.process)" = 'git-lfs filter-process'
+          git config --global runner.job first
+          git config --global user.name workflow-author
+      - run: |
+          test "$(git config --global --get runner.job)" = first
+          test "$(git config --global --get user.name)" = workflow-author
+          test "$(git -c runner.job=explicit config --get runner.job)" = explicit
+      - env:
+          GIT_CONFIG_COUNT: "1"
+          GIT_CONFIG_KEY_0: runner.job
+          GIT_CONFIG_VALUE_0: workflow-explicit
+        run: test "$(git config --get runner.job)" = workflow-explicit
+  second:
+    needs: first
+    runs-on: test-host
+    steps:
+      - run: |
+          test "$(git config --global --get filter.lfs.required)" = true
+          if git config --global --get runner.job; then exit 1; fi
+          if git config --global --get user.name; then exit 1; fi
+          git config --global runner.job second
+)yaml");
+  IUTEST_EXPECT_EQ("success", report.result) << test.output.str();
+}
+
 IUTEST(EngineTest, RunContextsEnvironmentAndFileCommands) {
   EngineRun test;
   test.options.vars = {{"GREETING", "hello"}};
@@ -113,14 +441,17 @@ jobs:
       - id: prepare
         env:
           SHARED: step
+          CPP_ACTIONS: overridden
         run: |
           test "$SHARED" = step
           test "$WORKFLOW_ONLY" = workflow-only
           test "$FROM_VAR" = hello
           test "$PASSED" = from-host
           test "$GITHUB_ACTIONS" = true
-          test "$GITHUB_ACTOR" = octocat
-          test "$GITHUB_REPOSITORY" = octo/hello
+          test "$CPP_ACTIONS" = true
+          test -n "$CPP_ACTIONS_VERSION"
+          test "$GITHUB_ACTOR" = fixture-user
+          test "$GITHUB_REPOSITORY" = fixture-owner/hello
           test "$GITHUB_JOB" = run
           test "$GITHUB_ACTION" = '${{ github.action }}'
           test "$GITHUB_ENV" = '${{ github.env }}'
@@ -399,6 +730,190 @@ jobs:
   IUTEST_EXPECT_EQ("failure", step(run, "errexit").outcome);
 }
 
+IUTEST(EngineTest, IgnoreInteractiveShellInDefaultsAndNestedComposites) {
+  EngineRun test;
+  IUTEST_EXPECT_FALSE(test.options.ignore_interactive_shell);
+  test.options.ignore_interactive_shell = true;
+  util::write_file(test.git.root / ".github/actions/outer/action.yml", R"(
+name: outer
+description: outer
+runs:
+  using: composite
+  steps:
+    - shell: bash --noprofile --norc --interactive -e {0}
+      run: |
+        case "$-" in *i*) exit 11 ;; esac
+        case "$-" in *e*) ;; *) exit 12 ;; esac
+    - uses: ./.github/actions/inner
+)");
+  util::write_file(test.git.root / ".github/actions/inner/action.yml", R"yaml(
+name: inner
+description: inner
+runs:
+  using: composite
+  steps:
+    - shell: bash --noprofile --norc -ieo pipefail {0}
+      run: |
+        case "$-" in *i*) exit 13 ;; esac
+        case "$-" in *e*) ;; *) exit 14 ;; esac
+        test "$(set -o | awk '$1 == "pipefail" {print $2}')" = on
+)yaml");
+  const auto report = test.run(R"(
+on: push
+defaults:
+  run:
+    shell: bash --noprofile --norc -ieo pipefail {0}
+jobs:
+  workflow-default:
+    runs-on: test-host
+    steps:
+      - run: |
+          case "$-" in *i*) exit 15 ;; esac
+          case "$-" in *e*) ;; *) exit 16 ;; esac
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/outer
+      - shell: bash
+        run: echo NON_INTERACTIVE_UNCHANGED
+  job-default:
+    runs-on: test-host
+    defaults:
+      run:
+        shell: sh -ie {0}
+    steps:
+      - run: |
+          case "$-" in *i*) exit 17 ;; esac
+          case "$-" in *e*) ;; *) exit 18 ;; esac
+)");
+  IUTEST_EXPECT_EQ("success", report.result) << test.output.str();
+  IUTEST_EXPECT_NE(std::string::npos, test.output.str().find("Interactive shell options ignored"));
+  IUTEST_EXPECT_NE(std::string::npos, test.output.str().find("NON_INTERACTIVE_UNCHANGED"));
+}
+
+IUTEST(EngineTest, SetupStepsRunPerJobAndPersistEnvironmentPathAndLoginProfile) {
+  EngineRun test;
+  test.setup_steps(R"yaml(
+setup-steps:
+  - id: prepare
+    name: Configure local tools
+    env: {SETUP_VALUE: ready}
+    run: |
+      test ! -e "$HOME/setup-once"
+      touch "$HOME/setup-once"
+      test "$PWD" = "$GITHUB_WORKSPACE"
+      test "$SETUP_VALUE" = ready
+      case "$-" in *i*) exit 31 ;; esac
+      test "$(set -o | awk '$1 == "pipefail" {print $2}')" = on
+      mkdir -p "$HOME/bin"
+      printf '#!/bin/sh\necho LOCAL_TOOL_READY\n' > "$HOME/bin/setup-tool"
+      chmod +x "$HOME/bin/setup-tool"
+      echo "$HOME/bin" >> "$GITHUB_PATH"
+      echo SETUP_RESULT=ready >> "$GITHUB_ENV"
+      printf 'export PATH="$HOME/bin:$PATH"\n' > "$HOME/.bash_profile"
+      echo 'value=setup-output' >> "$GITHUB_OUTPUT"
+      echo '# Setup summary' >> "$GITHUB_STEP_SUMMARY"
+  - name: Verify setup state
+    run: |
+      test "$SETUP_RESULT" = ready
+      test "${{ steps.prepare.outputs.value }}" = setup-output
+      setup-tool
+)yaml");
+  const auto report = test.run(R"yaml(
+on: push
+defaults:
+  run:
+    shell: missing-shell {0}
+    working-directory: nonexistent
+jobs:
+  build:
+    runs-on: test-host
+    strategy:
+      matrix:
+        variant: [one, two]
+    steps:
+      - id: prepare
+        shell: bash -leo pipefail {0}
+        working-directory: ${{ github.workspace }}
+        run: |
+          test "$SETUP_RESULT" = ready
+          test -e "$HOME/setup-once"
+          test -z "${{ steps.prepare.outputs.value }}"
+          setup-tool
+)yaml");
+  IUTEST_EXPECT_EQ("success", report.result) << test.output.str();
+  IUTEST_ASSERT_EQ(2u, report.workflows.front().jobs.size());
+  for (const auto& run : report.workflows.front().jobs) {
+    IUTEST_ASSERT_EQ(3u, run.steps.size());
+    IUTEST_EXPECT_EQ("cpp-actions setup / Configure local tools", run.steps.front().name);
+    IUTEST_EXPECT_EQ("__cpp_actions_setup_prepare", run.steps.front().id);
+    IUTEST_EXPECT_EQ("success", step(run, "prepare").outcome);
+    IUTEST_EXPECT_NE(std::string::npos, run.summary.find("# Setup summary"));
+  }
+}
+
+IUTEST(EngineTest, SetupFailureSkipsWorkflowEvenAlwaysStepsAndRecordsFailure) {
+  EngineRun test;
+  test.setup_steps(R"(
+setup-steps:
+  - name: Failing setup
+    run: exit 7
+  - name: Unreachable setup
+    run: echo SHOULD_NOT_EXECUTE_SETUP
+)");
+  const auto report = test.run(R"(
+on: push
+jobs:
+  build:
+    runs-on: test-host
+    steps:
+      - id: normal
+        name: Normal workflow step
+        run: echo SHOULD_NOT_EXECUTE_WORKFLOW
+      - id: cleanup
+        name: Always workflow step
+        if: always()
+        run: echo SHOULD_NOT_EXECUTE_CLEANUP
+)");
+  IUTEST_EXPECT_EQ("failure", report.result) << test.output.str();
+  const auto& run = job(report, "build");
+  IUTEST_ASSERT_EQ(4u, run.steps.size());
+  IUTEST_EXPECT_EQ("failure", run.steps.front().outcome);
+  IUTEST_EXPECT_EQ("skipped", run.steps[1].outcome);
+  IUTEST_EXPECT_EQ("skipped", step(run, "normal").outcome);
+  IUTEST_EXPECT_EQ("skipped", step(run, "cleanup").outcome);
+  IUTEST_EXPECT_EQ(std::string::npos, test.output.str().find("SHOULD_NOT_EXECUTE"));
+}
+
+IUTEST(EngineTest, SetupStepsHonorTimeoutAndSkippedJobs) {
+  EngineRun test;
+  test.setup_steps(R"(
+setup-steps:
+  - name: Setup timeout
+    timeout-minutes: 0.001
+    run: sleep 10
+)");
+  const auto report = test.run(R"(
+on: push
+jobs:
+  build:
+    runs-on: test-host
+    steps:
+      - id: normal
+        run: echo SHOULD_NOT_EXECUTE
+  skipped:
+    if: false
+    runs-on: test-host
+    steps:
+      - run: echo SHOULD_NOT_EXECUTE
+)");
+  IUTEST_EXPECT_EQ("failure", report.result) << test.output.str();
+  const auto& run = job(report, "build");
+  IUTEST_ASSERT_EQ(2u, run.steps.size());
+  IUTEST_EXPECT_EQ("failure", run.steps.front().outcome);
+  IUTEST_EXPECT_EQ("skipped", step(run, "normal").outcome);
+  IUTEST_EXPECT_EQ("skipped", job(report, "skipped").result);
+  IUTEST_EXPECT_TRUE(job(report, "skipped").steps.empty());
+}
+
 IUTEST(EngineTest, ConditionsAndFailureStatus) {
   EngineRun test;
   const auto report = test.run(R"yaml(
@@ -641,7 +1156,7 @@ jobs:
     steps:
       - id: running
         run: |
-          touch "$STARTED"
+          printf '%s\n' "$GITHUB_WORKSPACE" > "$STARTED"
           sleep 20
       - id: skipped
         run: exit 99
@@ -675,6 +1190,8 @@ jobs:
   IUTEST_EXPECT_EQ("skipped", step(run, "skipped").outcome);
   IUTEST_EXPECT_EQ("success", step(run, "cleanup").outcome);
   IUTEST_EXPECT_EQ("cancelled", job(report, "waiting").result);
+  const fs::path workspace(util::trim(util::read_file(marker)));
+  IUTEST_EXPECT_FALSE(fs::exists(workspace.parent_path().parent_path().parent_path()));
 }
 
 IUTEST(EngineTest, SecondCancellationStopsCleanup) {
@@ -923,6 +1440,71 @@ jobs:
   IUTEST_EXPECT_NE(std::string::npos, util::read_file(test.options.run_dir / "summary.md").find("# First ***"));
 }
 
+IUTEST(EngineTest, Base64SecretsAreMaskedAcrossLogsAndReports) {
+  EngineRun test;
+  test.options.secrets = {{"TOKEN", "gho_dummy_token"}};
+  test.options.github_token = "github-dummy-token";
+  test.options.debug = true;
+  const auto report = test.run(R"YAML(
+on: push
+jobs:
+  run:
+    runs-on: test-host
+    env:
+      TOKEN: ${{ secrets.TOKEN }}
+      GH_TOKEN: ${{ github.token }}
+    outputs:
+      public: ${{ steps.emit.outputs.public }}
+      encoded: ${{ steps.emit.outputs.encoded }}
+      basic: ${{ steps.emit.outputs.basic }}
+    steps:
+      - id: emit
+        run: |
+          encoded="$(printf '%s' "$TOKEN" | base64 | tr -d '\r\n')"
+          basic="$(printf 'build-user:%s' "$TOKEN" | base64 | tr -d '\r\n')"
+          github_encoded="$(printf '%s' "$GH_TOKEN" | base64 | tr -d '\r\n')"
+          dynamic="$(printf '%s%s' runtime- secret-value)"
+          echo "::add-mask::$dynamic"
+          dynamic_encoded="$(printf '%s' "$dynamic" | base64 | tr -d '\r\n')"
+          printf 'Authorization: Basic %s\n' "$basic"
+          printf '%s\n' "$encoded" "$dynamic_encoded"
+          printf '%s\n' "$github_encoded" >&2
+          echo "::debug::$encoded"
+          echo "::warning file=$encoded,title=$github_encoded::$dynamic_encoded"
+          printf 'public=ok\nencoded=%s\nbasic=%s\n' "$encoded" "$basic" >> "$GITHUB_OUTPUT"
+          printf '# Encoded %s / %s / %s / %s\n' "$encoded" "$basic" "$github_encoded" "$dynamic_encoded" >> "$GITHUB_STEP_SUMMARY"
+      - run: |
+          expected="$(printf '%s' "$TOKEN" | base64 | tr -d '\r\n')"
+          test '${{ steps.emit.outputs.encoded }}' = "$expected"
+          expected="$(printf 'build-user:%s' "$TOKEN" | base64 | tr -d '\r\n')"
+          test '${{ steps.emit.outputs.basic }}' = "$expected"
+)YAML");
+  IUTEST_ASSERT_EQ("success", report.result) << test.output.str();
+  const auto& run = job(report, "run");
+  IUTEST_EXPECT_EQ("ok", run.outputs.at("public"));
+  IUTEST_EXPECT_EQ(0u, run.outputs.count("encoded"));
+  IUTEST_EXPECT_EQ(0u, run.outputs.count("basic"));
+  IUTEST_EXPECT_EQ("***", step(run, "emit").outputs.at("encoded"));
+  IUTEST_EXPECT_EQ("YnVpbGQtdXNlcjpn***", step(run, "emit").outputs.at("basic"));
+  IUTEST_ASSERT_EQ(1u, run.annotations.size());
+  IUTEST_EXPECT_EQ("***", run.annotations[0].message);
+  IUTEST_EXPECT_EQ("***", run.annotations[0].title);
+  IUTEST_EXPECT_EQ("***", run.annotations[0].file);
+  IUTEST_EXPECT_EQ("# Encoded *** / YnVpbGQtdXNlcjpn*** / *** / ***\n", run.summary);
+  const auto log = util::read_file(run.log_file);
+  IUTEST_EXPECT_NE(std::string::npos, log.find("Authorization: Basic YnVpbGQtdXNlcjpn***"));
+  const auto persisted_report = util::read_file(test.options.run_dir / "report.json");
+  const auto summary = util::read_file(test.options.run_dir / "summary.md");
+  for (const auto* secret : {"gho_dummy_token", "github-dummy-token", "runtime-secret-value",
+                             "Z2hvX2R1bW15X3Rva2Vu", "YnVpbGQtdXNlcjpnaG9fZHVtbXlfdG9rZW4=",
+                             "Z2l0aHViLWR1bW15LXRva2Vu", "cnVudGltZS1zZWNyZXQtdmFsdWU="}) {
+    IUTEST_EXPECT_EQ(std::string::npos, test.output.str().find(secret));
+    IUTEST_EXPECT_EQ(std::string::npos, log.find(secret));
+    IUTEST_EXPECT_EQ(std::string::npos, persisted_report.find(secret));
+    IUTEST_EXPECT_EQ(std::string::npos, summary.find(secret));
+  }
+}
+
 IUTEST(EngineTest, DisabledLegacyEnvironmentCommandsFailStep) {
   EngineRun test;
   const auto report = test.run(R"(
@@ -1050,6 +1632,112 @@ jobs:
   IUTEST_EXPECT_EQ(2u, report.workflows[0].jobs.size());
 }
 
+#if defined(__APPLE__)
+IUTEST(EngineTest, FoundationUsesTheIsolatedJobHome) {
+  for (const bool sandbox : {false, true}) {
+    EngineRun test;
+    test.options.sandbox.enabled = sandbox;
+    test.options.pass_env = {"CPA_HOME_PROBE=" CPA_HOME_PROBE};
+    if (sandbox) test.options.sandbox.allow_read = {CPA_HOME_PROBE};
+    const auto report = test.run(sandbox ? R"yaml(
+on: push
+jobs:
+  test:
+    runs-on: test-host
+    env:
+      HOME: /workflow-home
+      CFFIXED_USER_HOME: /workflow-fixed-home
+    steps:
+      - run: echo "CFFIXED_USER_HOME=/github-env-home" >> "$GITHUB_ENV"
+      - env:
+          HOME: /step-home
+          CFFIXED_USER_HOME: /step-fixed-home
+        run: |
+          "$CPA_HOME_PROBE" "$HOME"
+      - run: |
+          "$CPA_HOME_PROBE" "$HOME"
+)yaml"
+                                                : R"yaml(
+on: push
+jobs:
+  test:
+    runs-on: test-host
+    steps:
+      - run: |
+          "$CPA_HOME_PROBE" "$HOME"
+)yaml");
+    IUTEST_EXPECT_EQ("success", report.result) << test.output.str();
+  }
+}
+#endif
+
+IUTEST(EngineTest, ShortWorkDirectoriesArePrivateUniqueAndCleanedOrRetained) {
+  for (const bool keep : {false, true}) {
+    for (const bool fail : {false, true}) {
+      for (const bool sandbox : {false, true}) {
+        if (sandbox && !host_is_macos()) continue;
+        EngineRun test;
+        test.options.keep_workdir = keep;
+        test.options.sandbox.enabled = sandbox;
+        test.options.run_dir = test.dir / std::string(120, 'r');
+        test.git.github = workspace::GitHubRepo{"demo", "example-build-workflow"};
+        const auto report = test.run(R"yaml(
+on: push
+jobs:
+  test:
+    runs-on: test-host
+    strategy:
+      fail-fast: false
+      matrix:
+        instance: [first, second]
+    outputs:
+      workspace: ${{ steps.path.outputs.workspace }}
+      temp: ${{ steps.path.outputs.temp }}
+    steps:
+      - id: path
+        run: |
+          test "$PWD" = "$GITHUB_WORKSPACE"
+          test "$RUNNER_WORKSPACE" = "$(dirname "$GITHUB_WORKSPACE")"
+          echo "workspace=$GITHUB_WORKSPACE" >> "$GITHUB_OUTPUT"
+          echo "temp=$RUNNER_TEMP" >> "$GITHUB_OUTPUT"
+          test ! -f marker
+          echo '${{ matrix.instance }}' > marker
+          mkdir -p example-client/build
+          touch example-client/build/Android-test.symbols.zip
+          find "$GITHUB_WORKSPACE/example-client/build" -name 'Android-*.symbols.zip' | head -n 1 | xargs -I{} mv {} ./symbols.zip
+          test -f symbols.zip
+      - run: test "$(cat marker)" = '${{ matrix.instance }}'
+)yaml" + std::string(fail ? "      - run: exit 7\n" : ""));
+        IUTEST_ASSERT_EQ(fail ? "failure" : "success", report.result) << test.output.str();
+        const auto& jobs = report.workflows.front().jobs;
+        IUTEST_ASSERT_EQ(2u, jobs.size());
+        std::vector<fs::path> roots;
+        for (const auto& item : jobs) {
+          const fs::path workspace(step(item, "path").outputs.at("workspace"));
+          const fs::path temp(step(item, "path").outputs.at("temp"));
+          const auto root = workspace.parent_path().parent_path().parent_path();
+          roots.push_back(root);
+          IUTEST_EXPECT_EQ(util::real_path("/tmp"), root.parent_path());
+          IUTEST_EXPECT_EQ(0u, root.filename().string().find("cpa-w-"));
+          IUTEST_EXPECT_LT((workspace / "example-client/build").string().size(), 100u);
+          IUTEST_EXPECT_LT((workspace / "example-client/build/Android-test.symbols.zip").string().size(), 255u);
+          IUTEST_EXPECT_EQ(root / "work/_temp", temp);
+          IUTEST_EXPECT_EQ(keep, fs::exists(root));
+          IUTEST_EXPECT_TRUE(fs::exists(item.log_file));
+          if (keep) {
+            IUTEST_EXPECT_EQ(fs::perms::owner_all, fs::status(root).permissions() & fs::perms::all);
+            const auto marker = test.options.run_dir / "jobs" / report.workflows.front().run_id /
+                                sanitize_key(item.key) / "work-path";
+            IUTEST_EXPECT_EQ((root / "work").string(), util::trim(util::read_file(marker)));
+            IUTEST_EXPECT_FALSE(fs::is_symlink(root));
+          }
+        }
+        IUTEST_EXPECT_NE(roots[0], roots[1]);
+      }
+    }
+  }
+}
+
 IUTEST(EngineTest, MatrixKeysWithEquivalentSanitizedNamesHaveSeparateWorkspaces) {
   EngineRun test;
   test.options.keep_workdir = true;
@@ -1145,9 +1833,9 @@ jobs:
   IUTEST_EXPECT_EQ(std::string::npos, util::read_file(test.options.run_dir / "report.json").find("dynamic-token"));
   IUTEST_EXPECT_FALSE(fs::exists(test.git.root / "created.txt"));
   IUTEST_EXPECT_EQ("host", util::read_file(test.git.root / "original.txt"));
-  IUTEST_EXPECT_EQ("isolated\n", util::read_file(test.options.run_dir / "jobs" / report.workflows[0].run_id /
-                                               sanitize_key(run.key) /
-                                               "work" / "hello" / "hello" / "created.txt"));
+  const fs::path work(util::trim(util::read_file(test.options.run_dir / "jobs" / report.workflows[0].run_id /
+                                                sanitize_key(run.key) / "work-path")));
+  IUTEST_EXPECT_EQ("isolated\n", util::read_file(work / "hello/hello/created.txt"));
 }
 
 IUTEST(EngineTest, CleansSnapshotsAndJobsButPreservesRunReports) {
@@ -1451,6 +2139,62 @@ IUTEST(EngineHelpersTest, ShellResolutionAndSubstitution) {
   pwsh.powershell = true;
   IUTEST_EXPECT_NE(std::string::npos, pwsh.script("Write-Output ok").find("$ErrorActionPreference = 'stop'"));
   IUTEST_EXPECT_NE(std::string::npos, pwsh.script("Write-Output ok").find("exit $LASTEXITCODE"));
+}
+
+IUTEST(EngineHelpersTest, InteractiveShellOptionsAreUnchangedByDefault) {
+  const auto shell = resolve_shell("bash -ileo pipefail {0}", "/usr/bin:/bin");
+  IUTEST_EXPECT_EQ((std::vector<std::string>{"-ileo", "pipefail", "{0}"}), shell.args);
+  IUTEST_EXPECT_NE(std::string::npos, shell.display.find("-ileo"));
+}
+
+IUTEST(EngineHelpersTest, IgnoreInteractiveShellPreservesOtherOptionsAndArguments) {
+  const std::vector<std::pair<std::string, std::vector<std::string>>> cases = {
+      {"bash -ileo pipefail {0}", {"-leo", "pipefail", "{0}"}},
+      {"bash -i -l -e -o pipefail {0}", {"-l", "-e", "-o", "pipefail", "{0}"}},
+      {"bash --interactive --login -e {0}", {"--login", "-e", "{0}"}},
+      {"bash -ii --interactive {0} -i --interactive", {"{0}", "-i", "--interactive"}},
+      {"sh -ie {0}", {"-e", "{0}"}},
+      {"bash --init-file -i -i {0}", {"--init-file", "-i", "{0}"}},
+      {"bash --rcfile --interactive -i {0}", {"--rcfile", "--interactive", "{0}"}},
+      {"bash -i -o ignoreeof -O extglob +o history {0}", {"-o", "ignoreeof", "-O", "extglob", "+o", "history", "{0}"}},
+      {"bash -i -- {0} -i", {"--", "{0}", "-i"}},
+      {"bash -ic \"echo -i; . {0}\" -i", {"-c", "echo -i; . {0}", "-i"}},
+      {"bash -i +i {0}", {"+i", "{0}"}},
+  };
+  for (const auto& [command, expected] : cases) {
+    auto shell = resolve_shell(command, "/usr/bin:/bin");
+    IUTEST_EXPECT_TRUE(shell.ignore_interactive()) << command;
+    IUTEST_EXPECT_EQ(expected, shell.args) << command;
+    IUTEST_EXPECT_FALSE(shell.ignore_interactive()) << command;
+    const auto argv = shell.argv("/path with spaces/script.sh");
+    IUTEST_EXPECT_EQ(shell.program, argv.front());
+    IUTEST_EXPECT_EQ(expected.size() + 1, argv.size());
+  }
+  auto shell = resolve_shell("bash -ileo pipefail {0}", "/usr/bin:/bin");
+  IUTEST_ASSERT_TRUE(shell.ignore_interactive());
+  IUTEST_EXPECT_NE(std::string::npos, shell.display.find("-leo pipefail"));
+  IUTEST_EXPECT_EQ("/a script.sh", shell.argv("/a script.sh").back());
+}
+
+IUTEST(EngineHelpersTest, IgnoreInteractiveShellLeavesOperandsAndOtherExecutablesAlone) {
+  for (const auto* command : {"bash", "bash +i {0}", "bash {0} -i", "bash -- {0} -i",
+                              "bash -o -i {0}", "bash --rcfile -i {0}",
+                              "bash -c \"echo -i; . {0}\" -i"}) {
+    auto shell = resolve_shell(command, "/usr/bin:/bin");
+    const auto args = shell.args;
+    const auto display = shell.display;
+    IUTEST_EXPECT_FALSE(shell.ignore_interactive()) << command;
+    IUTEST_EXPECT_EQ(args, shell.args);
+    IUTEST_EXPECT_EQ(display, shell.display);
+  }
+  for (const auto* program : {"/usr/bin/python3", "/usr/bin/node", "/usr/bin/pwsh", "/usr/bin/custom-shell"}) {
+    Shell shell;
+    shell.program = program;
+    shell.args = {"-i", "--interactive", "{0}"};
+    const auto args = shell.args;
+    IUTEST_EXPECT_FALSE(shell.ignore_interactive()) << program;
+    IUTEST_EXPECT_EQ(args, shell.args);
+  }
 }
 
 IUTEST(EngineHelpersTest, EvaluationRetainsTypesAndReportsLocation) {

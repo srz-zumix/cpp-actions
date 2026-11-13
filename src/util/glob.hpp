@@ -22,6 +22,9 @@ bool filter_list_match(const std::vector<std::string>& patterns, std::string_vie
 //   [] character class, dot files are matched.
 bool glob_match(std::string_view pattern, std::string_view path);
 
+// Match one glob segment as a whole string, without treating '/' specially.
+bool glob_match_string(std::string_view pattern, std::string_view value);
+
 // Returns regular files below `root` matching `patterns` (patterns starting
 // with '!' exclude). Paths are returned sorted.
 std::vector<std::filesystem::path> glob_files(const std::filesystem::path& root,

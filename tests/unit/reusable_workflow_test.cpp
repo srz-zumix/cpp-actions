@@ -26,12 +26,12 @@ class ReusableRun {
     options.parallel = 4;
     git.root = dir / "repository";
     fs::create_directories(git.root);
-    git.github = workspace::GitHubRepo{"octo", "hello"};
+    git.github = workspace::GitHubRepo{"fixture-owner", "hello"};
     git.head_sha = std::string(40, 'a');
     event.info.name = "push";
     event.info.ref = "refs/heads/main";
     event.sha = git.head_sha;
-    event.actor = "octocat";
+    event.actor = "fixture-user";
     event.info.payload = expr::Value::object();
   }
 
@@ -56,7 +56,7 @@ class ReusableRun {
   }
 
   fs::path cache(const std::string& sha) {
-    const auto root = options.cache_dir / "actions/octo/library" / sha;
+    const auto root = options.cache_dir / "actions/fixture-owner/library" / sha;
     fs::create_directories(root);
     util::write_file(root / ".cpp-actions-complete", sha + "\n");
     return root;
@@ -213,10 +213,55 @@ jobs:
   IUTEST_EXPECT_EQ("success", reusable_job(report, "call / nested / leaf").result);
 }
 
+IUTEST(ReusableWorkflowTest, NullStringInputsBecomeEmptyStrings) {
+  ReusableRun test;
+  test.workflow("typed.yml", R"(
+on:
+  workflow_call:
+    inputs:
+      literal: {type: string, required: true}
+      blank: {type: string}
+      tilde: {type: string}
+      expression: {type: string}
+      missing: {type: string}
+      overridden: {type: string, default: fallback}
+      default_null: {type: string, default: null}
+      default_expression: {type: string, default: '${{ null }}'}
+      quoted: {type: string}
+jobs:
+  leaf:
+    runs-on: test-host
+    steps:
+      - run: |
+          test '${{ toJSON(inputs.literal) }}' = '""'
+          test '${{ toJSON(inputs.blank) }}' = '""'
+          test '${{ toJSON(inputs.tilde) }}' = '""'
+          test '${{ toJSON(inputs.expression) }}' = '""'
+          test '${{ toJSON(inputs.missing) }}' = '""'
+          test '${{ toJSON(inputs.overridden) }}' = '""'
+          test '${{ toJSON(inputs.default_null) }}' = '""'
+          test '${{ toJSON(inputs.default_expression) }}' = '""'
+          test '${{ inputs.quoted }}' = null
+)");
+  const auto report = test.run(call("./.github/workflows/typed.yml", R"(
+    with:
+      literal: null
+      blank:
+      tilde: ~
+      expression: ${{ null }}
+      missing: ${{ inputs.missing }}
+      overridden: null
+      quoted: 'null'
+)"));
+  IUTEST_EXPECT_EQ("success", report.result) << test.output.str();
+  IUTEST_EXPECT_EQ("success", reusable_job(report, "call / leaf").result);
+}
+
 IUTEST(ReusableWorkflowTest, RejectsCoercedInputTypes) {
   const std::vector<std::pair<std::string, std::string>> cases = {
       {"boolean", "'true'"}, {"boolean", "'false'"}, {"number", "'12'"}, {"number", "true"},
-      {"string", "12"}, {"string", "false"}, {"string", "${{ inputs.missing }}"},
+      {"string", "12"}, {"string", "false"},
+      {"boolean", "null"}, {"number", "null"}, {"boolean", "${{ null }}"}, {"number", "${{ null }}"},
       {"boolean", "${{ 'true' }}"}, {"number", "${{ '12' }}"}};
   for (const auto& [type, value] : cases) {
     ReusableRun test;
@@ -368,11 +413,11 @@ IUTEST(ReusableWorkflowTest, ValidatesLocalAndRemoteReferencesBeforeFetching) {
   const std::vector<std::string> references = {
       "./leaf.yml", "./.github/workflows/sub/leaf.yml", "./.github/workflows/../leaf.yml",
       "./.github/workflows/leaf.txt", "./.github/workflows/leaf.yml@main",
-      "octo/library/.github/workflows/leaf.yml", "octo/library/.github/workflows/leaf.yml@",
-      "../library/.github/workflows/leaf.yml@main", "octo/../.github/workflows/leaf.yml@main",
-      "octo/library/other/workflows/leaf.yml@main", "octo/library/.github/workflows/sub/leaf.yml@main",
-      "octo/library/.github/workflows/leaf.yml@../main", "octo/library/.github/workflows/leaf.yml@-main",
-      "octo/library/.github/workflows/leaf.yml@refs//main"};
+      "fixture-owner/library/.github/workflows/leaf.yml", "fixture-owner/library/.github/workflows/leaf.yml@",
+      "../library/.github/workflows/leaf.yml@main", "fixture-owner/../.github/workflows/leaf.yml@main",
+      "fixture-owner/library/other/workflows/leaf.yml@main", "fixture-owner/library/.github/workflows/sub/leaf.yml@main",
+      "fixture-owner/library/.github/workflows/leaf.yml@../main", "fixture-owner/library/.github/workflows/leaf.yml@-main",
+      "fixture-owner/library/.github/workflows/leaf.yml@refs//main"};
   for (const auto& reference : references) {
     ReusableRun test;
     test.load(call("./.github/workflows/placeholder.yml"));
@@ -430,12 +475,12 @@ jobs:
     steps:
       - id: make
         run: |
-          test "$GITHUB_REPOSITORY" = octo/hello
+          test "$GITHUB_REPOSITORY" = fixture-owner/hello
           printf 'answer=remote-commit-ok\n' >> "$GITHUB_OUTPUT"
 )");
   test.workflow("leaf.yml", "on: workflow_call\njobs:\n  wrong:\n    runs-on: test-host\n"
                              "    steps:\n      - run: exit 1\n");
-  const auto report = test.run(call("octo/library/.github/workflows/middle.yml@" + sha));
+  const auto report = test.run(call("fixture-owner/library/.github/workflows/middle.yml@" + sha));
   IUTEST_EXPECT_EQ("success", report.result) << test.output.str();
   IUTEST_EXPECT_EQ("remote-commit-ok", reusable_job(report, "call").outputs.at("answer"));
   IUTEST_EXPECT_EQ("success", reusable_job(report, "call / nested / leaf").result);
@@ -448,7 +493,7 @@ IUTEST(ReusableWorkflowTest, RejectsRemoteCachedSymlinkEscapes) {
   util::write_file(test.dir / "outside.yml", kSimple);
   fs::create_directories(root / ".github/workflows");
   fs::create_symlink(test.dir / "outside.yml", root / ".github/workflows/leaf.yml");
-  const auto report = test.run(call("octo/library/.github/workflows/leaf.yml@" + sha));
+  const auto report = test.run(call("fixture-owner/library/.github/workflows/leaf.yml@" + sha));
   IUTEST_EXPECT_EQ("failure", report.result);
   IUTEST_EXPECT_NE(std::string::npos, reusable_job(report, "call").reason.find("invalid workflow path"));
 }
@@ -613,9 +658,9 @@ jobs:
   IUTEST_EXPECT_EQ(5u, report.workflows.front().jobs.size());
   const auto output = test.output.str();
   for (const auto& expected : {
-           "group=root-octo/hello-top-***, cancel-in-progress=true (display only; not enforced)",
-           "group=nested-octo/hello-one-***, cancel-in-progress=true (display only; not enforced)",
-           "group=nested-octo/hello-two-***, cancel-in-progress=true (display only; not enforced)",
+           "group=root-fixture-owner/hello-top-***, cancel-in-progress=true (display only; not enforced)",
+           "group=nested-fixture-owner/hello-one-***, cancel-in-progress=true (display only; not enforced)",
+           "group=nested-fixture-owner/hello-two-***, cancel-in-progress=true (display only; not enforced)",
            "group=caller-ready-one-0-***, cancel-in-progress=true (display only; not enforced)",
            "group=caller-ready-two-1-***, cancel-in-progress=false (display only; not enforced)",
            "'permissions' are not emulated; explicitly supplied tokens retain their original permissions"}) {

@@ -22,6 +22,8 @@ struct Shell {
   bool powershell = false;
 
   std::vector<std::string> argv(const std::filesystem::path& script) const;
+  // Removes bash/sh interactive options; returns whether any were removed.
+  bool ignore_interactive();
   // Script contents (adds the error handling prologue/epilogue of pwsh).
   std::string script(std::string_view body) const;
 };

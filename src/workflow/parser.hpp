@@ -20,6 +20,9 @@ Workflow parse_workflow(std::shared_ptr<yaml::Document> document, std::string fi
 std::vector<Step> parse_action_steps(const yaml::Node& steps, std::string file,
                                      std::vector<Diagnostic>* warnings = nullptr);
 
+// Trusted local setup: run steps only, without continue-on-error.
+std::vector<Step> parse_setup_steps(const yaml::Node& steps, const std::string& file);
+
 // Loads and parses a workflow file (YAML errors are reported as WorkflowError).
 Workflow load_workflow(const std::filesystem::path& path, std::string display_name,
                        std::vector<Diagnostic>* warnings = nullptr);

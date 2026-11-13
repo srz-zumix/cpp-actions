@@ -1,6 +1,7 @@
 #include "workspace/git.hpp"
 
 #include <algorithm>
+#include <iostream>
 #include <set>
 
 #include "util/fs.hpp"
@@ -11,13 +12,21 @@ namespace cpa::workspace {
 
 namespace {
 
-util::Environment git_environment() {
-  auto env = util::current_environment();
-  env["GIT_TERMINAL_PROMPT"] = "0";
-  env["GIT_OPTIONAL_LOCKS"] = "0";
-  env["LC_ALL"] = "C";
-  return env;
-}
+class InternalGitConfig {
+ public:
+  InternalGitConfig() : dir_(util::make_temp_dir("cpp-actions-git-")) {
+    util::write_file(path(), default_git_config());
+  }
+  ~InternalGitConfig() {
+    std::error_code ec;
+    fs::remove_all(dir_, ec);
+    if (ec) std::cerr << "Failed to remove internal Git configuration: " << dir_ << ": " << ec.message() << '\n';
+  }
+  fs::path path() const { return dir_ / "config"; }
+
+ private:
+  fs::path dir_;
+};
 
 std::optional<std::string> run_git(const fs::path& dir, const std::vector<std::string>& args, bool trim_newline) {
   std::vector<std::string> argv = {"git"};
@@ -58,6 +67,55 @@ std::optional<GitHubRepo> split_owner_repo(std::string_view path) {
 }
 
 }  // namespace
+
+std::string_view default_git_config() {
+  return R"([safe]
+	directory = *
+[filter "lfs"]
+	clean = git-lfs clean -- %f
+	smudge = git-lfs smudge -- %f
+	process = git-lfs filter-process
+	required = true
+[advice]
+	pushUpdateRejected = false
+	pushNonFFCurrent = false
+	pushNonFFMatching = false
+	pushAlreadyExists = false
+	pushFetchFirst = false
+	pushNeedsForce = false
+	statusHints = false
+	statusUoption = false
+	commitBeforeMerge = false
+	resolveConflict = false
+	implicitIdentity = false
+	detachedHead = false
+	amWorkDir = false
+	rmHints = false
+)";
+}
+
+void set_git_config_environment(util::Environment& env, const fs::path& global_config) {
+  env.erase("GIT_CONFIG");
+  env["GIT_CONFIG_NOSYSTEM"] = "1";
+  env["GIT_CONFIG_SYSTEM"] = "/dev/null";
+  env["GIT_CONFIG_GLOBAL"] = global_config.string();
+}
+
+util::Environment git_environment(util::Environment env) {
+  for (auto it = env.begin(); it != env.end();) {
+    if (it->first == "GIT_CONFIG" || it->first.starts_with("GIT_CONFIG_")) {
+      it = env.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  static const InternalGitConfig config;
+  set_git_config_environment(env, config.path());
+  env["GIT_TERMINAL_PROMPT"] = "0";
+  env["GIT_OPTIONAL_LOCKS"] = "0";
+  env["LC_ALL"] = "C";
+  return env;
+}
 
 std::optional<GitHubRepo> parse_github_remote(std::string_view url) {
   url = util::trim(url);

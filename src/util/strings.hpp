@@ -30,6 +30,7 @@ std::vector<std::string> split(std::string_view s, char sep);
 std::vector<std::string> split_lines(std::string_view s);
 std::string join(const std::vector<std::string>& parts, std::string_view sep);
 std::string replace_all(std::string_view s, std::string_view from, std::string_view to);
+std::string base64_encode(std::string_view s);
 
 // Number formatting compatible with .NET Double.ToString("G15", Invariant).
 std::string format_number(double value);

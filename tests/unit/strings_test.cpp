@@ -32,6 +32,18 @@ IUTEST(StringsTest, SplitLines) {
   IUTEST_EXPECT_EQ("c", lines[3]);
 }
 
+IUTEST(StringsTest, Base64Encode) {
+  IUTEST_EXPECT_EQ("", base64_encode(""));
+  IUTEST_EXPECT_EQ("Zg==", base64_encode("f"));
+  IUTEST_EXPECT_EQ("Zm8=", base64_encode("fo"));
+  IUTEST_EXPECT_EQ("Zm9v", base64_encode("foo"));
+  IUTEST_EXPECT_EQ("Zm9vYg==", base64_encode("foob"));
+  IUTEST_EXPECT_EQ("Zm9vYmE=", base64_encode("fooba"));
+  IUTEST_EXPECT_EQ("Zm9vYmFy", base64_encode("foobar"));
+  IUTEST_EXPECT_EQ("AP/+", base64_encode(std::string_view("\x00\xff\xfe", 3)));
+  IUTEST_EXPECT_EQ("w6nmvKI=", base64_encode("\xc3\xa9\xe6\xbc\xa2"));
+}
+
 IUTEST(StringsTest, FormatNumberG15) {
   IUTEST_EXPECT_EQ("0", format_number(0));
   IUTEST_EXPECT_EQ("-0", format_number(-0.0));

@@ -24,6 +24,8 @@ struct ProcessSpec {
   Environment env;
   std::filesystem::path cwd;
   std::optional<std::chrono::milliseconds> timeout;
+  // Kill immediately on timeout instead of using the normal signal grace period.
+  bool hard_timeout = false;
   const std::atomic<bool>* cancel = nullptr;
   const std::atomic<bool>* force_cancel = nullptr;
   // Called for each complete output line (without the line terminator).

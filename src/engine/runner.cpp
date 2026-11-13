@@ -17,6 +17,7 @@
 #include <thread>
 
 #include "actions/action.hpp"
+#include "engine/cleanup.hpp"
 #include "engine/evaluate.hpp"
 #include "engine/job.hpp"
 #include "expr/template.hpp"
@@ -74,6 +75,7 @@ std::string effective_result(const JobReport& r) {
 }
 
 Value convert_call_input(const workflow::CallInput& in, const Value& v, const std::string& where) {
+  if (in.type == "string" && v.is_null()) return Value("");
   if ((in.type == "boolean" && v.is_bool()) || (in.type == "number" && v.is_number()) ||
       (in.type == "string" && v.is_string())) return v;
   throw EvaluationError(where + ": the input '" + in.name + "' must be a " + in.type);
@@ -754,6 +756,38 @@ void Runner::cancel() {
 RunReport Runner::run(const std::vector<Selection>& selection, const Event& event, const workspace::GitInfo& git) {
   const auto started = Clock::now();
   auto options = impl_->options;
+  for (const auto& selector : options.sandbox.allow_apple_security_for)
+    actions::validate_action_permission_selector(selector);
+  for (const auto& selector : options.sandbox.allow_docker_for)
+    actions::validate_action_permission_selector(selector);
+  for (const auto& selector : options.sandbox.allow_msbuild_for)
+    actions::validate_action_permission_selector(selector);
+  for (const auto& selector : options.sandbox.allow_unity_for)
+    actions::validate_action_permission_selector(selector);
+  for (const auto& selector : options.sandbox.allow_xcode_for)
+    actions::validate_action_permission_selector(selector);
+  const auto validate_step_selector = [](const std::string& selector, std::string_view permission) {
+    const auto first = selector.find("::");
+    const auto second = first == std::string::npos ? first : selector.find("::", first + 2);
+    const auto file = selector.substr(0, first);
+    const auto valid_id = [](const std::string& id) {
+      return !id.empty() && id.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-") ==
+                                std::string::npos &&
+             (id.front() == '_' || (id.front() >= 'A' && id.front() <= 'Z') ||
+              (id.front() >= 'a' && id.front() <= 'z'));
+    };
+    if (first == std::string::npos || second == std::string::npos ||
+        !file.starts_with(".github/workflows/") || file.substr(18).find('/') != std::string::npos ||
+        (!file.ends_with(".yml") && !file.ends_with(".yaml")) ||
+        selector.find_first_of("*?[]{}\r\n\t") != std::string::npos || file.find("..") != std::string::npos ||
+        !valid_id(selector.substr(first + 2, second - first - 2)) || !valid_id(selector.substr(second + 2))) {
+      throw std::invalid_argument("Invalid " + std::string(permission) + " step selector '" + selector +
+                                  "': expected .github/workflows/file.yml::job-id::step-id");
+    }
+  };
+  for (const auto& selector : options.sandbox.allow_docker_step) validate_step_selector(selector, "Docker");
+  for (const auto& selector : options.sandbox.allow_msbuild_step) validate_step_selector(selector, "MSBuild");
+  for (const auto& selector : options.sandbox.allow_unity_step) validate_step_selector(selector, "Unity");
   if (options.sandbox.enabled) {
     std::string reason;
     if (!sandbox::supported(&reason)) throw std::runtime_error("sandbox unavailable: " + reason);
@@ -765,6 +799,18 @@ RunReport Runner::run(const std::vector<Selection>& selection, const Event& even
   create_private_directory(options.run_dir, true);
   options.run_dir = util::real_path(options.run_dir);
   create_private_directory(options.run_dir / "logs", true);
+  const RunLock run_lock(options.run_dir);
+  if (options.artifact_dir.empty()) options.artifact_dir = options.run_dir / "artifacts";
+  options.artifact_dir = fs::weakly_canonical(fs::absolute(options.artifact_dir));
+  for (const auto& protected_path : {options.run_dir / "jobs", options.run_dir / "control",
+                                      options.run_dir / "snapshot"}) {
+    if (util::is_subpath(options.artifact_dir, protected_path) ||
+        util::is_subpath(protected_path, options.artifact_dir)) {
+      throw std::invalid_argument("Artifact directory overlaps a job/control/snapshot directory: " +
+                                  options.artifact_dir.string());
+    }
+  }
+  create_private_directory(options.artifact_dir, false);
 
   for (const auto& id : options.jobs) {
     const bool found = std::any_of(selection.begin(), selection.end(), [&](const Selection& s) {
@@ -841,7 +887,8 @@ RunReport Runner::run(const std::vector<Selection>& selection, const Event& even
     }
     wr.secrets = options.secrets;
     wr.vars = to_object(options.vars);
-    wr.artifacts = options.run_dir / "artifacts" / wr.run_id;
+    wr.artifacts = options.artifact_dir / wr.run_id;
+    create_private_directory(wr.artifacts, true);
     wr.repo_root = git.root.empty() ? fs::current_path() : git.root;
     wr.call_stack.push_back(fs::weakly_canonical(s.file->path.empty() ? wr.repo_root / wr.file : s.file->path));
     item->jobs = job_selection(wf, options);

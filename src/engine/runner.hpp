@@ -12,6 +12,7 @@
 #include "engine/event.hpp"
 #include "engine/report.hpp"
 #include "expr/value.hpp"
+#include "sandbox/hosted_python.hpp"
 #include "workspace/git.hpp"
 
 namespace cpa::engine {
@@ -20,13 +21,31 @@ namespace fs = std::filesystem;
 
 struct SandboxOptions {
   bool enabled = true;
-  std::vector<std::string> allow_hosts;  // in addition to the GitHub domains
+  std::vector<std::string> allow_hosts;  // in addition to the default allowed hosts
+  std::vector<std::string> allow_apple_security_for;
+  std::vector<std::string> allow_docker_for;
+  std::vector<std::string> allow_docker_step;
+  std::vector<std::string> allow_msbuild_for;
+  std::vector<std::string> allow_msbuild_step;
+  std::vector<std::string> allow_unity_for;
+  std::vector<std::string> allow_unity_step;
+  std::vector<std::string> allow_xcode_for;
   std::vector<fs::path> allow_read;
   std::vector<fs::path> allow_write;
   bool allow_localhost = false;
+  bool allow_xcode_simulator = false;
+  bool allow_unity_hosts = false;
+  int proxy_max_connections = 0;  // 0 = default
+  // The standard Docker CLI endpoint; the override enables isolated runner tests.
+  fs::path docker_socket = "/var/run/docker.sock";
+  // The actual action fixes this path; the override enables isolated runner tests.
+  fs::path hosted_python_tool_cache = sandbox::kHostedPythonToolCache;
 };
 
 struct RunOptions {
+  std::shared_ptr<yaml::Document> setup_document;
+  std::vector<workflow::Step> setup_steps;
+  fs::path artifact_dir;  // artifact root; default: <run>/artifacts
   fs::path run_dir;    // default: <cache>/runs/<timestamp>-<random>
   fs::path cache_dir;  // shared caches; default: <user cache dir>/cpp-actions
   std::vector<std::string> jobs;              // job ids to run (empty = all)
@@ -43,6 +62,8 @@ struct RunOptions {
   fs::path node;  // node executable for JavaScript actions
   std::string github_token;
   bool keep_workdir = false;
+  bool ignore_interactive_shell = false;
+  bool inherit_unity_editor_prefs = false;
   bool debug = false;
 };
 

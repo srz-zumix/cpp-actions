@@ -10,10 +10,20 @@ namespace cpa::sandbox {
 namespace fs = std::filesystem;
 
 struct ProfileOptions {
-  std::vector<fs::path> read;   // additional read-only directories
-  std::vector<fs::path> write;  // read-write directories
-  int proxy_port = 0;           // outbound connections to 127.0.0.1:<port> (0 = none)
-  bool allow_localhost = false;  // bind and connect on localhost (any port)
+  std::vector<fs::path> read;         // additional read-only directories
+  std::vector<fs::path> write;        // read-write directories
+  std::vector<fs::path> scoped_read;  // prevalidated paths; do not resolve symlinks again
+  std::vector<fs::path> scoped_write;
+  int proxy_port = 0;            // outbound connections to localhost:<port> (0 = none)
+  bool allow_localhost = false;  // connect to loopback; listen on any port (all interfaces)
+  bool allow_apple_security = false;
+  bool allow_msbuild = false;
+  bool allow_unity = false;
+  bool allow_xcode = false;
+  fs::path unity_home;          // job HOME used in Unity log mutex names
+  fs::path unity_tmp;
+  fs::path docker_socket;       // prevalidated canonical socket for this invocation
+  bool allow_xcode_simulator = false;
   std::string extra_rules;       // appended verbatim (SBPL)
 };
 
@@ -25,6 +35,7 @@ std::string generate_profile(const ProfileOptions& options);
 
 // Quotes a string for SBPL ("..." with \ and " escaped).
 std::string sbpl_quote(std::string_view s);
+void validate_scoped_path(const fs::path& path);
 
 // Per-user temporary and cache directories of macOS (confstr), empty elsewhere.
 std::vector<fs::path> darwin_user_dirs();
