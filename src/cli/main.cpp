@@ -392,15 +392,21 @@ fs::path clean_cache_dir(const CleanCli& o) {
 
 int cmd_clean(const CleanCli& o) {
   if (o.runs.empty() == !o.all) throw std::runtime_error("specify run directories or --all (but not both)");
-  const auto runs_root = clean_cache_dir(o) / "runs";
+  const auto is_path = [](const std::string& run) {
+    return run.find('/') != std::string::npos || run == "." || run == ".." || run.starts_with("~");
+  };
+  const bool needs_cache_dir =
+      o.all || std::any_of(o.runs.begin(), o.runs.end(), [&](const auto& run) { return !is_path(run); });
+  const auto runs_root = needs_cache_dir ? clean_cache_dir(o) / "runs" : fs::path{};
   std::vector<fs::path> runs;
   for (const auto& run : o.runs) {
-    const bool is_path = run.find('/') != std::string::npos || run == "." || run == ".." || run.starts_with("~");
-    if (!is_path && (run.empty() || run.find('\0') != std::string::npos))
+    const bool path = is_path(run);
+    if (!path && (run.empty() || run.find('\0') != std::string::npos))
       throw std::runtime_error("invalid run name '" + run + "'");
-    const auto path = is_path ? fs::absolute(config::expand_user(run)) : runs_root / run;
-    if (!fs::exists(fs::symlink_status(path))) throw std::runtime_error("run directory not found: " + path.string());
-    runs.push_back(path.lexically_normal());
+    const auto run_path = path ? fs::absolute(config::expand_user(run)) : runs_root / run;
+    if (!fs::exists(fs::symlink_status(run_path)))
+      throw std::runtime_error("run directory not found: " + run_path.string());
+    runs.push_back(run_path.lexically_normal());
   }
   if (o.all && fs::is_directory(runs_root)) {
     for (const auto& entry : fs::directory_iterator(runs_root)) {
