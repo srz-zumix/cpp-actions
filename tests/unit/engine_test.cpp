@@ -90,8 +90,9 @@ jobs:
     steps:
       - run: "true"
 )"), std::exception);
-    if (std::string(name) == "invalid-file")
+    if (std::string(name) == "invalid-file") {
       IUTEST_EXPECT_EQ("preserve", util::read_file(test.options.artifact_dir));
+    }
   }
 }
 
@@ -316,6 +317,7 @@ IUTEST(EngineTest, JavaAndMavenHomesAndTempAreIsolatedForEachJob) {
     if (sandbox && !host_is_macos()) continue;
     EngineRun test;
     test.options.sandbox.enabled = sandbox;
+    if (sandbox) test.options.sandbox.allow_read.push_back(java->parent_path().parent_path());
     test.options.sandbox.allow_unity_step = {".github/workflows/test.yml::test::unity"};
     test.options.run_dir = test.dir / "java home 'and \"quotes\"";
     test.options.pass_env = {"JAVA=" + java->string(),

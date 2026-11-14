@@ -410,7 +410,9 @@ IUTEST(ActionRunnerTest, SetupPythonRejectsUnavailableOrUnprotectedExecutablePat
         "setup-python host tool cache overlaps",
     };
     IUTEST_EXPECT_NE(std::string::npos, f.log.find(errors[scenario])) << "scenario " << scenario << ": " << f.log;
-    if (scenario == 1 || scenario >= 4) IUTEST_EXPECT_FALSE(std::filesystem::exists(cache)) << scenario;
+    if (scenario == 1 || scenario >= 4) {
+      IUTEST_EXPECT_FALSE(std::filesystem::exists(cache)) << scenario;
+    }
   }
 }
 
