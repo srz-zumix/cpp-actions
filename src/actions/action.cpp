@@ -95,6 +95,9 @@ ActionRef parse_action_permission_selector(std::string_view selector) {
   if (ref.kind == ActionRef::Kind::Local) {
     invalid = invalid || selector.find('*') != std::string_view::npos;
     for (const auto& part : fs::path(ref.local_path)) invalid = invalid || part == "..";
+  } else {
+    const auto at = selector.rfind('@');
+    invalid = invalid || selector.substr(0, at).find('*') != std::string_view::npos;
   }
   if (invalid) throw ActionError("Invalid action permission selector '" + std::string(selector) +
                                  "': use an exact local path or owner/repo[/path]@ref; only '*' in ref is supported");

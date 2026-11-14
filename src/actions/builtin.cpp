@@ -249,7 +249,8 @@ BuiltinResult checkout(const Inputs& in, const BuiltinContext& ctx) {
   if (!ctx.writable.empty() && !within(workspace, ctx.writable)) {
     return fail("Workspace path is outside of the writable directories: " + ctx.workspace.string());
   }
-  // Preserve a workspace-root symlink installed by a workspace setup action.
+  // Resolve the workspace root so a symlink installed there by a workspace setup action is followed
+  // (checkout writes into its destination) rather than rejected by the symlinked-ancestor check below.
   const fs::path target = rel.empty() ? workspace : (workspace / rel).lexically_normal();
   if (!within(target, {workspace})) {
     return fail("Repository path '" + target.string() + "' is not under '" + ctx.workspace.string() + "'");
