@@ -90,8 +90,9 @@ jobs:
     steps:
       - run: "true"
 )"), std::exception);
-    if (std::string(name) == "invalid-file")
+    if (std::string(name) == "invalid-file") {
       IUTEST_EXPECT_EQ("preserve", util::read_file(test.options.artifact_dir));
+    }
   }
 }
 
