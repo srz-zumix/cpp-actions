@@ -24,6 +24,7 @@ struct SandboxConfig {
   std::vector<fs::path> write;
   std::vector<std::string> allow_hosts;  // in addition to default_allowed_hosts()
   bool allow_localhost = false;
+  bool allow_xcode = false;  // Xcode temporary/cache grants for every invocation
   bool allow_xcode_simulator = false;
   bool allow_unity_hosts = false;
   int proxy_max_connections = kDefaultProxyConnections;

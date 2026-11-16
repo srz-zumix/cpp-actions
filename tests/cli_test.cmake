@@ -44,7 +44,7 @@ jobs:
     steps:
       - run: exit 7
 ]=])
-# Repository files must not grant permissions or be interpreted as user config.
+# Dry runs must not load configuration, even when the repository file is invalid.
 file(WRITE "${repo}/.cpp-actions.yml" "untrusted-key: ignored\n")
 file(WRITE "${repo}/config.yml" "untrusted-key: ignored\n")
 file(WRITE "${WORK}/config/cpp-actions/config.yml" [=[
@@ -76,6 +76,21 @@ endif()
 if(NOT cli_output MATCHES "CLI success")
   message(FATAL_ERROR "dry-run did not render the workflow")
 endif()
+check_cli(repository-dry-run 0 --dry-run --workflow success.yml)
+if(EXISTS "${WORK}/runs/repository-dry-run"
+    OR cli_error MATCHES "automatically loading repository configuration")
+  message(FATAL_ERROR "dry-run loaded repository configuration")
+endif()
+check_cli(repository-no-trigger 0 --event workflow_dispatch --workflow success.yml)
+if(EXISTS "${WORK}/runs/repository-dry-run" OR EXISTS "${WORK}/runs/repository-no-trigger"
+    OR cli_error MATCHES "automatically loading repository configuration")
+  message(FATAL_ERROR "preview or unmatched event loaded repository configuration")
+endif()
+check_cli(repository-invalid 2 --workflow success.yml)
+if(EXISTS "${WORK}/runs/repository-invalid" OR NOT cli_error MATCHES "\\.cpp-actions.yml")
+  message(FATAL_ERROR "invalid repository configuration was ignored")
+endif()
+file(REMOVE "${repo}/.cpp-actions.yml")
 
 file(WRITE "${repo}/.github/workflows/artifacts.yml" [=[
 on: push
@@ -724,6 +739,41 @@ jobs:
         if(contents MATCHES "${WORK}/home/Library/Developer/DeveloperDiskImages")
           message(FATAL_ERROR "Xcode permission used overridden HOME rather than OS user home")
         endif()
+      endif()
+    endforeach()
+  endforeach()
+  file(WRITE "${WORK}/xcode-tools-enabled.yml" "allow-xcode: true\n")
+  file(WRITE "${WORK}/xcode-tools-disabled.yml" "allow-xcode: false\n")
+  foreach(mode IN ITEMS default disabled cli config cli-overrides-false)
+    set(xcode_tool_args --config "${WORK}/xcode-tools-disabled.yml")
+    if(mode STREQUAL "default")
+      set(xcode_tool_args)
+    elseif(mode STREQUAL "cli" OR mode STREQUAL "cli-overrides-false")
+      if(mode STREQUAL "cli")
+        set(xcode_tool_args)
+      endif()
+      list(APPEND xcode_tool_args --allow-xcode)
+    elseif(mode STREQUAL "config")
+      set(xcode_tool_args --config "${WORK}/xcode-tools-enabled.yml")
+    endif()
+    check_cli("xcode-tools-${mode}" 0 --workflow xcode-simulator.yml --host-label cli-local
+      --keep-workdir ${xcode_tool_args})
+    file(GLOB xcode_profiles "${WORK}/runs/xcode-tools-${mode}/control/*/*/sandbox.sb")
+    list(LENGTH xcode_profiles profile_count)
+    if(NOT profile_count EQUAL 2)
+      message(FATAL_ERROR "Xcode option did not produce both job profiles")
+    endif()
+    foreach(profile IN LISTS xcode_profiles)
+      file(READ "${profile}" contents)
+      if(mode STREQUAL "default" OR mode STREQUAL "disabled")
+        if(contents MATCHES "ModuleCache" OR contents MATCHES "swbuild"
+            OR cli_output MATCHES "compiler-cache access enabled")
+          message(FATAL_ERROR "Xcode tool permission enabled without an opt-in: ${mode}")
+        endif()
+      elseif(NOT contents MATCHES "ModuleCache\\[\\.\\]noindex" OR NOT contents MATCHES "SDKStatCaches"
+          OR NOT contents MATCHES "swbuild\\[\\.\\]tmp" OR contents MATCHES "com.apple.CoreSimulator"
+          OR NOT cli_output MATCHES "compiler-cache access enabled for all steps")
+        message(FATAL_ERROR "Xcode tool permission or warning missing: ${mode}")
       endif()
     endforeach()
   endforeach()

@@ -33,6 +33,7 @@ struct SandboxOptions {
   std::vector<fs::path> allow_read;
   std::vector<fs::path> allow_write;
   bool allow_localhost = false;
+  bool allow_xcode = false;
   bool allow_xcode_simulator = false;
   bool allow_unity_hosts = false;
   int proxy_max_connections = 0;  // 0 = default
@@ -43,8 +44,7 @@ struct SandboxOptions {
 };
 
 struct RunOptions {
-  std::shared_ptr<yaml::Document> setup_document;
-  std::vector<workflow::Step> setup_steps;
+  std::vector<config::SetupSteps> setup_steps;
   fs::path artifact_dir;  // artifact root; default: <run>/artifacts
   fs::path run_dir;    // default: <cache>/runs/<timestamp>-<random>
   fs::path cache_dir;  // shared caches; default: <user cache dir>/cpp-actions

@@ -115,7 +115,8 @@ files: use `--allow-read` separately. Avoid granting your entire home directory.
 putting secrets in shell history or process arguments. Secrets and variables are
 available through workflow expression contexts, not automatically as step
 environment variables. Dotenv files are read only when explicitly configured;
-repository `.env`, secrets, and configuration files are never auto-discovered.
+repository `.env` and secrets files are never auto-discovered; `.cpp-actions.yml`
+is loaded as described under user configuration below.
 Later files override earlier files, and command-line values override files.
 An explicitly supplied `GITHUB_TOKEN` secret also authenticates GitHub action
 resolution; the host's token is never imported automatically.
@@ -197,15 +198,40 @@ and it does not resume an already stopped process.
 
 ### User configuration
 
-Only `$XDG_CONFIG_HOME/cpp-actions/config.yml`, or
-`~/.config/cpp-actions/config.yml` when XDG is unset, is loaded automatically.
-An automatic configuration resolving inside the selected repository is refused.
-`--config /trusted/path/config.yml` explicitly selects a different file, including
-a repository file only when you deliberately trust it. Dry runs do not load it.
+By default, `run` loads `$XDG_CONFIG_HOME/cpp-actions/config.yml`, or
+`~/.config/cpp-actions/config.yml` when XDG is unset, followed by
+`.cpp-actions.yml` at the selected repository root. The root comes from `-C` or
+the current directory, including when started from a subdirectory. Either file
+may be absent; an invalid existing file fails rather than falling back.
+
+Lists, including permission grants, `host-labels`, and `env-pass`, are appended
+in user-then-repository order. Later `env-pass` assignments override earlier
+assignments of the same variable. Repository scalar settings override user
+settings when supplied; omitted settings retain user values. Variable maps
+merge by key. Environments merge by case-insensitive name, including their
+variable maps and file settings. `secrets-file` and `vars-file` are scalar
+settings: only the final selected files are loaded, and merged inline `vars`
+override the selected variables file. An explicit empty file, `node`, or
+`cache-dir` value clears the earlier value. Setup steps from both files run in
+order; explicit setup step IDs must be unique across files.
+
+`--config /trusted/path/config.yml` loads only that file, skipping both
+automatic configurations. CLI grants add to it, and CLI scalar settings and
+values take precedence. Dry runs and runs with no matching workflow do not load
+configuration or secrets.
+
+**Trust the repository before running it.** Automatic `.cpp-actions.yml`
+loading emits a warning: it can execute setup steps, import host environment
+variables or dotenv files, and relax sandbox permissions. Review it as carefully
+as workflow changes. User configuration resolving inside the repository is
+refused; `.cpp-actions.yml` is the designated repository-local configuration.
+`clean` uses the same merge rules when looking up a cache by run name or
+`--all`; an explicit `--cache-dir` takes precedence without loading
+configuration.
 
 ```yaml
 allow-hosts:
-  - registry.npmjs.org
+  - registry.example.test
 allow-read:
   - ~/sdk
 env-pass:
@@ -220,9 +246,9 @@ Configuration paths are relative to the configuration file; CLI paths are
 relative to your current directory. Leading `~` is expanded. CLI grants add to
 configuration grants; CLI scalar settings and supplied values take precedence.
 The configuration also supports `host-labels`, `cache-dir`, `node`, `vars-file`,
-and environment-specific `environments` mappings with `secrets-file`,
-`vars-file`, and `vars`. Advanced `allow-write` and `allow-localhost` settings
-relax isolation and should be used sparingly.
+`allow-xcode`, and environment-specific `environments` mappings with
+`secrets-file`, `vars-file`, and `vars`. Advanced `allow-write` and
+`allow-localhost` settings relax isolation and should be used sparingly.
 `--node /absolute/path/to/node` overrides the configured `node` executable.
 `--allow-write` and `--allow-localhost` provide explicit CLI grants for the
 corresponding advanced settings.
@@ -412,6 +438,31 @@ pre, main, and post processes. Nested `uses:` actions must be selected
 separately. Top-level workflow `run:` steps and emulated built-in actions do
 not receive it. CLI and configuration lists are combined; workflow variables
 and `GITHUB_ENV` cannot enable the permission. Activation is logged.
+
+Workflows that run `xcodebuild` or `cmake -G Xcode` directly in top-level
+`run:` steps can instead grant the same permissions to every step of every job:
+
+```sh
+cpp-actions run -w apple.yml --allow-xcode
+```
+
+```yaml
+allow-xcode: true
+```
+
+The grant is disabled by default. The CLI flag adds the grant even when the
+configuration sets it to `false`; workflow files, environment variables, and
+`GITHUB_ENV` cannot enable it. Each job logs a warning when enabled.
+
+Both forms also grant the compiler caches that Xcode keeps in the macOS user
+cache directory (`getconf DARWIN_USER_CACHE_DIR`), which build settings cannot
+redirect into the job: `org.llvm.clang/ModuleCache.noindex` (the clang module
+cache and its validation session file) and
+`com.apple.DeveloperTools/<version>/Xcode/SDKStatCaches.noindex`. Only the
+missing parent directories of these caches may be created. **These caches are
+shared with host Xcode builds**: a granted process can modify module and SDK
+stat caches that later host builds consume, so enable the grant only for
+trusted workflows.
 
 The profile grants access to `TemporaryItems/NSIRD_xcodebuild_*`,
 `TemporaryItems/NSIRD_SWBBuildService_*`, `TemporaryItems/NSIRD_ibtool_*`,

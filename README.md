@@ -163,11 +163,14 @@ arguments or shell history. An explicitly supplied `GITHUB_TOKEN` secret
 authenticates action resolution; `--github-token` (alias `--token`) takes
 precedence. The host token is never automatically imported.
 
-### Trusted user configuration
+### Trusted configuration
 
-For repeated runs, place configuration at
-`$XDG_CONFIG_HOME/cpp-actions/config.yml`, or
-`~/.config/cpp-actions/config.yml` when XDG is unset:
+By default, `run` loads the user configuration at
+`$XDG_CONFIG_HOME/cpp-actions/config.yml` (or `~/.config/cpp-actions/config.yml`
+when XDG is unset), followed by `.cpp-actions.yml` at the selected repository
+root. Repository configuration can execute setup steps and relax sandbox
+permissions, so review and trust it before running. `--config /trusted/path/config.yml`
+loads only that file. Dry runs do not load execution configuration.
 
 ```yaml
 allow-hosts:
@@ -182,13 +185,10 @@ vars:
   BUILD_MODE: debug
 ```
 
-Configuration paths are relative to the configuration file; CLI paths are
+Configuration paths are relative to their configuration file; CLI paths are
 relative to the current directory. Leading `~` is expanded. CLI grants add to
 configuration grants; CLI scalar settings and supplied values take precedence.
-Repository `.env`, secrets, and configuration files are never auto-discovered.
-Automatic configuration resolving inside the repository is refused.
-`--config /trusted/path/config.yml` selects a file you deliberately trust.
-Dry runs do not load execution configuration.
+Repository `.env` and secrets files are never auto-discovered.
 
 See the [configuration reference](docs/reference.md#user-configuration) for
 environment-specific secrets/vars, setup steps, and additional settings.

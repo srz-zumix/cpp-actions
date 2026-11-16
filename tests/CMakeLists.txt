@@ -66,6 +66,12 @@ add_test(NAME cli_actions COMMAND ${CMAKE_COMMAND}
   -DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/cli-actions
   -P ${CMAKE_CURRENT_SOURCE_DIR}/cli/run.cmake)
 set_tests_properties(cli_actions PROPERTIES TIMEOUT 120)
+add_test(NAME cli_config COMMAND ${CMAKE_COMMAND}
+  -DCLI=$<TARGET_FILE:cpp-actions>
+  -DWORK=${CMAKE_CURRENT_BINARY_DIR}/cli-config
+  -DHOST_IS_APPLE=${APPLE}
+  -P ${CMAKE_CURRENT_SOURCE_DIR}/cli/config.cmake)
+set_tests_properties(cli_config PROPERTIES TIMEOUT 120)
 
 find_program(CPA_BASH bash)
 if(CPA_BASH)
