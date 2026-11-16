@@ -92,6 +92,8 @@ IUTEST(SandboxProfileTest, XcodeTemporaryFilesRequireExplicitOptIn) {
   sandbox::ProfileOptions options;
   IUTEST_EXPECT_EQ(std::string::npos, sandbox::generate_profile(options).find("; Opt-in Xcode temporary files"));
   IUTEST_EXPECT_EQ(std::string::npos, sandbox::generate_profile(options).find("XcodeDistPipeline"));
+  IUTEST_EXPECT_EQ(std::string::npos, sandbox::generate_profile(options).find("ModuleCache"));
+  IUTEST_EXPECT_EQ(std::string::npos, sandbox::generate_profile(options).find("SDKStatCaches"));
   options.allow_xcode = true;
 #if defined(__APPLE__)
   const auto profile = sandbox::generate_profile(options);
@@ -128,6 +130,9 @@ IUTEST(SandboxProfileTest, XcodeTemporaryFilesRequireExplicitOptIn) {
   IUTEST_EXPECT_EQ(std::string::npos, section.find("AssetCatalogSimulatorAgent"));
   IUTEST_EXPECT_EQ(std::string::npos, section.find("CoreSimulator[.]SimDevice[.]"));
   IUTEST_EXPECT_EQ(std::string::npos, section.find("(subpath "));
+  IUTEST_EXPECT_NE(std::string::npos, section.find("clang/ModuleCache[.]noindex(/.*)?$"));
+  IUTEST_EXPECT_NE(std::string::npos, section.find("/Xcode/SDKStatCaches[.]noindex(/.*)?$"));
+  IUTEST_EXPECT_NE(std::string::npos, section.find("(vnode-type DIRECTORY)"));
   IUTEST_EXPECT_EQ(std::string::npos, profile.find("xcrun_db"));
   IUTEST_EXPECT_EQ(std::string::npos, profile.find("com.apple.CoreSimulator."));
   IUTEST_EXPECT_EQ(std::string::npos, profile.find("(global-name \"com.apple.SecurityServer\")"));
@@ -1645,6 +1650,53 @@ IUTEST(SandboxTest, XcodeAssetWorkersRejectSpoofedSigningIdentifiers) {
       }
       result = util::capture(wrap({fake.string(), "file-deny", worker.fresh.string()}, allow_xcode));
       IUTEST_EXPECT_EQ(0, result.exit_code) << worker.executable << ": " << result.out << result.err;
+    }
+  }
+}
+
+IUTEST(SandboxTest, XcodeCompilerCachesAreGrantedJobWideOrPerInvocation) {
+  namespace fs = std::filesystem;
+  cpa_test::TempDir dir;
+  const auto user_dirs = sandbox::darwin_user_dirs();
+  IUTEST_ASSERT_EQ(2u, user_dirs.size());
+  const auto cache = util::real_path(user_dirs[1]);
+  const auto tag = "cpa-test-" + util::random_uuid();
+  const auto module_cache = cache / "org.llvm.clang/ModuleCache.noindex";
+  const auto tools = cache / "com.apple.DeveloperTools" / tag;
+  const auto stat_cache = tools / "Xcode/SDKStatCaches.noindex";
+  ScopedHostPaths cleanup;
+  fs::create_directories(module_cache);
+  fs::create_directories(stat_cache);
+  cleanup.paths.push_back(tools);
+  const auto unrelated_tools = cache / "com.apple.DeveloperTools" / (tag + "-other");
+  const auto new_tools = cache / "com.apple.DeveloperTools" / (tag + "-new");
+  cleanup.paths.push_back(new_tools);
+  for (const bool job_wide : {false, true}) {
+    sandbox::SandboxConfig config;
+    config.profile_file = dir / (job_wide ? "job.sb" : "base.sb");
+    config.allow_xcode = job_wide;
+    sandbox::Sandbox box(config, {});
+    for (const bool invocation : {false, true}) {
+      const bool allowed = job_wide || invocation;
+      const auto probe = [&](const std::string& mode, const fs::path& path) {
+        return util::capture(box.wrap({CPA_MSBUILD_SOCKET_PROBE, mode, path.string()}, {}, false, false, false, {}, {},
+                                      false, invocation));
+      };
+      const auto allow = allowed ? "file-allow" : "file-deny";
+      for (const auto& path : {module_cache / (tag + ".pcm"), stat_cache / (tag + ".sdkstatcache")}) {
+        const auto result = probe(allow, path);
+        IUTEST_EXPECT_EQ(0, result.exit_code) << path.string() << ": " << result.out << result.err;
+      }
+      for (const auto& path : {cache / tag, cache / "org.llvm.clang" / tag, tools / tag, tools / "Xcode" / tag,
+                               unrelated_tools}) {
+        const auto result = probe("file-deny", path);
+        IUTEST_EXPECT_EQ(0, result.exit_code) << path.string() << ": " << result.out << result.err;
+      }
+      const auto created = util::capture(box.wrap({"/bin/mkdir", new_tools.string()}, {}, false, false, false, {}, {},
+                                                   false, invocation));
+      IUTEST_EXPECT_EQ(allowed, created.exit_code == 0) << created.out << created.err;
+      std::error_code ec;
+      fs::remove(new_tools, ec);
     }
   }
 }

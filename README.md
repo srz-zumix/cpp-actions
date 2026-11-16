@@ -119,7 +119,9 @@ files: use `--allow-read` separately. Avoid granting your entire home directory.
 putting secrets in shell history or process arguments. Secrets and variables are
 available through workflow expression contexts, not automatically as step
 environment variables. Dotenv files are read only when explicitly configured;
-repository `.env`, secrets, and configuration files are never auto-discovered.
+repository `.env` and secrets files are never auto-discovered. Configuration
+can explicitly select dotenv files; repository `.cpp-actions.yml` is loaded
+automatically as described below.
 Later files override earlier files, and command-line values override files.
 An explicitly supplied `GITHUB_TOKEN` secret also authenticates GitHub action
 resolution; the host's token is never imported automatically.
@@ -150,7 +152,7 @@ cpp-actions clean --all                                # every completed run und
 `clean` removes the recorded `cpa-w-XXXXXX` work directories and `cpa-u-XXXXXX`
 Unity temporary directories, then the run's `jobs`, `control`, and `snapshot`
 directories. Logs, `report.json`, `summary.md`, and artifacts are kept.
-`--cache-dir` (or `cache-dir` from the user or `--config` configuration) selects
+`--cache-dir` (or `cache-dir` from the user, repository, or `--config` configuration) selects
 `<cache>/runs`. Recorded paths are removed only if they are real directories
 owned by you directly beneath the temporary root with the expected name;
 otherwise the entry is reported, the job's metadata is preserved for a retry,
@@ -199,13 +201,43 @@ steps. Interactive-only initialization (such as `.bashrc` loading or checks of
 setup. It does not rewrite scripts or interactive shells launched inside them,
 and it does not resume an already stopped process.
 
-### User configuration
+### User and repository configuration
 
-Only `$XDG_CONFIG_HOME/cpp-actions/config.yml`, or
-`~/.config/cpp-actions/config.yml` when XDG is unset, is loaded automatically.
-An automatic configuration resolving inside the selected repository is refused.
-`--config /trusted/path/config.yml` explicitly selects a different file, including
-a repository file only when you deliberately trust it. Dry runs do not load it.
+By default, `run` loads `$XDG_CONFIG_HOME/cpp-actions/config.yml`, or
+`~/.config/cpp-actions/config.yml` when XDG is unset, followed by
+`.cpp-actions.yml` at the selected repository root. The repository root comes
+from `-C` or the current directory, including when starting from a subdirectory.
+Either file may be absent. An invalid existing file fails rather than falling
+back to another configuration.
+
+Lists, including permission grants, `host-labels`, and `env-pass`, are appended
+in user-then-repository order. Later `env-pass` assignments override earlier
+assignments of the same variable. Scalar settings (including booleans) supplied
+by the repository override user settings; omitted settings retain user values.
+Variable maps merge by key. Environments merge by case-insensitive name, with
+their variable maps and file settings following the same precedence.
+`secrets-file` and `vars-file` are scalar settings: only the final selected
+files are loaded, and merged inline `vars` override the selected variables file.
+An explicit empty file, `node`, or `cache-dir` value clears the earlier value.
+Setup steps from both files run in order; explicit setup step IDs must be unique
+across files.
+
+`--config /trusted/path/config.yml` loads **only** that file, skipping both
+automatic configurations. CLI grants add to the resulting configuration and
+CLI scalar settings and values take precedence. `run --dry-run` and runs with
+no matching workflow do not load configuration or secrets.
+
+**Trust the repository before running it.** Automatic `.cpp-actions.yml`
+loading emits a warning: the file can execute setup steps, import host
+environment variables or dotenv files, and relax sandbox permissions.
+Review changes to it just as carefully as workflow changes. The automatic
+user configuration still cannot resolve inside the selected repository;
+`.cpp-actions.yml` is the designated repository-local configuration.
+
+`clean` uses the same merge rules when looking up a cache by run name or
+`--all`, with the repository determined from its current directory.
+An explicit `--cache-dir` takes precedence without loading configuration.
+Cleaning only explicit run-directory paths also does not load configuration.
 
 ```yaml
 allow-hosts:
@@ -237,7 +269,7 @@ from the network; outbound connections to other addresses remain denied.
 
 ### cpp-actions-only setup steps
 
-Trusted user configuration can define `setup-steps`. These run once per executed
+Trusted user or repository configuration can define `setup-steps`. These run once per executed
 job (including each matrix job and jobs inside reusable workflows), before its
 workflow steps. They are not added to the GitHub workflow itself. Skipped jobs
 do not execute setup, and dry runs do not load configuration or execute setup.
@@ -417,6 +449,31 @@ separately. Top-level workflow `run:` steps and emulated built-in actions do
 not receive it. CLI and configuration lists are combined; workflow variables
 and `GITHUB_ENV` cannot enable the permission. Activation is logged.
 
+Workflows that run `xcodebuild` or `cmake -G Xcode` directly in top-level
+`run:` steps can instead grant the same permissions to every step of every job:
+
+```sh
+cpp-actions run -w apple.yml --allow-xcode
+```
+
+```yaml
+allow-xcode: true
+```
+
+It is disabled by default. The CLI flag adds the grant even if the
+configuration sets it to `false`; workflow files, environment variables, and
+`GITHUB_ENV` cannot enable it. Each job logs a warning when enabled.
+
+Both forms also grant the compiler caches that Xcode keeps in the macOS user
+cache directory (`getconf DARWIN_USER_CACHE_DIR`), which build settings cannot
+redirect into the job: `org.llvm.clang/ModuleCache.noindex` (the clang module
+cache and its validation session file) and
+`com.apple.DeveloperTools/<version>/Xcode/SDKStatCaches.noindex`. Only the
+missing parent directories of these caches may be created. **These caches are
+shared with host Xcode builds**: a granted process can modify module and SDK
+stat caches that later host builds consume, so enable the grant only for
+trusted workflows.
+
 The profile grants access to `TemporaryItems/NSIRD_xcodebuild_*`,
 `TemporaryItems/NSIRD_SWBBuildService_*`, `TemporaryItems/NSIRD_ibtool_*`,
 `swbuild.tmp.*`, and direct `<UUID>.storyboard` entries beneath the canonical
@@ -465,11 +522,12 @@ host processes or jobs. If the OS or Xcode does not support these process
 checks or uses different signing identities, access fails rather than falling
 back to an unrestricted grant.
 
-This permission does not grant general host temporary-directory access,
-`xcrun_db` cache access, Simulator services, or Apple security services.
-Xcode may still log `xcrun` cache errors, and signed or Simulator builds may
-need separate permissions. `--allow-xcode-simulator` remains a separate
-run-wide opt-in and does not, by itself, enable these temporary-file permissions.
+This permission does not grant general host temporary- or cache-directory
+access, `xcrun_db` cache access, Simulator services, or Apple security services.
+Xcode may still log harmless `xcrun` cache errors, and signed or Simulator
+builds may need separate permissions. `--allow-xcode-simulator` remains a
+separate run-wide opt-in and does not, by itself, enable these temporary-file
+permissions.
 
 ### Opt-in Docker CLI access
 

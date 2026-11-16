@@ -1,6 +1,7 @@
 #include "config/config.hpp"
 
 #include <cstdlib>
+#include <set>
 
 #include "sandbox/proxy.hpp"
 #include "util/fs.hpp"
@@ -194,11 +195,11 @@ Config load_config(const fs::path& path) {
     const auto* v = e.value;
     if (key == "setup-steps") {
       try {
-        c.setup_steps = workflow::parse_setup_steps(*v, file);
+        auto steps = workflow::parse_setup_steps(*v, file);
+        if (!steps.empty()) c.setup_steps.push_back({doc, std::move(steps)});
       } catch (const workflow::WorkflowError& error) {
         throw ConfigError(error.what());
       }
-      c.setup_document = doc;
     } else if (key == "allow-hosts") {
       c.allow_hosts = node_strings(v, file, key);
     } else if (key == "allow-apple-security-for") {
@@ -226,6 +227,11 @@ Config load_config(const fs::path& path) {
         throw ConfigError(file + ":" + std::to_string(e.key->mark.line) + ": 'allow-localhost' must be a boolean");
       }
       c.allow_localhost = v->boolean;
+    } else if (key == "allow-xcode") {
+      if (v == nullptr || v->kind != yaml::NodeKind::Boolean) {
+        throw ConfigError(file + ":" + std::to_string(e.key->mark.line) + ": 'allow-xcode' must be a boolean");
+      }
+      c.allow_xcode = v->boolean;
     } else if (key == "allow-xcode-simulator") {
       if (v == nullptr || v->kind != yaml::NodeKind::Boolean) {
         throw ConfigError(file + ":" + std::to_string(e.key->mark.line) + ": 'allow-xcode-simulator' must be a boolean");
@@ -307,6 +313,113 @@ Config load_config(const fs::path& path) {
     }
   }
   return c;
+}
+
+std::vector<fs::path> configuration_paths(const fs::path& repo_root, const fs::path& explicit_path) {
+  if (!explicit_path.empty()) return {expand_user(explicit_path.string())};
+  std::vector<fs::path> paths;
+  const auto user_path = default_config_path();
+  if (fs::exists(fs::symlink_status(user_path))) {
+    if (util::is_subpath(util::real_path(user_path), util::real_path(repo_root))) {
+      throw ConfigError("automatic configuration is inside the repository; use --config to trust it explicitly");
+    }
+    paths.push_back(user_path);
+  }
+  const auto repo_path = repo_root / ".cpp-actions.yml";
+  if (fs::exists(fs::symlink_status(repo_path))) {
+    if (!fs::is_regular_file(repo_path)) {
+      throw ConfigError("repository configuration is not a regular file: " + repo_path.string());
+    }
+    paths.push_back(repo_path);
+  }
+  return paths;
+}
+
+Config load_configs(const std::vector<fs::path>& paths) {
+  Config merged;
+  const auto append = [](auto& target, const auto& source) {
+    target.insert(target.end(), source.begin(), source.end());
+  };
+  const auto override_value = [](auto& target, const auto& source) {
+    if (source) target = source;
+  };
+  const auto merge_values = [](auto& target, const auto& source) {
+    for (const auto& [key, value] : source) target[key] = value;
+  };
+  for (const auto& path : paths) {
+    auto config = load_config(path);
+    const auto directory = fs::absolute(path).parent_path();
+    const auto resolve = [&](const std::string& value) {
+      const auto expanded = expand_user(value);
+      return (expanded.is_absolute() ? expanded : directory / expanded).lexically_normal().string();
+    };
+    const auto resolve_optional = [&](std::optional<std::string>& value) {
+      if (value && !value->empty()) *value = resolve(*value);
+    };
+    for (auto& value : config.allow_read) value = resolve(value);
+    for (auto& value : config.allow_write) value = resolve(value);
+    resolve_optional(config.node);
+    resolve_optional(config.cache_dir);
+    resolve_optional(config.secrets_file);
+    resolve_optional(config.vars_file);
+    append(merged.setup_steps, config.setup_steps);
+    append(merged.allow_hosts, config.allow_hosts);
+    append(merged.allow_apple_security_for, config.allow_apple_security_for);
+    append(merged.allow_docker_for, config.allow_docker_for);
+    append(merged.allow_docker_step, config.allow_docker_step);
+    append(merged.allow_msbuild_for, config.allow_msbuild_for);
+    append(merged.allow_msbuild_step, config.allow_msbuild_step);
+    append(merged.allow_unity_for, config.allow_unity_for);
+    append(merged.allow_unity_step, config.allow_unity_step);
+    append(merged.allow_xcode_for, config.allow_xcode_for);
+    append(merged.allow_read, config.allow_read);
+    append(merged.allow_write, config.allow_write);
+    append(merged.pass_env, config.pass_env);
+    append(merged.host_labels, config.host_labels);
+    override_value(merged.allow_localhost, config.allow_localhost);
+    override_value(merged.allow_xcode, config.allow_xcode);
+    override_value(merged.allow_xcode_simulator, config.allow_xcode_simulator);
+    override_value(merged.allow_unity_hosts, config.allow_unity_hosts);
+    override_value(merged.ignore_interactive_shell, config.ignore_interactive_shell);
+    override_value(merged.inherit_unity_editor_prefs, config.inherit_unity_editor_prefs);
+    override_value(merged.proxy_max_connections, config.proxy_max_connections);
+    override_value(merged.parallel, config.parallel);
+    override_value(merged.node, config.node);
+    override_value(merged.cache_dir, config.cache_dir);
+    override_value(merged.secrets_file, config.secrets_file);
+    override_value(merged.vars_file, config.vars_file);
+    merge_values(merged.vars, config.vars);
+    for (auto& [name, environment] : config.environments) {
+      resolve_optional(environment.secrets_file);
+      resolve_optional(environment.vars_file);
+      auto& target = merged.environments[util::to_lower(name)];
+      override_value(target.secrets_file, environment.secrets_file);
+      override_value(target.vars_file, environment.vars_file);
+      merge_values(target.vars, environment.vars);
+    }
+  }
+  std::set<std::string> ids;
+  for (const auto& group : merged.setup_steps) {
+    for (const auto& step : group.steps) {
+      if (step.explicit_id && !ids.insert(step.id).second) {
+        throw ConfigError(workflow::Diagnostic{group.document->file, step.node->mark,
+                                              "Duplicate setup step id '" + step.id + "' across configuration files"}
+                              .to_string());
+      }
+    }
+  }
+  int index = 0;
+  for (auto& group : merged.setup_steps) {
+    for (auto& step : group.steps) {
+      step.index = index++;
+      if (step.explicit_id) continue;
+      std::string id = "__run";
+      for (int n = 2; ids.count(id) != 0; ++n) id = "__run_" + std::to_string(n);
+      ids.insert(id);
+      step.id = std::move(id);
+    }
+  }
+  return merged;
 }
 
 }  // namespace cpa::config

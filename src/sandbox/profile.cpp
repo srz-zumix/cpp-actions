@@ -108,32 +108,47 @@ std::string guid_regex() {
   return guid;
 }
 
-fs::path xcode_temp_directory() {
+fs::path xcode_user_directory([[maybe_unused]] int name, const std::string& label) {
 #if defined(__APPLE__)
   char buffer[PATH_MAX];
   errno = 0;
-  const auto length = ::confstr(_CS_DARWIN_USER_TEMP_DIR, buffer, sizeof(buffer));
+  const auto length = ::confstr(name, buffer, sizeof(buffer));
   if (length == 0) {
-    throw std::system_error(errno != 0 ? errno : ENOENT, std::generic_category(),
-                            "Resolving macOS Xcode temporary directory");
+    throw std::system_error(errno != 0 ? errno : ENOENT, std::generic_category(), "Resolving macOS Xcode " + label);
   }
-  if (length > sizeof(buffer)) throw std::runtime_error("macOS Xcode temporary directory path is too long");
-  const fs::path temp(buffer);
-  if (!temp.is_absolute() || temp == temp.root_path()) {
-    throw std::runtime_error("macOS Xcode temporary directory must be an absolute path below the filesystem root");
+  if (length > sizeof(buffer)) throw std::runtime_error("macOS Xcode " + label + " path is too long");
+  const fs::path dir(buffer);
+  if (!dir.is_absolute() || dir == dir.root_path()) {
+    throw std::runtime_error("macOS Xcode " + label + " must be an absolute path below the filesystem root");
   }
   std::error_code ec;
-  const auto canonical = fs::canonical(temp, ec);
-  if (ec) throw std::system_error(ec, "Resolving macOS Xcode temporary directory");
+  const auto canonical = fs::canonical(dir, ec);
+  if (ec) throw std::system_error(ec, "Resolving macOS Xcode " + label);
   if (canonical == canonical.root_path()) {
-    throw std::runtime_error("macOS Xcode temporary directory must not be the filesystem root");
+    throw std::runtime_error("macOS Xcode " + label + " must not be the filesystem root");
   }
   const auto status = fs::status(canonical, ec);
-  if (ec) throw std::system_error(ec, "Inspecting macOS Xcode temporary directory");
-  if (!fs::is_directory(status)) throw std::runtime_error("macOS Xcode temporary directory is not a directory");
+  if (ec) throw std::system_error(ec, "Inspecting macOS Xcode " + label);
+  if (!fs::is_directory(status)) throw std::runtime_error("macOS Xcode " + label + " is not a directory");
   return canonical;
 #else
-  throw std::runtime_error("macOS Xcode temporary directory is unavailable on this platform");
+  throw std::runtime_error("macOS Xcode " + label + " is unavailable on this platform");
+#endif
+}
+
+fs::path xcode_temp_directory() {
+#if defined(__APPLE__)
+  return xcode_user_directory(_CS_DARWIN_USER_TEMP_DIR, "temporary directory");
+#else
+  return xcode_user_directory(0, "temporary directory");
+#endif
+}
+
+fs::path xcode_cache_directory() {
+#if defined(__APPLE__)
+  return xcode_user_directory(_CS_DARWIN_USER_CACHE_DIR, "cache directory");
+#else
+  return xcode_user_directory(0, "cache directory");
 #endif
 }
 
@@ -147,6 +162,20 @@ std::string xcode_rules(bool allow_xcode_simulator) {
   const auto simulator_regex =
       temp_regex + "/com[.]apple[.]CoreSimulator[.]SimDevice[.]" + guid + "[.]Standalone[.]" + guid;
   std::string out = "\n; Opt-in Xcode temporary files (shared with host Xcode processes)\n";
+  // Xcode keeps the clang module validation session and SDK stat caches in the user cache
+  // directory; build settings cannot redirect both into the job.
+  const auto cache = xcode_cache_directory();
+  const auto clang_cache = cache / "org.llvm.clang";
+  const auto developer_tools_regex = "^" + regex_literal((cache / "com.apple.DeveloperTools").string());
+  out += "(allow file-read* file-write* (regex " +
+         sbpl_quote("^" + regex_literal(clang_cache.string()) + "/ModuleCache[.]noindex(/.*)?$") + "))\n";
+  out += "(allow file-read* (literal " + sbpl_quote(clang_cache.string()) + ") (regex " +
+         sbpl_quote(developer_tools_regex + "(/[^/]+(/Xcode)?)?$") + "))\n";
+  out += "(allow file-write-create\n  (require-all\n    (vnode-type DIRECTORY)\n    (require-any\n      (literal " +
+         sbpl_quote(clang_cache.string()) + ")\n      (regex " +
+         sbpl_quote(developer_tools_regex + "(/[^/]+(/Xcode)?)?$") + "))))\n";
+  out += "(allow file-read* file-write* (regex " +
+         sbpl_quote(developer_tools_regex + "/[^/]+/Xcode/SDKStatCaches[.]noindex(/.*)?$") + "))\n";
   out += "(allow file-read* file-write-create (literal " + sbpl_quote(temporary_items.string()) + "))\n";
   out += "(allow file-read* file-write* (regex " +
          sbpl_quote("^" + regex_literal(temporary_items.string()) +

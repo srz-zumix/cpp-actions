@@ -21,16 +21,18 @@ class ConfigError : public std::runtime_error {
 };
 
 struct EnvironmentConfig {
-  std::string secrets_file;
-  std::string vars_file;
+  std::optional<std::string> secrets_file;
+  std::optional<std::string> vars_file;
   std::map<std::string, std::string> vars;
 };
 
-// User configuration (~/.config/cpp-actions/config.yml). It is never read from
-// the repository unless given explicitly, because it relaxes the sandbox.
+struct SetupSteps {
+  std::shared_ptr<yaml::Document> document;
+  std::vector<workflow::Step> steps;
+};
+
 struct Config {
-  std::shared_ptr<yaml::Document> setup_document;
-  std::vector<workflow::Step> setup_steps;
+  std::vector<SetupSteps> setup_steps;
   std::vector<std::string> allow_hosts;
   std::vector<std::string> allow_apple_security_for;
   std::vector<std::string> allow_docker_for;
@@ -43,6 +45,7 @@ struct Config {
   std::vector<std::string> allow_read;
   std::vector<std::string> allow_write;
   std::optional<bool> allow_localhost;
+  std::optional<bool> allow_xcode;
   std::optional<bool> allow_xcode_simulator;
   std::optional<bool> allow_unity_hosts;
   std::optional<bool> ignore_interactive_shell;
@@ -51,10 +54,10 @@ struct Config {
   std::vector<std::string> pass_env;
   std::vector<std::string> host_labels;
   std::optional<int> parallel;
-  std::string node;
-  std::string cache_dir;
-  std::string secrets_file;
-  std::string vars_file;
+  std::optional<std::string> node;
+  std::optional<std::string> cache_dir;
+  std::optional<std::string> secrets_file;
+  std::optional<std::string> vars_file;
   std::map<std::string, std::string> vars;
   std::map<std::string, EnvironmentConfig> environments;
 };
@@ -62,6 +65,9 @@ struct Config {
 // $XDG_CONFIG_HOME/cpp-actions/config.yml or ~/.config/cpp-actions/config.yml.
 fs::path default_config_path();
 Config load_config(const fs::path& path);
+std::vector<fs::path> configuration_paths(const fs::path& repo_root, const fs::path& explicit_path = {});
+// Resolves paths against their source files, then merges in order.
+Config load_configs(const std::vector<fs::path>& paths);
 
 // Parses KEY=VALUE lines (dotenv): comments, `export` prefixes, single and
 // double quotes (double quotes support \n, \t, \" and \\ and may span lines).
