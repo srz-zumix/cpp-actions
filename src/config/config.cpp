@@ -344,7 +344,14 @@ Config load_configs(const std::vector<fs::path>& paths) {
     if (source) target = source;
   };
   const auto merge_values = [](auto& target, const auto& source) {
-    for (const auto& [key, value] : source) target[key] = value;
+    for (const auto& [key, value] : source) {
+      // Variable names are case-insensitive in expressions; drop earlier
+      // spellings so the later file keeps precedence.
+      for (auto it = target.begin(); it != target.end();) {
+        it = util::iequals(it->first, key) ? target.erase(it) : std::next(it);
+      }
+      target[key] = value;
+    }
   };
   for (const auto& path : paths) {
     auto config = load_config(path);
@@ -401,7 +408,7 @@ Config load_configs(const std::vector<fs::path>& paths) {
   std::set<std::string> ids;
   for (const auto& group : merged.setup_steps) {
     for (const auto& step : group.steps) {
-      if (step.explicit_id && !ids.insert(step.id).second) {
+      if (step.explicit_id && !ids.insert(util::to_lower(step.id)).second) {
         throw ConfigError(workflow::Diagnostic{group.document->file, step.node->mark,
                                               "Duplicate setup step id '" + step.id + "' across configuration files"}
                               .to_string());
