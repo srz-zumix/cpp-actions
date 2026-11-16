@@ -169,24 +169,22 @@ class SignalHandlers {
   struct sigaction old_term_ {};
 };
 
+config::Config load_configuration(const fs::path& root, const std::string& explicit_path) {
+  const auto paths = config::configuration_paths(root, explicit_path);
+  auto cfg = config::load_configs(paths);
+  if (explicit_path.empty() &&
+      std::find(paths.begin(), paths.end(), root / ".cpp-actions.yml") != paths.end()) {
+    std::cerr << "WARNING: automatically loading repository configuration: "
+              << (root / ".cpp-actions.yml").string()
+              << "; trust this file before running (it can execute setup steps and relax sandbox permissions)\n";
+  }
+  return cfg;
+}
+
 engine::RunOptions run_options(const RunCli& o, const fs::path& root) {
   auto options = o.options;
-  const bool explicit_config = !o.config_path.empty();
-  const auto config_path = explicit_config ? config::expand_user(o.config_path) : config::default_config_path();
-  config::Config cfg;
-  if (explicit_config || fs::exists(config_path)) {
-    if (!explicit_config && util::is_subpath(util::real_path(config_path), root)) {
-      throw std::runtime_error("automatic configuration is inside the repository; use --config to trust it explicitly");
-    }
-    cfg = config::load_config(config_path);
-  }
-  const auto config_dir = fs::absolute(config_path).parent_path();
-  auto config_file = [&](std::string_view value) {
-    auto path = config::expand_user(value);
-    return (path.is_absolute() ? path : config_dir / path).lexically_normal();
-  };
+  const auto cfg = load_configuration(root, o.config_path);
   options.sandbox.enabled = !o.no_sandbox;
-  options.setup_document = cfg.setup_document;
   options.setup_steps = cfg.setup_steps;
   options.sandbox.allow_hosts.insert(options.sandbox.allow_hosts.begin(), cfg.allow_hosts.begin(),
                                      cfg.allow_hosts.end());
@@ -197,7 +195,7 @@ engine::RunOptions run_options(const RunCli& o, const fs::path& root) {
                                           cfg.allow_docker_for.begin(), cfg.allow_docker_for.end());
   options.sandbox.allow_docker_step.insert(options.sandbox.allow_docker_step.begin(),
                                            cfg.allow_docker_step.begin(), cfg.allow_docker_step.end());
-  for (const auto& path : cfg.allow_read) options.sandbox.allow_read.push_back(config_file(path));
+  for (const auto& path : cfg.allow_read) options.sandbox.allow_read.emplace_back(path);
   options.sandbox.allow_msbuild_for.insert(options.sandbox.allow_msbuild_for.begin(),
                                            cfg.allow_msbuild_for.begin(), cfg.allow_msbuild_for.end());
   options.sandbox.allow_msbuild_step.insert(options.sandbox.allow_msbuild_step.begin(),
@@ -210,8 +208,9 @@ engine::RunOptions run_options(const RunCli& o, const fs::path& root) {
                                          cfg.allow_xcode_for.begin(), cfg.allow_xcode_for.end());
   for (const auto& path : o.allow_read) options.sandbox.allow_read.push_back(config::expand_user(path));
   for (auto& path : options.sandbox.allow_write) path = config::expand_user(path.string());
-  for (const auto& path : cfg.allow_write) options.sandbox.allow_write.push_back(config_file(path));
+  for (const auto& path : cfg.allow_write) options.sandbox.allow_write.emplace_back(path);
   options.sandbox.allow_localhost = options.sandbox.allow_localhost || cfg.allow_localhost.value_or(false);
+  options.sandbox.allow_xcode = options.sandbox.allow_xcode || cfg.allow_xcode.value_or(false);
   options.sandbox.allow_xcode_simulator =
       options.sandbox.allow_xcode_simulator || cfg.allow_xcode_simulator.value_or(false);
   options.sandbox.allow_unity_hosts = options.sandbox.allow_unity_hosts || cfg.allow_unity_hosts.value_or(false);
@@ -223,24 +222,19 @@ engine::RunOptions run_options(const RunCli& o, const fs::path& root) {
   options.parallel = o.parallel >= 0 ? o.parallel : cfg.parallel.value_or(0);
   options.sandbox.proxy_max_connections =
       o.proxy_max_connections > 0 ? o.proxy_max_connections : cfg.proxy_max_connections.value_or(0);
-  if (options.cache_dir.empty() && !cfg.cache_dir.empty()) options.cache_dir = config_file(cfg.cache_dir);
+  if (options.cache_dir.empty() && cfg.cache_dir) options.cache_dir = *cfg.cache_dir;
   if (!options.cache_dir.empty()) options.cache_dir = config::expand_user(options.cache_dir.string());
   if (!options.run_dir.empty()) options.run_dir = config::expand_user(options.run_dir.string());
   if (!options.artifact_dir.empty()) options.artifact_dir = config::expand_user(options.artifact_dir.string());
-  if (options.node.empty() && !cfg.node.empty()) options.node = config_file(cfg.node);
+  if (options.node.empty() && cfg.node) options.node = *cfg.node;
   if (!options.node.empty()) options.node = config::expand_user(options.node.string());
   options.with_needs = !o.no_needs;
   options.matrix = parse_assignments(o.matrix, "--matrix");
   options.environments = cfg.environments;
-  for (auto& [name, env] : options.environments) {
-    (void)name;
-    if (!env.secrets_file.empty()) env.secrets_file = config_file(env.secrets_file).string();
-    if (!env.vars_file.empty()) env.vars_file = config_file(env.vars_file).string();
-  }
   auto load_values = [](auto& values, const fs::path& path) {
     for (const auto& [key, value] : config::load_dotenv(path)) values[key] = value;
   };
-  if (!cfg.secrets_file.empty()) load_values(options.secrets, config_file(cfg.secrets_file));
+  if (cfg.secrets_file && !cfg.secrets_file->empty()) load_values(options.secrets, *cfg.secrets_file);
   for (const auto& path : o.secret_files) load_values(options.secrets, config::expand_user(path));
   for (const auto& item : o.secrets) {
     const auto [name, value] = config::split_assignment(item);
@@ -257,7 +251,7 @@ engine::RunOptions run_options(const RunCli& o, const fs::path& root) {
       options.github_token.empty() && it != options.secrets.end()) {
     options.github_token = it->second;
   }
-  if (!cfg.vars_file.empty()) load_values(options.vars, config_file(cfg.vars_file));
+  if (cfg.vars_file && !cfg.vars_file->empty()) load_values(options.vars, *cfg.vars_file);
   for (const auto& [key, value] : cfg.vars) options.vars[key] = value;
   for (const auto& path : o.var_files) load_values(options.vars, config::expand_user(path));
   for (const auto& [key, value] : parse_assignments(o.vars, "--var")) options.vars[key] = value;
@@ -371,22 +365,9 @@ struct CleanCli {
 
 fs::path clean_cache_dir(const CleanCli& o) {
   if (!o.cache_dir.empty()) return config::expand_user(o.cache_dir);
-  const bool explicit_config = !o.config_path.empty();
-  const auto config_path = explicit_config ? config::expand_user(o.config_path) : config::default_config_path();
-  if (explicit_config || fs::exists(config_path)) {
-    if (!explicit_config) {
-      const auto cwd = util::real_path(fs::current_path());
-      const auto root = workspace::find_repo_root(cwd).value_or(cwd);
-      if (util::is_subpath(util::real_path(config_path), root)) {
-        throw std::runtime_error("automatic configuration is inside the repository; use --config to trust it explicitly");
-      }
-    }
-    const auto cfg = config::load_config(config_path);
-    if (!cfg.cache_dir.empty()) {
-      auto path = config::expand_user(cfg.cache_dir);
-      return (path.is_absolute() ? path : fs::absolute(config_path).parent_path() / path).lexically_normal();
-    }
-  }
+  const auto cwd = util::real_path(fs::current_path());
+  const auto cfg = load_configuration(workspace::find_repo_root(cwd).value_or(cwd), o.config_path);
+  if (cfg.cache_dir && !cfg.cache_dir->empty()) return *cfg.cache_dir;
   return engine::default_cache_dir();
 }
 
@@ -483,10 +464,12 @@ int main(int argc, char** argv) {
   run->add_option("--github-token,--token", run_opts.options.github_token, "Explicit GitHub API token");
   run->add_option("--allow-write", run_opts.options.sandbox.allow_write, "Additional sandbox writable path");
   run->add_flag("--allow-localhost", run_opts.options.sandbox.allow_localhost, "Allow loopback connections and listening on any port (listeners are not limited to loopback)");
+  run->add_flag("--allow-xcode", run_opts.options.sandbox.allow_xcode,
+                "Allow Xcode temporary files and compiler caches for all steps of all jobs (shared with host Xcode)");
   run->add_flag("--allow-xcode-simulator", run_opts.options.sandbox.allow_xcode_simulator,
                 "Allow Xcode/Simulator services for all jobs (permits host Simulator operations)");
   run->add_option("--config", run_opts.config_path,
-                  "Explicit trusted configuration file (never auto-load repository config)");
+                  "Use only this trusted configuration file instead of user and repository defaults");
   run->add_flag("--no-sandbox", run_opts.no_sandbox, "DANGER: disable filesystem and network isolation");
   run->add_option("--allow-host", run_opts.options.sandbox.allow_hosts, "Additional allowed network host (repeatable)");
   run->add_flag("--allow-unity-hosts", run_opts.options.sandbox.allow_unity_hosts,
@@ -539,7 +522,8 @@ int main(int argc, char** argv) {
   clean->add_option("run", clean_opts.runs, "Run directory path, or run name under <cache>/runs");
   clean->add_flag("-a,--all", clean_opts.all, "Clean every completed run under <cache>/runs");
   clean->add_option("--cache-dir", clean_opts.cache_dir, "Shared cache directory");
-  clean->add_option("--config", clean_opts.config_path, "Explicit trusted configuration file (for cache-dir)");
+  clean->add_option("--config", clean_opts.config_path,
+                    "Use only this trusted configuration file instead of user and repository defaults (for cache-dir)");
   clean->add_flag("-n,--dry-run", clean_opts.dry_run, "Show what would be removed without removing it");
   clean->add_flag("--force", clean_opts.force,
                   "Also clean runs without report.json (interrupted runs; never runs that are still in progress)");

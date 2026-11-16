@@ -48,6 +48,7 @@ ProfileOptions Sandbox::profile_options() const {
   options.write = config_.write;
   options.proxy_port = proxy_->port();
   options.allow_localhost = config_.allow_localhost;
+  options.allow_xcode = config_.allow_xcode;
   options.allow_xcode_simulator = config_.allow_xcode_simulator;
   options.unity_home = config_.unity_home;
   options.unity_tmp = config_.unity_tmp;
@@ -106,7 +107,7 @@ std::vector<std::string> Sandbox::wrap(const std::vector<std::string>& argv, con
       options.allow_apple_security = allow_apple_security;
       options.allow_msbuild = allow_msbuild;
       options.allow_unity = allow_unity;
-      options.allow_xcode = allow_xcode;
+      options.allow_xcode = options.allow_xcode || allow_xcode;
       options.docker_socket = docker_socket;
       options.read.insert(options.read.end(), extra_read.begin(), extra_read.end());
       options.scoped_read = scoped_read;

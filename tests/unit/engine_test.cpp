@@ -55,7 +55,6 @@ class EngineRun {
     const auto path = dir / "config.yml";
     util::write_file(path, text);
     const auto config = config::load_config(path);
-    options.setup_document = config.setup_document;
     options.setup_steps = config.setup_steps;
   }
 

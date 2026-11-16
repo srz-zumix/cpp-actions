@@ -439,14 +439,14 @@ void JobRunner::load_environment(const std::string& name) {
     return;
   }
   const auto& env = it->second;
-  if (!env.secrets_file.empty()) {
-    for (const auto& [k, v] : config::load_dotenv(config::expand_user(env.secrets_file))) {
+  if (env.secrets_file && !env.secrets_file->empty()) {
+    for (const auto& [k, v] : config::load_dotenv(config::expand_user(*env.secrets_file))) {
       secrets_.set(k, v);
       run_.masker.add(v);
     }
   }
-  if (!env.vars_file.empty()) {
-    for (const auto& [k, v] : config::load_dotenv(config::expand_user(env.vars_file))) vars_.set(k, v);
+  if (env.vars_file && !env.vars_file->empty()) {
+    for (const auto& [k, v] : config::load_dotenv(config::expand_user(*env.vars_file))) vars_.set(k, v);
   }
   for (const auto& [k, v] : env.vars) vars_.set(k, v);
   log_->info("Environment: " + name, Color::Gray);
@@ -607,6 +607,11 @@ void JobRunner::start_sandbox() {
                   util::join(sandbox::unity_allowed_hosts(), ", "));
   }
   config.allow_localhost = run_.options.sandbox.allow_localhost;
+  config.allow_xcode = run_.options.sandbox.allow_xcode;
+  if (config.allow_xcode) {
+    log_->warning("Xcode temporary-file and compiler-cache access enabled for all steps in this job; host Xcode "
+                  "temporary entries, clang module cache and SDK stat caches may be read and modified");
+  }
   config.allow_xcode_simulator = run_.options.sandbox.allow_xcode_simulator;
   if (config.allow_xcode_simulator) {
     log_->warning("Xcode/Simulator compatibility enabled for all steps in this job; processes can read the OS user's "
@@ -1745,10 +1750,12 @@ JobReport JobRunner::run() {
   if (!run_.options.setup_steps.empty()) {
     StepScope setup_scope;
     setup_scope.setup = true;
-    setup_scope.file = run_.options.setup_document ? run_.options.setup_document->file : "<setup-steps>";
     setup_scope.inputs = top_.inputs;
     setup_scope.prefix = "cpp-actions setup / ";
-    for (const auto& step : run_.options.setup_steps) run_step(setup_scope, step);
+    for (const auto& group : run_.options.setup_steps) {
+      setup_scope.file = group.document ? group.document->file : "<setup-steps>";
+      for (const auto& step : group.steps) run_step(setup_scope, step);
+    }
     setup_failed_ = setup_scope.status == "failure";
     if (setup_failed_) {
       status_ = "failure";
