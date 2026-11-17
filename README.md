@@ -52,6 +52,39 @@ or secrets, or creating run output.
 is supplied. `--matrix NAME=VALUE` filters matrix combinations.
 Use `run --help` for the complete option list.
 
+### iutest Apple workflow example
+
+The manually dispatched [iutest Apple example](.github/workflows/iutest-apple-example.yml)
+builds cpp-actions on a GitHub-hosted macOS runner and runs iutest's
+`.github/workflows/apple.yml` with a simulated `pull_request` event. Choose an
+iutest ref (default `develop`) and an individual job or `all`. The default is
+`ios-build`, which requires neither a reporting token nor shared `/tmp` access.
+The workflow uploads the cpp-actions report and logs, including on failure.
+
+The current iutest tests create stream-capture files directly under `/tmp`.
+Until iutest uses the job's `TMPDIR`, `xcode-build` and
+`macos-stdversion-test` need the `allow_shared_tmp` input enabled. This grants
+all selected jobs **read and write access to the entire host `/private/tmp`**,
+including other job workspaces and temporary files. Use it only with trusted
+code on a disposable GitHub-hosted runner; leave it disabled when iutest honors
+`TMPDIR`. The example also grants Xcode temporary-file access for Xcode jobs and
+Simulator access for `ios-build`, as described below. When `all` is selected,
+both grants apply to every job in the run.
+
+The `macos-stdversion-test` job, including when `all` is selected, runs a
+third-party action that publishes checks to iutest. Set the repository secret
+`IUTEST_REPORT_TOKEN` to a GitHub App installation token with `checks: write`
+for iutest. The token is available to all selected jobs and is also used to
+resolve and download remote actions. It must still be valid when the reporting
+steps run. These steps can create checks on the target repository; only use
+trusted refs and actions. The automatic token for this repository cannot publish
+checks to iutest. A missing token, a skipped job, or an error annotation fails
+the example rather than being reported as success.
+
+For this job, the example also exposes `python3` as `python` in the isolated
+job environment and requires its detection, so iutest does not silently omit
+Python-dependent compile-error tests.
+
 Execution is **sandboxed by default and supported only on macOS**, using
 `/usr/bin/sandbox-exec` (Seatbelt). A missing or unsupported sandbox fails closed;
 it never silently falls back to unsandboxed execution. macOS runner labels are
