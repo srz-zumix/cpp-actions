@@ -538,8 +538,10 @@ checks or uses different signing identities, access fails rather than falling
 back to an unrestricted grant.
 
 This permission does not grant general host temporary-directory access,
-`xcrun_db` cache access, Simulator services, or Apple security services.
-Xcode may still log `xcrun` cache errors, and signed or Simulator builds may
+host `xcrun_db` cache access, Simulator services, or Apple security services.
+Instead, sandboxed jobs on macOS always set `xcrun_db` to a job-private
+`$TMPDIR/xcrun_db`, so `xcrun` caches lookups without sharing the host cache
+with unsandboxed processes. Signed or Simulator builds may
 need separate permissions. `--allow-xcode-simulator` remains a separate
 run-wide opt-in and does not, by itself, enable these temporary-file permissions.
 

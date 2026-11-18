@@ -1762,6 +1762,24 @@ jobs:
     IUTEST_EXPECT_EQ("success", report.result) << test.output.str();
   }
 }
+
+IUTEST(EngineTest, SandboxedXcrunCachesInTheJobTemporaryDirectory) {
+  EngineRun test;
+  test.options.sandbox.enabled = true;
+  const auto report = test.run(R"yaml(
+on: push
+jobs:
+  test:
+    runs-on: test-host
+    steps:
+      - run: |
+          test "$xcrun_db" = "$TMPDIR/xcrun_db"
+          xcrun -f clang 2> err.txt
+          if grep -q "couldn't create cache file" err.txt; then cat err.txt; exit 1; fi
+          test -s "$TMPDIR/xcrun_db"
+)yaml");
+  IUTEST_EXPECT_EQ("success", report.result) << test.output.str();
+}
 #endif
 
 IUTEST(EngineTest, ShortWorkDirectoriesArePrivateUniqueAndCleanedOrRetained) {
