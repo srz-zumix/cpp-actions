@@ -48,7 +48,7 @@ jobs:
       - name: Run iutest Apple workflow
         env:
           IUTEST_JOB: ${{ inputs.job }}
-          IUTEST_REPORT_TOKEN: ${{ secrets.IUTEST_REPORT_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
           case "$IUTEST_JOB" in
@@ -66,17 +66,10 @@ jobs:
             --workflow apple.yml --event pull_request --changes-base HEAD
             --config "$config" --parallel 1 --no-color
             --cache-dir "$RUNNER_TEMP/cpp-actions-iutest-cache"
-            --run-dir "$RUNNER_TEMP/cpp-actions-iutest-apple")
+            --run-dir "$RUNNER_TEMP/cpp-actions-iutest-apple"
+            --github-token "$GITHUB_TOKEN")
           if [[ "$IUTEST_JOB" != all ]]; then
             args+=(--job "$IUTEST_JOB")
-          fi
-          if [[ "$IUTEST_JOB" == all || "$IUTEST_JOB" == macos-stdversion-test ]]; then
-            if [[ -z "$IUTEST_REPORT_TOKEN" ]]; then
-              echo "::error::Set the IUTEST_REPORT_TOKEN secret to a GitHub App token with checks:write on iutest"
-              exit 1
-            fi
-            export GITHUB_TOKEN="$IUTEST_REPORT_TOKEN"
-            args+=(--secret GITHUB_TOKEN)
           fi
 
           build/ci/src/cpp-actions "${args[@]}"

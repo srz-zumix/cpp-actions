@@ -1446,6 +1446,8 @@ util::Environment JobRunner::step_environment(const StringMap& env, const FileCo
     out["TMPDIR"] = tmp_.string();
 #if defined(__APPLE__)
     out["CFFIXED_USER_HOME"] = home_.string();
+    // xcrun ignores TMPDIR for its lookup cache; the host cache would be shared with unsandboxed xcrun.
+    out["xcrun_db"] = (tmp_ / "xcrun_db").string();
     out["PATH"] = (job_dir_ / "scripts/bin").string() + ":" + out["PATH"];
 #endif
     for (const auto& [k, v] : sandbox_->environment()) out[k] = v;
