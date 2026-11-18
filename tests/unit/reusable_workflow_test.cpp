@@ -513,6 +513,7 @@ jobs:
         "  remote:\n    uses: fixture-owner/library/.github/workflows/middle.yml@" + sha + "\n"
         "  direct:\n    uses: fixture-owner/library/.github/workflows/leaf.yml@" + sha + "\n");
     IUTEST_ASSERT_EQ("success", report.result) << test.output.str();
+    IUTEST_ASSERT_FALSE(report.workflows.empty());
     for (const auto* key : {"local / leaf", "remote / nested / leaf", "direct / leaf"}) {
       const auto& item = reusable_job(report, key);
       const auto profile = test.options.run_dir / "control" / report.workflows.front().run_id /

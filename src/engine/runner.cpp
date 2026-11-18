@@ -767,7 +767,8 @@ RunReport Runner::run(const std::vector<Selection>& selection, const Event& even
   for (const auto& selector : options.sandbox.allow_xcode_for)
     actions::validate_action_permission_selector(selector);
   const auto valid_selector_file = [](const std::string& file) {
-    return file.starts_with(".github/workflows/") && file.substr(18).find('/') == std::string::npos &&
+    constexpr std::string_view prefix = ".github/workflows/";
+    return file.starts_with(prefix) && file.substr(prefix.size()).find('/') == std::string::npos &&
            (file.ends_with(".yml") || file.ends_with(".yaml")) && file.find("..") == std::string::npos;
   };
   const auto valid_selector_id = [](const std::string& id) {
