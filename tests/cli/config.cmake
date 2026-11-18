@@ -12,7 +12,7 @@ set(repo_config "${repo}/.cpp-actions.yml")
 file(MAKE_DIRECTORY "${repo}/.github/workflows" "${repo}/nested" "${user_dir}" "${WORK}/home" "${WORK}/tmp")
 find_program(GIT git REQUIRED)
 set(git_command "${CMAKE_COMMAND}" -E env "GIT_CONFIG_NOSYSTEM=1" "GIT_CONFIG_GLOBAL=/dev/null"
-  "${GIT}" -c commit.gpgsign=false -c user.name=config-test -c user.email=test@example.com)
+  "${GIT}" -c commit.gpgsign=false -c user.name=config-test -c user.email=fixture-user@example.test)
 execute_process(COMMAND ${git_command} init --quiet -b main "${repo}" RESULT_VARIABLE status)
 if(NOT status EQUAL 0)
   message(FATAL_ERROR "could not initialize configuration fixture")
@@ -33,7 +33,8 @@ endif()
 
 function(check_run name expected)
   set(workflow_args --workflow config.yml)
-  if("--workflow" IN_LIST ARGN)
+  list(FIND ARGN "--workflow" workflow_option_index)
+  if(NOT workflow_option_index EQUAL -1)
     set(workflow_args)
   endif()
   execute_process(COMMAND ${command} run ${workflow_args}
