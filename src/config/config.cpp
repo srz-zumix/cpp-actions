@@ -218,6 +218,8 @@ Config load_config(const fs::path& path) {
       c.allow_unity_step = node_strings(v, file, key);
     } else if (key == "allow-xcode-for") {
       c.allow_xcode_for = node_strings(v, file, key);
+    } else if (key == "allow-xcode-simulator-job") {
+      c.allow_xcode_simulator_job = node_strings(v, file, key);
     } else if (key == "allow-read") {
       c.allow_read = node_strings(v, file, key);
     } else if (key == "allow-write") {
@@ -379,6 +381,7 @@ Config load_configs(const std::vector<fs::path>& paths) {
     append(merged.allow_unity_for, config.allow_unity_for);
     append(merged.allow_unity_step, config.allow_unity_step);
     append(merged.allow_xcode_for, config.allow_xcode_for);
+    append(merged.allow_xcode_simulator_job, config.allow_xcode_simulator_job);
     append(merged.allow_read, config.allow_read);
     append(merged.allow_write, config.allow_write);
     append(merged.pass_env, config.pass_env);

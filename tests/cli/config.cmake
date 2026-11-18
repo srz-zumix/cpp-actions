@@ -309,5 +309,45 @@ if(NOT cli_error MATCHES "not a regular file")
   message(FATAL_ERROR "dangling repository configuration was silently ignored")
 endif()
 
+file(WRITE "${WORK}/simulator-job.yml" [=[
+host-labels: [config-host]
+allow-xcode-simulator: false
+allow-xcode-simulator-job: ['.github/workflows/plain.yml::smoke']
+]=])
+file(WRITE "${WORK}/simulator-other.yml" [=[
+host-labels: [config-host]
+allow-xcode-simulator: false
+allow-xcode-simulator-job: ['.github/workflows/plain.yml::other']
+]=])
+check_run(simulator-invalid 2 --workflow plain.yml --config "${WORK}/simulator-other.yml"
+  --allow-xcode-simulator-job invalid)
+if(NOT cli_error MATCHES "Invalid Xcode/Simulator job selector")
+  message(FATAL_ERROR "invalid Simulator job selector was not rejected\n${cli_error}")
+endif()
+if(HOST_IS_APPLE)
+  check_run(simulator-config 0 --workflow plain.yml --config "${WORK}/simulator-job.yml" --keep-workdir)
+  check_run(simulator-cli 0 --workflow plain.yml --config "${WORK}/simulator-other.yml"
+    --allow-xcode-simulator-job ".github/workflows/plain.yml::smoke" --keep-workdir)
+  check_run(simulator-unmatched 0 --workflow plain.yml --config "${WORK}/simulator-other.yml" --keep-workdir)
+  check_run(simulator-global 0 --workflow plain.yml --config "${WORK}/simulator-other.yml"
+    --allow-xcode-simulator --keep-workdir)
+  foreach(mode IN ITEMS config cli unmatched global)
+    file(GLOB profiles "${WORK}/runs/simulator-${mode}/control/*/*/sandbox.sb")
+    list(LENGTH profiles count)
+    if(NOT count EQUAL 1)
+      message(FATAL_ERROR "expected one Simulator job profile for ${mode}")
+    endif()
+    list(GET profiles 0 profile)
+    file(READ "${profile}" contents)
+    if(mode STREQUAL "unmatched")
+      if(contents MATCHES "com.apple.CoreSimulator.CoreSimulatorService")
+        message(FATAL_ERROR "unmatched Simulator job selector granted access")
+      endif()
+    elseif(NOT contents MATCHES "com.apple.CoreSimulator.CoreSimulatorService")
+      message(FATAL_ERROR "Simulator grant missing for ${mode}")
+    endif()
+  endforeach()
+endif()
+
 cleanup_workspaces("${WORK}")
 file(REMOVE_RECURSE "${WORK}")

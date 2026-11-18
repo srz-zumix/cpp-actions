@@ -18,11 +18,6 @@ on:
           - all
         default: ios-build
         required: true
-      allow_shared_tmp:
-        description: Allow trusted iutest jobs to read and write all of /private/tmp
-        type: boolean
-        default: false
-
 permissions:
   contents: read
 
@@ -53,7 +48,6 @@ jobs:
       - name: Run iutest Apple workflow
         env:
           IUTEST_JOB: ${{ inputs.job }}
-          IUTEST_ALLOW_SHARED_TMP: ${{ inputs.allow_shared_tmp }}
           IUTEST_REPORT_TOKEN: ${{ secrets.IUTEST_REPORT_TOKEN }}
         shell: bash
         run: |
@@ -62,20 +56,10 @@ jobs:
             *) echo "::error::Unsupported iutest job: $IUTEST_JOB"; exit 1 ;;
           esac
 
-          config=/dev/null
-          if [[ "$IUTEST_JOB" == all || "$IUTEST_JOB" == macos-stdversion-test ]]; then
-            config="$RUNNER_TEMP/cpp-actions-iutest.yml"
-            cat > "$config" <<'CONFIG'
-          setup-steps:
-            - name: Provide Python for iutest
-              if: github.job == 'macos-stdversion-test'
-              run: |
-                python3_bin="$(command -v python3)"
-                mkdir -p "$RUNNER_TEMP/cpp-actions-python"
-                ln -s "$python3_bin" "$RUNNER_TEMP/cpp-actions-python/python"
-                echo "$RUNNER_TEMP/cpp-actions-python" >> "$GITHUB_PATH"
-                "$RUNNER_TEMP/cpp-actions-python/python" --version
-          CONFIG
+          config="$GITHUB_WORKSPACE/iutest/.cpp-actions.yml"
+          if [[ ! -f "$config" ]]; then
+            echo "::error::The selected iutest ref must contain .cpp-actions.yml; commit and publish the configuration and TMPDIR changes before running this example"
+            exit 1
           fi
 
           args=(run --directory "$GITHUB_WORKSPACE/iutest"
@@ -86,22 +70,13 @@ jobs:
           if [[ "$IUTEST_JOB" != all ]]; then
             args+=(--job "$IUTEST_JOB")
           fi
-          if [[ "$IUTEST_JOB" != macos-stdversion-test ]]; then
-            args+=(--allow-xcode)
-          fi
-          if [[ "$IUTEST_JOB" == all || "$IUTEST_JOB" == ios-build ]]; then
-            args+=(--allow-xcode-simulator)
-          fi
-          if [[ "$IUTEST_ALLOW_SHARED_TMP" == true ]]; then
-            args+=(--allow-write /private/tmp)
-          fi
           if [[ "$IUTEST_JOB" == all || "$IUTEST_JOB" == macos-stdversion-test ]]; then
             if [[ -z "$IUTEST_REPORT_TOKEN" ]]; then
               echo "::error::Set the IUTEST_REPORT_TOKEN secret to a GitHub App token with checks:write on iutest"
               exit 1
             fi
             export GITHUB_TOKEN="$IUTEST_REPORT_TOKEN"
-            args+=(--pass-env IUTEST_REQUIRE_PYTHON=1 --secret GITHUB_TOKEN)
+            args+=(--secret GITHUB_TOKEN)
           fi
 
           build/ci/src/cpp-actions "${args[@]}"

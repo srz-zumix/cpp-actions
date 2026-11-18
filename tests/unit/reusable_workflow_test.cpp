@@ -7,7 +7,9 @@
 #include <sstream>
 #include <thread>
 
+#include "engine/job.hpp"
 #include "engine/runner.hpp"
+#include "sandbox/sandbox.hpp"
 #include "test_support.hpp"
 #include "workflow/parser.hpp"
 
@@ -18,6 +20,7 @@ namespace {
 
 class ReusableRun {
  public:
+  ~ReusableRun() { cpa_test::remove_retained_workspaces(options.run_dir); }
   ReusableRun() : console(output, false) {
     options.run_dir = dir / "run";
     options.cache_dir = dir / "cache";
@@ -484,6 +487,43 @@ jobs:
   IUTEST_EXPECT_EQ("success", report.result) << test.output.str();
   IUTEST_EXPECT_EQ("remote-commit-ok", reusable_job(report, "call").outputs.at("answer"));
   IUTEST_EXPECT_EQ("success", reusable_job(report, "call / nested / leaf").result);
+}
+
+IUTEST(ReusableWorkflowTest, XcodeSimulatorJobGrantDoesNotCrossRepositoryRoots) {
+  if (!sandbox::supported()) IUTEST_SKIP() << "Seatbelt is unavailable";
+  for (const bool global : {false, true}) {
+    ReusableRun test;
+    test.options.keep_workdir = true;
+    test.options.sandbox.enabled = true;
+    test.options.sandbox.allow_xcode_simulator = global;
+    test.options.sandbox.allow_xcode_simulator_job = {".github/workflows/leaf.yml::leaf"};
+    test.workflow("leaf.yml", kSimple);
+    const std::string sha(40, 'b');
+    const auto remote = test.cache(sha);
+    util::write_file(remote / ".github/workflows/leaf.yml", kSimple);
+    util::write_file(remote / ".github/workflows/middle.yml", R"yaml(
+on: workflow_call
+jobs:
+  nested:
+    uses: ./.github/workflows/leaf.yml
+)yaml");
+    const auto report = test.run(
+        "on: push\njobs:\n"
+        "  local:\n    uses: ./.github/workflows/leaf.yml\n"
+        "  remote:\n    uses: fixture-owner/library/.github/workflows/middle.yml@" + sha + "\n"
+        "  direct:\n    uses: fixture-owner/library/.github/workflows/leaf.yml@" + sha + "\n");
+    IUTEST_ASSERT_EQ("success", report.result) << test.output.str();
+    for (const auto* key : {"local / leaf", "remote / nested / leaf", "direct / leaf"}) {
+      const auto& item = reusable_job(report, key);
+      const auto profile = test.options.run_dir / "control" / report.workflows.front().run_id /
+                           sanitize_key(item.key) / "sandbox.sb";
+      const auto contents = util::read_file(profile);
+      const bool allowed = global || std::string(key) == "local / leaf";
+      IUTEST_EXPECT_EQ(allowed, contents.find("; Opt-in Xcode/Simulator compatibility") != std::string::npos) << key;
+      const auto log = util::read_file(item.log_file);
+      IUTEST_EXPECT_EQ(allowed, log.find("Xcode/Simulator compatibility enabled") != std::string::npos) << key;
+    }
+  }
 }
 
 IUTEST(ReusableWorkflowTest, RejectsRemoteCachedSymlinkEscapes) {

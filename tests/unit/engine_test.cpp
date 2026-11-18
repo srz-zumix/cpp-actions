@@ -11,6 +11,7 @@
 #include "engine/job.hpp"
 #include "engine/runner.hpp"
 #include "engine/shell.hpp"
+#include "sandbox/sandbox.hpp"
 #include "test_support.hpp"
 #include "util/sha256.hpp"
 #include "util/strings.hpp"
@@ -164,6 +165,97 @@ bool wait_for_file(const fs::path& path) {
 }
 
 }  // namespace
+
+IUTEST(EngineTest, XcodeSimulatorJobSelectorValidation) {
+  const std::string workflow = R"yaml(
+on: push
+jobs:
+  test:
+    runs-on: test-host
+    steps:
+      - run: "true"
+)yaml";
+  for (const auto* selector : {".github/workflows/test.yml::test", ".github/workflows/other.yaml::_job-2"}) {
+    EngineRun test;
+    test.options.sandbox.allow_xcode_simulator_job = {selector};
+    IUTEST_EXPECT_NO_THROW(test.run(workflow)) << selector;
+  }
+  for (const auto* selector : {"", ".github/workflows/test.yml", ".github/workflows/test.yml::",
+                               ".github/workflows/test.yml::9job", ".github/workflows/test.yml::*",
+                               ".github/workflows/test.yml::job::step", ".github/workflows/../test.yml::job",
+                               ".github/workflows/sub/test.yml::job", ".github/workflows/test.txt::job",
+                               "/tmp/test.yml::job", ".github/workflows/test.yml::job\n"}) {
+    EngineRun test;
+    test.options.sandbox.allow_xcode_simulator_job = {selector};
+    IUTEST_EXPECT_THROW(test.run(workflow), std::invalid_argument) << selector;
+  }
+}
+
+IUTEST(EngineTest, XcodeSimulatorJobGrantScopesBaseAndActionProfiles) {
+  if (!sandbox::supported()) IUTEST_SKIP() << "Seatbelt is unavailable";
+  for (const bool global : {false, true}) {
+    EngineRun test;
+    test.options.keep_workdir = true;
+    test.options.sandbox.enabled = true;
+    test.options.sandbox.allow_xcode_simulator = global;
+    test.options.sandbox.allow_xcode_simulator_job = {".github/workflows/test.yml::ios"};
+    test.options.sandbox.allow_xcode_for = {"./.github/actions/xcode"};
+    util::write_file(test.git.root / ".github/actions/xcode/action.yml", R"yaml(
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: echo derived-profile
+)yaml");
+    const auto report = test.run(R"yaml(
+on: push
+jobs:
+  ios:
+    runs-on: test-host
+    strategy:
+      matrix:
+        version: [one, two]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/xcode
+  other:
+    runs-on: test-host
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/xcode
+)yaml");
+    IUTEST_ASSERT_EQ("success", report.result) << test.output.str();
+    IUTEST_ASSERT_EQ(1u, report.workflows.size());
+    IUTEST_ASSERT_EQ(3u, report.workflows.front().jobs.size());
+    int ios_jobs = 0;
+    int other_jobs = 0;
+    for (const auto& item : report.workflows.front().jobs) {
+      const bool allowed = global || item.job_id == "ios";
+      if (item.job_id == "ios") ++ios_jobs;
+      if (item.job_id == "other") ++other_jobs;
+      const auto control = test.options.run_dir / "control" / report.workflows.front().run_id / sanitize_key(item.key);
+      const auto base = util::read_file(control / "sandbox.sb");
+      IUTEST_EXPECT_EQ(allowed, base.find("; Opt-in Xcode/Simulator compatibility") != std::string::npos) << item.key;
+      const auto log = util::read_file(item.log_file);
+      IUTEST_EXPECT_EQ(allowed, log.find("Xcode/Simulator compatibility enabled") != std::string::npos) << item.key;
+      IUTEST_EXPECT_NE(std::string::npos,
+                       log.find(allowed ? "matching host Xcode/Simulator temporary entries"
+                                        : "matching host Xcode temporary entries")) << item.key;
+      bool found_derived = false;
+      for (const auto& entry : fs::directory_iterator(control)) {
+        if (entry.path().extension() != ".sb" || entry.path().filename() == "sandbox.sb") continue;
+        const auto derived = util::read_file(entry.path());
+        if (derived.find("; Opt-in Xcode temporary files") == std::string::npos) continue;
+        found_derived = true;
+        IUTEST_EXPECT_EQ(allowed, derived.find("; Opt-in Xcode/Simulator compatibility") != std::string::npos)
+            << item.key;
+      }
+      IUTEST_EXPECT_TRUE(found_derived) << item.key;
+    }
+    IUTEST_EXPECT_EQ(2, ios_jobs);
+    IUTEST_EXPECT_EQ(1, other_jobs);
+  }
+}
 
 IUTEST(EngineTest, GradleHomeDefaultsToEachJobHome) {
   EngineRun test;

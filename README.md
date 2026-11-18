@@ -61,15 +61,16 @@ iutest ref (default `develop`) and an individual job or `all`. The default is
 `ios-build`, which requires neither a reporting token nor shared `/tmp` access.
 The workflow uploads the cpp-actions report and logs, including on failure.
 
-The current iutest tests create stream-capture files directly under `/tmp`.
-Until iutest uses the job's `TMPDIR`, `xcode-build` and
-`macos-stdversion-test` need the `allow_shared_tmp` input enabled. This grants
-all selected jobs **read and write access to the entire host `/private/tmp`**,
-including other job workspaces and temporary files. Use it only with trusted
-code on a disposable GitHub-hosted runner; leave it disabled when iutest honors
-`TMPDIR`. The example also grants Xcode temporary-file access for Xcode jobs and
-Simulator access for `ios-build`, as described below. When `all` is selected,
-both grants apply to every job in the run.
+The selected iutest ref must contain its `.cpp-actions.yml` configuration and
+the iutest change that makes temporary files honor `TMPDIR`. Publish those
+changes to `develop` before using the default ref, or select another ref that
+contains them. The example fails explicitly if the configuration is missing.
+It loads that file with `--config`, so the runner's user configuration is not
+merged. Review the selected ref and configuration before running it: repository
+configuration can execute setup steps, pass environment variables, and relax
+the sandbox. The iutest configuration enables Xcode temporary-file access for
+all jobs and Simulator access for `ios-build` only; it does not grant access
+to the entire host `/private/tmp`. Use trusted refs on disposable runners.
 
 The `macos-stdversion-test` job, including when `all` is selected, runs a
 third-party action that publishes checks to iutest. Set the repository secret
@@ -81,9 +82,9 @@ trusted refs and actions. The automatic token for this repository cannot publish
 checks to iutest. A missing token, a skipped job, or an error annotation fails
 the example rather than being reported as success.
 
-For this job, the example also exposes `python3` as `python` in the isolated
-job environment and requires its detection, so iutest does not silently omit
-Python-dependent compile-error tests.
+For the standard-test job, the iutest configuration also exposes `python3`
+as `python` in the isolated job environment and requires its detection, so
+iutest does not silently omit Python-dependent compile-error tests.
 
 Execution is **sandboxed by default and supported only on macOS**, using
 `/usr/bin/sandbox-exec` (Seatbelt). A missing or unsupported sandbox fails closed;
@@ -438,9 +439,31 @@ Or enable it in the trusted user configuration:
 allow-xcode-simulator: true
 ```
 
-It is disabled by default. The CLI flag adds a grant even if the configuration
-sets it to `false`. Workflow files, environment variables, and `GITHUB_ENV`
-cannot enable it.
+To limit the grant to particular jobs instead, specify exact workflow paths and
+job IDs in trusted configuration:
+
+```yaml
+allow-xcode-simulator-job:
+  - .github/workflows/apple.yml::ios-build
+```
+
+Or repeat the CLI option for each job:
+
+```sh
+cpp-actions run -w apple.yml --allow-xcode-simulator-job '.github/workflows/apple.yml::ios-build'
+```
+
+The path must be a `.yml` or `.yaml` file directly under `.github/workflows`,
+and matching is case-sensitive. The selector uses the original job ID and
+applies to every matrix instance, including setup and action steps. It applies
+only to workflows rooted in the selected repository, including local reusable
+workflows, not remote reusable workflows or their nested local calls.
+
+Both forms are disabled by default. Job selectors from configuration and CLI
+are combined; the global flag or `allow-xcode-simulator: true` still grants
+every job, including jobs in remote reusable workflows. The CLI global flag
+adds a grant even if the configuration sets it to `false`. Workflow files,
+environment variables, and `GITHUB_ENV` cannot enable either form.
 
 The grant permits contact with `com.apple.CoreSimulator.CoreSimulatorService`,
 `com.apple.CoreSimulator.simdiskimaged`, and the native host architecture's
@@ -528,8 +551,8 @@ For archive export, platform-signed `xcodebuild` can create direct
 pipeline entries. These temporary names are shared with host and other-job
 Xcode processes, not owned by the action.
 
-When **both** this action-specific grant and `--allow-xcode-simulator` are
-enabled, the action can additionally access direct
+When **both** this action-specific grant and a global or matching job-scoped
+Simulator grant are enabled, the action can additionally access direct
 `com.apple.CoreSimulator.SimDevice.<UUID>.Standalone.<UUID>` entries in that
 temporary directory. The platform binary named `AssetCatalogSimulatorAgent`
 with signing identifier `com.apple.dt.AssetCatalogSimulatorAgent` can also
@@ -558,9 +581,9 @@ back to an unrestricted grant.
 This permission does not grant general host temporary- or cache-directory
 access, `xcrun_db` cache access, Simulator services, or Apple security services.
 Xcode may still log harmless `xcrun` cache errors, and signed or Simulator
-builds may need separate permissions. `--allow-xcode-simulator` remains a
-separate run-wide opt-in and does not, by itself, enable these temporary-file
-permissions.
+builds may need separate permissions. Simulator access remains a separate
+global or job-scoped opt-in and does not, by itself, enable these
+temporary-file permissions.
 
 ### Opt-in Docker CLI access
 

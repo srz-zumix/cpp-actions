@@ -239,6 +239,7 @@ class JobRunner {
   double timeout_minutes_ = kDefaultJobTimeoutMinutes;
   bool continue_on_error_ = false;
   bool setup_failed_ = false;
+  bool allow_xcode_simulator_ = false;
 
   fs::path job_dir_;
   fs::path control_dir_;
@@ -612,7 +613,15 @@ void JobRunner::start_sandbox() {
     log_->warning("Xcode temporary-file and compiler-cache access enabled for all steps in this job; host Xcode "
                   "temporary entries, clang module cache and SDK stat caches may be read and modified");
   }
-  config.allow_xcode_simulator = run_.options.sandbox.allow_xcode_simulator;
+  allow_xcode_simulator_ = run_.options.sandbox.allow_xcode_simulator;
+  const auto& simulator_jobs = run_.options.sandbox.allow_xcode_simulator_job;
+  if (!allow_xcode_simulator_ && !simulator_jobs.empty()) {
+    const auto root = run_.git.root.empty() ? fs::current_path() : run_.git.root;
+    const auto selector = wf_.file + "::" + job_.id;
+    allow_xcode_simulator_ = util::real_path(wr_.repo_root) == util::real_path(root) &&
+                             std::find(simulator_jobs.begin(), simulator_jobs.end(), selector) != simulator_jobs.end();
+  }
+  config.allow_xcode_simulator = allow_xcode_simulator_;
   if (config.allow_xcode_simulator) {
     log_->warning("Xcode/Simulator compatibility enabled for all steps in this job; processes can read the OS user's "
                   "DeveloperDiskImages and contact CoreSimulator services, including host Simulator operations");
@@ -1114,7 +1123,7 @@ StepResult JobRunner::run_uses(StepScope& scope, const workflow::Step& step, con
   resolved.allow_xcode = permitted(run_.options.sandbox.allow_xcode_for);
   if (sandbox_ && resolved.allow_xcode) {
     log_->warning("Xcode temporary-file access enabled for action '" + resolved.display +
-                  "'; matching host " + (run_.options.sandbox.allow_xcode_simulator ? "Xcode/Simulator" : "Xcode") +
+                  "'; matching host " + (allow_xcode_simulator_ ? "Xcode/Simulator" : "Xcode") +
                   " temporary entries may be accessible to its processes and children, including unrelated "
                   "distribution-pipeline and UUID-named entries");
   }
