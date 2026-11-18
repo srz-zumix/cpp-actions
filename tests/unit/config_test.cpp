@@ -142,6 +142,7 @@ environments:
       {"allow-unity-for", &Config::allow_unity_for},
       {"allow-unity-step", &Config::allow_unity_step},
       {"allow-xcode-for", &Config::allow_xcode_for},
+      {"allow-xcode-simulator-job", &Config::allow_xcode_simulator_job},
       {"env-pass", &Config::pass_env},
       {"host-labels", &Config::host_labels}};
   for (const auto& [key, member] : lists) {
@@ -390,6 +391,21 @@ IUTEST(ConfigTest, XcodeSimulatorRequiresBooleanOptIn) {
     util::write_file(dir / "config.yml", std::string("allow-xcode-simulator: ") + value + "\n");
     IUTEST_EXPECT_THROW(load_config(dir / "config.yml"), ConfigError);
   }
+}
+
+IUTEST(ConfigTest, XcodeSimulatorJobPermissionList) {
+  cpa_test::TempDir dir;
+  util::write_file(dir / "config.yml", "{}\n");
+  IUTEST_EXPECT_TRUE(load_config(dir / "config.yml").allow_xcode_simulator_job.empty());
+  util::write_file(dir / "config.yml",
+                   "allow-xcode-simulator-job: ['.github/workflows/build.yml::ios', "
+                   "'.github/workflows/other.yaml::simulator']\n");
+  const auto config = load_config(dir / "config.yml");
+  IUTEST_EXPECT_EQ((std::vector<std::string>{".github/workflows/build.yml::ios",
+                                            ".github/workflows/other.yaml::simulator"}),
+                   config.allow_xcode_simulator_job);
+  util::write_file(dir / "config.yml", "allow-xcode-simulator-job: {bad: mapping}\n");
+  IUTEST_EXPECT_THROW(load_config(dir / "config.yml"), ConfigError);
 }
 
 IUTEST(ConfigTest, UnityHostsRequireBooleanOptIn) {

@@ -399,6 +399,31 @@ It is disabled by default. The CLI flag adds a grant even if the configuration
 sets it to `false`. Workflow files, environment variables, and `GITHUB_ENV`
 cannot enable it.
 
+To limit the grant to particular jobs, specify workflow paths and job IDs in
+trusted configuration:
+
+```yaml
+allow-xcode-simulator-job:
+  - .github/workflows/apple.yml::ios-build
+```
+
+Or repeat the CLI option for each job:
+
+```sh
+cpp-actions run -w apple.yml --allow-xcode-simulator-job '.github/workflows/apple.yml::ios-build'
+```
+
+The path must be a `.yml` or `.yaml` file directly under `.github/workflows`,
+and matching is case-sensitive. The selector uses the original job ID and
+applies to every matrix instance, including setup and action steps. It applies
+only to workflows rooted in the selected repository, including local reusable
+workflows, not remote reusable workflows or their nested local calls.
+
+Job selectors are disabled by default and configuration and CLI selectors are
+combined. The global flag or `allow-xcode-simulator: true` still grants every
+job, including jobs in remote reusable workflows. Neither form can be enabled
+by workflow files, environment variables, or `GITHUB_ENV`.
+
 The grant permits contact with `com.apple.CoreSimulator.CoreSimulatorService`,
 `com.apple.CoreSimulator.simdiskimaged`, and the native host architecture's
 `com.apple.CoreSimulator.SimLaunchHost-arm64` or `SimLaunchHost-x86_64` service.

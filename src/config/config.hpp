@@ -42,6 +42,7 @@ struct Config {
   std::vector<std::string> allow_unity_for;
   std::vector<std::string> allow_unity_step;
   std::vector<std::string> allow_xcode_for;
+  std::vector<std::string> allow_xcode_simulator_job;
   std::vector<std::string> allow_read;
   std::vector<std::string> allow_write;
   std::optional<bool> allow_localhost;

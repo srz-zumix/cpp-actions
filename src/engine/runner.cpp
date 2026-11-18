@@ -766,21 +766,25 @@ RunReport Runner::run(const std::vector<Selection>& selection, const Event& even
     actions::validate_action_permission_selector(selector);
   for (const auto& selector : options.sandbox.allow_xcode_for)
     actions::validate_action_permission_selector(selector);
-  const auto validate_step_selector = [](const std::string& selector, std::string_view permission) {
+  const auto valid_selector_file = [](const std::string& file) {
+    constexpr std::string_view prefix = ".github/workflows/";
+    return file.starts_with(prefix) && file.substr(prefix.size()).find('/') == std::string::npos &&
+           (file.ends_with(".yml") || file.ends_with(".yaml")) && file.find("..") == std::string::npos;
+  };
+  const auto valid_selector_id = [](const std::string& id) {
+    return !id.empty() && id.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-") ==
+                              std::string::npos &&
+           (id.front() == '_' || (id.front() >= 'A' && id.front() <= 'Z') ||
+            (id.front() >= 'a' && id.front() <= 'z'));
+  };
+  const auto validate_step_selector = [&](const std::string& selector, std::string_view permission) {
     const auto first = selector.find("::");
     const auto second = first == std::string::npos ? first : selector.find("::", first + 2);
     const auto file = selector.substr(0, first);
-    const auto valid_id = [](const std::string& id) {
-      return !id.empty() && id.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-") ==
-                                std::string::npos &&
-             (id.front() == '_' || (id.front() >= 'A' && id.front() <= 'Z') ||
-              (id.front() >= 'a' && id.front() <= 'z'));
-    };
-    if (first == std::string::npos || second == std::string::npos ||
-        !file.starts_with(".github/workflows/") || file.substr(18).find('/') != std::string::npos ||
-        (!file.ends_with(".yml") && !file.ends_with(".yaml")) ||
-        selector.find_first_of("*?[]{}\r\n\t") != std::string::npos || file.find("..") != std::string::npos ||
-        !valid_id(selector.substr(first + 2, second - first - 2)) || !valid_id(selector.substr(second + 2))) {
+    if (first == std::string::npos || second == std::string::npos || !valid_selector_file(file) ||
+        selector.find_first_of("*?[]{}\r\n\t") != std::string::npos ||
+        !valid_selector_id(selector.substr(first + 2, second - first - 2)) ||
+        !valid_selector_id(selector.substr(second + 2))) {
       throw std::invalid_argument("Invalid " + std::string(permission) + " step selector '" + selector +
                                   "': expected .github/workflows/file.yml::job-id::step-id");
     }
@@ -788,6 +792,16 @@ RunReport Runner::run(const std::vector<Selection>& selection, const Event& even
   for (const auto& selector : options.sandbox.allow_docker_step) validate_step_selector(selector, "Docker");
   for (const auto& selector : options.sandbox.allow_msbuild_step) validate_step_selector(selector, "MSBuild");
   for (const auto& selector : options.sandbox.allow_unity_step) validate_step_selector(selector, "Unity");
+  for (const auto& selector : options.sandbox.allow_xcode_simulator_job) {
+    const auto separator = selector.find("::");
+    const auto file = selector.substr(0, separator);
+    if (separator == std::string::npos || selector.find("::", separator + 2) != std::string::npos ||
+        !valid_selector_file(file) || selector.find_first_of("*?[]{}\r\n\t") != std::string::npos ||
+        !valid_selector_id(selector.substr(separator + 2))) {
+      throw std::invalid_argument("Invalid Xcode/Simulator job selector '" + selector +
+                                  "': expected .github/workflows/file.yml::job-id");
+    }
+  }
   if (options.sandbox.enabled) {
     std::string reason;
     if (!sandbox::supported(&reason)) throw std::runtime_error("sandbox unavailable: " + reason);

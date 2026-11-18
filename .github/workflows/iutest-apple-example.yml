@@ -1,0 +1,114 @@
+name: Example - iutest Apple workflow
+
+on:
+  workflow_dispatch:
+    inputs:
+      iutest_ref:
+        description: iutest branch, tag, or commit
+        type: string
+        default: develop
+        required: true
+      job:
+        description: iutest Apple job to run
+        type: choice
+        options:
+          - ios-build
+          - xcode-build
+          - macos-stdversion-test
+          - all
+        default: ios-build
+        required: true
+permissions:
+  contents: read
+
+jobs:
+  run-iutest:
+    runs-on: macos-latest
+    timeout-minutes: 180
+    steps:
+      - name: Check out cpp-actions
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Ninja
+        run: command -v ninja || brew install ninja
+      - name: Build cpp-actions
+        run: |
+          cmake --preset ci -DCPA_BUILD_TESTS=OFF
+          cmake --build --preset ci
+      - name: Check out iutest
+        uses: actions/checkout@v7.0.1
+        with:
+          repository: srz-zumix/iutest
+          ref: ${{ inputs.iutest_ref }}
+          path: iutest
+          persist-credentials: false
+      - name: Show iutest revision
+        run: git -C iutest rev-parse --verify HEAD
+      - name: Run iutest Apple workflow
+        env:
+          IUTEST_JOB: ${{ inputs.job }}
+          IUTEST_REPORT_TOKEN: ${{ secrets.IUTEST_REPORT_TOKEN }}
+        shell: bash
+        run: |
+          case "$IUTEST_JOB" in
+            all|ios-build|xcode-build|macos-stdversion-test) ;;
+            *) echo "::error::Unsupported iutest job: $IUTEST_JOB"; exit 1 ;;
+          esac
+
+          config="$GITHUB_WORKSPACE/iutest/.cpp-actions.yml"
+          if [[ ! -f "$config" ]]; then
+            echo "::error::The selected iutest ref must contain .cpp-actions.yml; commit and publish the configuration and TMPDIR changes before running this example"
+            exit 1
+          fi
+
+          args=(run --directory "$GITHUB_WORKSPACE/iutest"
+            --workflow apple.yml --event pull_request --changes-base HEAD
+            --config "$config" --parallel 1 --no-color
+            --cache-dir "$RUNNER_TEMP/cpp-actions-iutest-cache"
+            --run-dir "$RUNNER_TEMP/cpp-actions-iutest-apple")
+          if [[ "$IUTEST_JOB" != all ]]; then
+            args+=(--job "$IUTEST_JOB")
+          fi
+          if [[ "$IUTEST_JOB" == all || "$IUTEST_JOB" == macos-stdversion-test ]]; then
+            if [[ -z "$IUTEST_REPORT_TOKEN" ]]; then
+              echo "::error::Set the IUTEST_REPORT_TOKEN secret to a GitHub App token with checks:write on iutest"
+              exit 1
+            fi
+            export GITHUB_TOKEN="$IUTEST_REPORT_TOKEN"
+            args+=(--secret GITHUB_TOKEN)
+          fi
+
+          build/ci/src/cpp-actions "${args[@]}"
+
+          # A reporting action can emit an error annotation without failing its step.
+          report="$RUNNER_TEMP/cpp-actions-iutest-apple/report.json"
+          if ! jq --exit-status --arg selected "$IUTEST_JOB" '
+            .event == "pull_request" and .result == "success" and
+            (.workflows | length == 1) and
+            .workflows[0].file == ".github/workflows/apple.yml" and
+            .workflows[0].result == "success" and
+            (.workflows[0].jobs | length > 0) and
+            all(.workflows[0].jobs[];
+              .result == "success" and all(.annotations[]; .level != "error")) and
+            (if $selected == "all" then
+              [.workflows[0].jobs[].id] as $ids |
+              all(["macos-stdversion-test", "xcode-build", "ios-build"][];
+                . as $id | $ids | index($id) != null)
+            else
+              any(.workflows[0].jobs[]; .id == $selected)
+            end)
+          ' "$report" > /dev/null; then
+            echo "::error::The selected iutest jobs did not all succeed; inspect the cpp-actions report"
+            exit 1
+          fi
+      - name: Upload cpp-actions report and logs
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: iutest-apple-cpp-actions
+          path: |
+            ${{ runner.temp }}/cpp-actions-iutest-apple/report.json
+            ${{ runner.temp }}/cpp-actions-iutest-apple/summary.md
+            ${{ runner.temp }}/cpp-actions-iutest-apple/logs/
+          if-no-files-found: warn

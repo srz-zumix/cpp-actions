@@ -30,6 +30,7 @@ struct SandboxOptions {
   std::vector<std::string> allow_unity_for;
   std::vector<std::string> allow_unity_step;
   std::vector<std::string> allow_xcode_for;
+  std::vector<std::string> allow_xcode_simulator_job;
   std::vector<fs::path> allow_read;
   std::vector<fs::path> allow_write;
   bool allow_localhost = false;

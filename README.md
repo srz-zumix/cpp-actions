@@ -130,6 +130,40 @@ cpp-actions run --event workflow_dispatch --input target=debug
 
 Use `cpp-actions --help` and `cpp-actions run --help` for the complete CLI.
 
+### iutest Apple workflow example
+
+The manually dispatched [iutest Apple example](.github/workflows/iutest-apple-example.yml)
+builds cpp-actions on a GitHub-hosted macOS runner and runs iutest's
+`.github/workflows/apple.yml` with a simulated `pull_request` event. Choose an
+iutest ref (default `develop`) and an individual job or `all`. The default is
+`ios-build`, which requires neither a reporting token nor shared `/tmp` access.
+The workflow uploads the cpp-actions report and logs, including on failure.
+
+The selected iutest ref must contain its `.cpp-actions.yml` configuration and
+the iutest change that makes temporary files honor `TMPDIR`. Publish those
+changes to `develop` before using the default ref, or select another ref that
+contains them. The example fails explicitly if the configuration is missing.
+It loads that file with `--config`, so the runner's user configuration is not
+merged. Review the selected ref and configuration before running it: repository
+configuration can execute setup steps, pass environment variables, and relax
+the sandbox. The iutest configuration enables Xcode temporary-file access for
+all jobs and Simulator access for `ios-build` only; it does not grant access
+to the entire host `/private/tmp`. Use trusted refs on disposable runners.
+
+The `macos-stdversion-test` job, including when `all` is selected, runs a
+third-party action that publishes checks to iutest. Set the repository secret
+`IUTEST_REPORT_TOKEN` to a GitHub App installation token with `checks: write`
+for iutest. The token is available to all selected jobs and is also used to
+resolve and download remote actions. It must still be valid when the reporting
+steps run. These steps can create checks on the target repository; only use
+trusted refs and actions. The automatic token for this repository cannot publish
+checks to iutest. A missing token, a skipped job, or an error annotation fails
+the example rather than being reported as success.
+
+For the standard-test job, the iutest configuration also exposes `python3`
+as `python` in the isolated job environment and requires its detection, so
+iutest does not silently omit Python-dependent compile-error tests.
+
 ## Configure access, environment, and secrets
 
 Steps receive a minimal environment, isolated per-job `HOME` and `TMPDIR`, and

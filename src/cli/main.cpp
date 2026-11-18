@@ -206,6 +206,9 @@ engine::RunOptions run_options(const RunCli& o, const fs::path& root) {
                                           cfg.allow_unity_step.begin(), cfg.allow_unity_step.end());
   options.sandbox.allow_xcode_for.insert(options.sandbox.allow_xcode_for.begin(),
                                          cfg.allow_xcode_for.begin(), cfg.allow_xcode_for.end());
+  options.sandbox.allow_xcode_simulator_job.insert(options.sandbox.allow_xcode_simulator_job.begin(),
+                                                   cfg.allow_xcode_simulator_job.begin(),
+                                                   cfg.allow_xcode_simulator_job.end());
   for (const auto& path : o.allow_read) options.sandbox.allow_read.push_back(config::expand_user(path));
   for (auto& path : options.sandbox.allow_write) path = config::expand_user(path.string());
   for (const auto& path : cfg.allow_write) options.sandbox.allow_write.emplace_back(path);
@@ -468,6 +471,8 @@ int main(int argc, char** argv) {
                 "Allow Xcode temporary files and compiler caches for all steps of all jobs (shared with host Xcode)");
   run->add_flag("--allow-xcode-simulator", run_opts.options.sandbox.allow_xcode_simulator,
                 "Allow Xcode/Simulator services for all jobs (permits host Simulator operations)");
+  run->add_option("--allow-xcode-simulator-job", run_opts.options.sandbox.allow_xcode_simulator_job,
+                  "Allow Xcode/Simulator services for workflow-path::job-id (repeatable)");
   run->add_option("--config", run_opts.config_path,
                   "Use only this trusted configuration file instead of user and repository defaults");
   run->add_flag("--no-sandbox", run_opts.no_sandbox, "DANGER: disable filesystem and network isolation");
