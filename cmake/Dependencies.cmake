@@ -58,8 +58,8 @@ endif()
 # fresh build directory) to pick up a newer develop. After the release, pin
 # the release tarball with URL_HASH like the other dependencies.
 #
-# The include directory is intentionally not SYSTEM: warnings in iutest
-# headers are reported (and fixed in iutest) instead of being suppressed.
+# iutest is a third-party header-only dependency; treat its headers as SYSTEM so
+# compiler-specific extensions in them do not fail this project's -Werror builds.
 if(CPA_BUILD_TESTS)
   set(IUTEST_ROOT "$ENV{IUTEST_ROOT}" CACHE PATH "Path to an iutest checkout (optional)")
   if(IUTEST_ROOT AND EXISTS "${IUTEST_ROOT}/include/iutest.hpp")
@@ -76,6 +76,6 @@ if(CPA_BUILD_TESTS)
     set(CPA_IUTEST_INCLUDE_DIR "${iutest_SOURCE_DIR}/include")
   endif()
   add_library(cpa_iutest INTERFACE)
-  target_include_directories(cpa_iutest INTERFACE "${CPA_IUTEST_INCLUDE_DIR}")
+  target_include_directories(cpa_iutest SYSTEM INTERFACE "${CPA_IUTEST_INCLUDE_DIR}")
   message(STATUS "iutest: ${CPA_IUTEST_INCLUDE_DIR}")
 endif()
