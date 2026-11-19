@@ -81,9 +81,14 @@ Steps start with a minimal environment, a per-job `HOME` and `TMPDIR`, a default
 system `PATH`, locale, fixed `runner` values for `USER`/`LOGNAME`, and
 runner/workflow variables. Every step, setup step, and action process also
 receives `CPP_ACTIONS=true` and `CPP_ACTIONS_VERSION=<version>` so scripts can
-detect cpp-actions (for example, `if [ "${CPP_ACTIONS:-}" = true ]`). Like
-`GITHUB_ACTIONS`, they cannot be overridden by `env` or `GITHUB_ENV`; they are
-process environment variables, not entries in the `env` expression context.
+detect cpp-actions (for example, `if [ "${CPP_ACTIONS:-}" = true ]`).
+`CPP_ACTIONS` is also the string `true` in the `env` expression context, so
+`if: ${{ env.CPP_ACTIONS != 'true' }}` skips a step under cpp-actions. It cannot
+be overridden in either the expression context or process environment by
+workflow/job/step `env`, `--pass-env`, or `GITHUB_ENV`. `CPP_ACTIONS_VERSION`
+and `GITHUB_ACTIONS` are not automatically added to the `env` expression
+context and cannot be overridden in the process environment. On macOS and
+Linux, names in the `env` expression context are case-sensitive.
 `GRADLE_USER_HOME` defaults to `<job HOME>/.gradle`,
 keeping Gradle caches and native libraries separate from the host and other
 jobs. Explicit values from `--pass-env`, workflow/job/step `env`, or

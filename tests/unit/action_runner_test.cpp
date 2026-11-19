@@ -826,6 +826,127 @@ runs:
   IUTEST_EXPECT_EQ("success", job.result) << f.log;
 }
 
+IUTEST(ActionRunnerTest, CppActionsMarkerInCompositeExpressions) {
+  ActionFixture f;
+  f.file("outer/action.yml", R"yaml(name: report
+inputs:
+  default_marker:
+    default: ${{ env.CPP_ACTIONS }}
+  passed_marker:
+    description: marker supplied by the caller
+outputs:
+  marker:
+    value: ${{ env.CPP_ACTIONS }}
+  nested_marker:
+    value: ${{ steps.nested.outputs.marker }}
+  verified:
+    value: ${{ steps.verify.outputs.executed }}
+runs:
+  using: composite
+  steps:
+    - name: Test Report
+      id: report
+      uses: ./forbidden
+      if: ${{ env.CPP_ACTIONS != 'true' }}
+    - name: Test Summary
+      id: summary
+      if: ${{ env.CPP_ACTIONS != 'true' }}
+      shell: bash
+      run: exit 1
+    - id: verify
+      if: ${{ env.CPP_ACTIONS == 'true' }}
+      env:
+        CPP_ACTIONS: nested-step-override
+      shell: bash
+      run: |
+        test "$CPP_ACTIONS" = true
+        test '${{ env.CPP_ACTIONS }}' = true
+        test '${{ inputs.default_marker }}' = true
+        test '${{ inputs.passed_marker }}' = true
+        echo executed=yes >> "$GITHUB_OUTPUT"
+    - id: nested
+      uses: ./inner
+      env:
+        CPP_ACTIONS: nested-action-override
+)yaml");
+  f.file("inner/action.yml", R"yaml(name: inner
+outputs:
+  marker:
+    value: ${{ env.CPP_ACTIONS }}
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      if: ${{ env.CPP_ACTIONS == 'true' }}
+      run: test '${{ env.CPP_ACTIONS }}' = "$CPP_ACTIONS"
+)yaml");
+  f.file("forbidden/action.yml", R"yaml(name: forbidden
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: exit 1
+)yaml");
+  const auto job = f.run(R"yaml(      - uses: ./outer
+        id: outer
+        env:
+          CPP_ACTIONS: action-override
+        with:
+          passed_marker: ${{ env.CPP_ACTIONS }}
+      - run: |
+          test '${{ steps.outer.outputs.marker }}' = true
+          test '${{ steps.outer.outputs.nested_marker }}' = true
+          test '${{ steps.outer.outputs.verified }}' = yes
+)yaml");
+  IUTEST_ASSERT_EQ("success", job.result) << f.log;
+  int skipped = 0;
+  for (const auto& step : job.steps) {
+    if (step.id == "report" || step.id == "summary") {
+      ++skipped;
+      IUTEST_EXPECT_EQ("skipped", step.outcome) << f.log;
+    }
+  }
+  IUTEST_EXPECT_EQ(2, skipped) << f.log;
+}
+
+IUTEST(ActionRunnerTest, CppActionsMarkerInNodeLifecycleExpressions) {
+  const auto node = host_node();
+  if (!node) IUTEST_SKIP() << "No host Node.js runtime";
+  ActionFixture f;
+  f.file("js/action.yml", R"yaml(name: marker-lifecycle
+inputs:
+  marker:
+    default: ${{ env.CPP_ACTIONS }}
+runs:
+  using: node20
+  pre: pre.js
+  pre-if: env.CPP_ACTIONS == 'true'
+  main: main.js
+  post: post.js
+  post-if: env.CPP_ACTIONS == 'true'
+)yaml");
+  f.file("js/pre.js", R"js(require('fs').appendFileSync(process.env.GITHUB_STEP_SUMMARY, 'pre\n');
+)js");
+  f.file("js/main.js",
+         R"js(if (process.env.CPP_ACTIONS !== 'true' || process.env.INPUT_MARKER !== 'true') process.exit(1);
+require('fs').appendFileSync(process.env.GITHUB_STEP_SUMMARY, 'main\n');
+)js");
+  f.file("js/post.js", R"js(if (process.env.CPP_ACTIONS !== 'true') process.exit(1);
+require('fs').appendFileSync(process.env.GITHUB_STEP_SUMMARY, 'post\n');
+)js");
+  const auto job = f.run(R"yaml(      - uses: ./js
+        env:
+          CPP_ACTIONS: action-override
+      - run: echo CPP_ACTIONS=file-override >> "$GITHUB_ENV"
+)yaml",
+                         *node);
+  IUTEST_ASSERT_EQ("success", job.result) << f.log;
+  IUTEST_EXPECT_EQ("pre\nmain\npost\n", job.summary);
+  const auto cleanup = posts(job);
+  IUTEST_ASSERT_EQ(1u, cleanup.size());
+  IUTEST_EXPECT_EQ("success", cleanup[0].outcome);
+}
+
 IUTEST(ActionRunnerTest, NestedCompositePostKeepsInputsStepsPathAndFailureStatus) {
   const auto node = host_node();
   if (!node) IUTEST_SKIP() << "No host Node.js runtime";
