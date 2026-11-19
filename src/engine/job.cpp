@@ -37,6 +37,8 @@ using StringMap = std::map<std::string, std::string>;
 constexpr std::size_t kMaxSummarySize = 1024 * 1024;
 constexpr int kMaxCompositeDepth = 10;
 constexpr double kDefaultJobTimeoutMinutes = 360;
+constexpr auto kCppActionsEnvName = "CPP_ACTIONS";
+constexpr auto kCppActionsEnvValue = "true";
 
 std::int64_t elapsed_ms(Clock::time_point start) {
   return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start).count();
@@ -75,6 +77,13 @@ Value with_fields(const Value& base, const std::vector<std::pair<std::string, Va
   }
   for (const auto& [k, v] : fields) out.set(k, v);
   return out;
+}
+
+Value expression_env(const StringMap& values) {
+  auto env = Value::object(true);
+  for (const auto& [key, value] : values) env.set(key, value);
+  env.set(kCppActionsEnvName, kCppActionsEnvValue);
+  return env;
 }
 
 std::chrono::milliseconds minutes_to_ms(double minutes) {
@@ -723,7 +732,7 @@ expr::EvalContext JobRunner::make_context(const StepScope& scope, const StringMa
   } else {
     c.set("github", github_);
   }
-  c.set("env", to_object(env));
+  c.set("env", expression_env(env));
   c.set("vars", vars_);
   c.set("secrets", secrets_);
   auto job = Value::object();
@@ -821,7 +830,7 @@ void JobRunner::run_step(StepScope& scope, const workflow::Step& step) {
   std::optional<std::chrono::milliseconds> timeout;
   try {
     for (const auto& [k, v] : evaluate_string_map(step.env, ctx, general, scope.file)) env[k] = v;
-    ctx.contexts.set("env", to_object(env));
+    ctx.contexts.set("env", expression_env(env));
     if (step.continue_on_error != nullptr) {
       continue_on_error = evaluate_token(step.continue_on_error, ctx, general, scope.file).truthy();
     }
@@ -1391,7 +1400,7 @@ util::Environment JobRunner::step_environment(const StringMap& env, const FileCo
   auto type = ref_type(ev.info.ref);
   if (type.empty() && !ev.info.ref.empty()) type = "branch";
   const StringMap runtime = {
-      {"CPP_ACTIONS", "true"},
+      {kCppActionsEnvName, kCppActionsEnvValue},
       {"CPP_ACTIONS_VERSION", CPA_VERSION},
       {"GITHUB_ACTIONS", "true"},
       {"GITHUB_ACTION", action_id},

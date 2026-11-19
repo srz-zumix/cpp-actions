@@ -584,6 +584,68 @@ jobs:
   IUTEST_EXPECT_EQ("push", saved.get("event").to_string());
 }
 
+IUTEST(EngineTest, CppActionsMarkerInExpressionEnvironment) {
+  EngineRun test;
+  test.options.pass_env = {"CPP_ACTIONS=host-override"};
+  test.setup_steps(R"yaml(
+setup-steps:
+  - id: check_marker
+    if: ${{ env.CPP_ACTIONS == 'true' }}
+    run: |
+      test "$CPP_ACTIONS" = true
+      test '${{ env.CPP_ACTIONS }}' = true
+      echo SETUP_MARKER=ready >> "$GITHUB_ENV"
+)yaml");
+  const auto report = test.run(R"yaml(
+on: push
+env:
+  CPP_ACTIONS: workflow-override
+  cpp_actions: lowercase-value
+  SHARED: workflow
+jobs:
+  run:
+    runs-on: test-host
+    env:
+      CPP_ACTIONS: job-override
+      SHARED: job
+    outputs:
+      marker: ${{ env.CPP_ACTIONS }}
+    steps:
+      - id: report
+        if: ${{ env.CPP_ACTIONS != 'true' }}
+        run: exit 1
+      - id: verify
+        if: ${{ env.CPP_ACTIONS == 'true' }}
+        env:
+          CPP_ACTIONS: step-override
+          SHARED: step
+          COPIED_MARKER: ${{ env.CPP_ACTIONS }}
+        run: |
+          test "$CPP_ACTIONS" = true
+          test '${{ env.CPP_ACTIONS }}' = "$CPP_ACTIONS"
+          test '${{ env.cpp_actions }}' = "$cpp_actions"
+          test "$cpp_actions" = lowercase-value
+          test '${{ toJSON(env.Cpp_Actions) }}' = null
+          test '${{ toJSON(env.CPP_ACTIONS) }}' = '"true"'
+          test "$COPIED_MARKER" = true
+          test "$SETUP_MARKER" = ready
+          test "$SHARED" = step
+          echo CPP_ACTIONS=file-override >> "$GITHUB_ENV"
+      - id: verify_after
+        if: ${{ env.CPP_ACTIONS == 'true' }}
+        run: |
+          test "$CPP_ACTIONS" = true
+          test '${{ env.CPP_ACTIONS }}' = "$CPP_ACTIONS"
+          test "$SHARED" = job
+)yaml");
+  IUTEST_ASSERT_EQ("success", report.result) << test.output.str();
+  const auto& run = job(report, "run");
+  IUTEST_EXPECT_EQ("skipped", step(run, "report").outcome);
+  IUTEST_EXPECT_EQ("success", step(run, "verify").outcome);
+  IUTEST_EXPECT_EQ("success", step(run, "verify_after").outcome);
+  IUTEST_EXPECT_EQ("true", run.outputs.at("marker"));
+}
+
 IUTEST(EngineTest, DispatchInputsAndConfiguredEnvironment) {
   EngineRun test;
   test.event.info.name = "workflow_dispatch";
