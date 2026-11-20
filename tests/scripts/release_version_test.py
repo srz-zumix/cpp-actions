@@ -239,9 +239,47 @@ class ReleaseVersionTest(unittest.TestCase):
     def test_version_pr_is_excluded_from_release_resolution(self):
         config = self.github_config("release-drafter.yml")
         category = next(category for category in config["categories"] if category.get("type") == "pre-exclude")
-        self.assertEqual(category["when"]["conventional"], {"type": "chore", "scope": "release"})
-        self.assertEqual(category["when"]["paths"], ["CMakeLists.txt", "vcpkg.json"])
-        self.assertEqual(category["when"]["paths-mode"], "only")
+        version_condition = next(condition for condition in category["when"] if "conventional" in condition)
+        self.assertEqual(version_condition["conventional"], {"type": "chore", "scope": "release"})
+        self.assertEqual(version_condition["paths"], ["CMakeLists.txt", "vcpkg.json"])
+        self.assertEqual(version_condition["paths-mode"], "only")
+        label_condition = next(condition for condition in category["when"] if "labels" in condition)
+        self.assertEqual(label_condition, {"labels": ["invalid", "internal-fix", "misc", "ci"]})
+
+    def test_release_drafter_uses_modern_categories_without_changing_label_rules(self):
+        config = self.github_config("release-drafter.yml")
+        for field in ("exclude-labels", "exclude-paths", "include-labels", "include-paths", "version-resolver"):
+            self.assertNotIn(field, config)
+        for category in config["categories"]:
+            self.assertNotIn("label", category)
+            self.assertNotIn("labels", category)
+        changelog = {
+            category["title"]: category["when"]["labels"]
+            for category in config["categories"]
+            if "title" in category
+        }
+        self.assertEqual(changelog, {
+            "BREAKING CHANGES": ["BREAKING CHANGE"],
+            "Features": ["feature", "enhancement"],
+            "Fixes": ["fix", "bug", "security"],
+            "Dependencies": ["dependencies", "renovate"],
+            "Documentation": ["document", "documentation"],
+        })
+        resolvers = [
+            category for category in config["categories"] if category.get("type") == "version-resolver"
+        ]
+        self.assertEqual(
+            {category["semver-increment"]: category["when"]["labels"] for category in resolvers if "when" in category},
+            {
+                "major": ["BREAKING CHANGE", "major"],
+                "minor": ["feature", "enhancement", "minor"],
+                "patch": ["improvement", "fix", "bug", "security", "patch"],
+            },
+        )
+        self.assertEqual(
+            [category for category in resolvers if "when" not in category],
+            [{"type": "version-resolver", "semver-increment": "patch"}],
+        )
 
     def test_manual_publication_checks_both_project_versions(self):
         jobs = self.github_config("workflows/release-drafter.yml")["jobs"]

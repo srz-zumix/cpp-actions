@@ -3,59 +3,70 @@ tag-template: 'v$RESOLVED_VERSION'
 categories:
   - type: 'pre-exclude'
     when:
-      conventional:
-        type: 'chore'
-        scope: 'release'
-      paths:
-        - 'CMakeLists.txt'
-        - 'vcpkg.json'
-      paths-mode: 'only'
+      - conventional:
+          type: 'chore'
+          scope: 'release'
+        paths:
+          - 'CMakeLists.txt'
+          - 'vcpkg.json'
+        paths-mode: 'only'
+      - labels:
+          - 'invalid'
+          - 'internal-fix'
+          - 'misc'
+          - 'ci'
   - title: 'BREAKING CHANGES'
-    labels:
-      - 'BREAKING CHANGE'
+    when:
+      labels:
+        - 'BREAKING CHANGE'
   - title: 'Features'
-    labels:
-      - 'feature'
-      - 'enhancement'
+    when:
+      labels:
+        - 'feature'
+        - 'enhancement'
   - title: 'Fixes'
-    labels:
-      - 'fix'
-      - 'bug'
-      - 'security'
+    when:
+      labels:
+        - 'fix'
+        - 'bug'
+        - 'security'
   - title: 'Dependencies'
     collapse-after: 3
-    labels:
-      - 'dependencies'
-      - 'renovate'
+    when:
+      labels:
+        - 'dependencies'
+        - 'renovate'
   - title: 'Documentation'
-    labels:
-      - 'document'
-      - 'documentation'
-exclude-labels:
-  - 'invalid'
-  - 'internal-fix'
-  - 'misc'
-  - 'ci'
+    when:
+      labels:
+        - 'document'
+        - 'documentation'
+  - type: 'version-resolver'
+    semver-increment: 'major'
+    when:
+      labels:
+        - 'BREAKING CHANGE'
+        - 'major'
+  - type: 'version-resolver'
+    semver-increment: 'minor'
+    when:
+      labels:
+        - 'feature'
+        - 'enhancement'
+        - 'minor'
+  - type: 'version-resolver'
+    semver-increment: 'patch'
+    when:
+      labels:
+        - 'improvement'
+        - 'fix'
+        - 'bug'
+        - 'security'
+        - 'patch'
+  - type: 'version-resolver'
+    semver-increment: 'patch'
 change-template: '- $TITLE @$AUTHOR (#$NUMBER)'
 change-title-escapes: '\<*_&' # You can add # and @ to disable mentions, and add ` to disable code blocks.
-version-resolver:
-  major:
-    labels:
-      - 'BREAKING CHANGE'
-      - 'major'
-  minor:
-    labels:
-      - 'feature'
-      - 'enhancement'
-      - 'minor'
-  patch:
-    labels:
-      - 'improvement'
-      - 'fix'
-      - 'bug'
-      - 'security'
-      - 'patch'
-  default: patch
 template: |
   [Compare $PREVIOUS_TAG with v$RESOLVED_VERSION](https://github.com/$OWNER/$REPOSITORY/compare/$PREVIOUS_TAG...v$RESOLVED_VERSION)
 
