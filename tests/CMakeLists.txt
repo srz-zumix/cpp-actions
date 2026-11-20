@@ -79,6 +79,23 @@ if(CPA_BASH)
     "${CMAKE_CURRENT_SOURCE_DIR}/scripts/install_hosted_python_test.sh"
     "${PROJECT_SOURCE_DIR}/scripts/install-hosted-python.sh")
   set_tests_properties(hosted_python_script PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+  find_program(CPA_PYTHON3 python3)
+  if(CPA_PYTHON3)
+    find_program(CPA_RUBY ruby)
+    if(NOT CPA_RUBY)
+      message(STATUS "Ruby is unavailable; release workflow YAML tests are skipped")
+    endif()
+    add_test(NAME release_publish_script COMMAND "${CPA_PYTHON3}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/scripts/publish_release_test.py"
+      "${PROJECT_SOURCE_DIR}/scripts/publish-release.sh")
+    set_tests_properties(release_publish_script PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+    add_test(NAME release_version_script COMMAND "${CPA_PYTHON3}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/scripts/release_version_test.py"
+      "${PROJECT_SOURCE_DIR}/scripts/release-version.py")
+    set_tests_properties(release_version_script PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+  else()
+    message(STATUS "Python 3 is unavailable; release script tests are skipped")
+  endif()
 else()
-  message(STATUS "Bash is unavailable; hosted Python installer script tests are skipped")
+  message(STATUS "Bash is unavailable; shell script tests are skipped")
 endif()

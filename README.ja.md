@@ -24,6 +24,20 @@ Linux での実行には隔離の明示的な無効化とホストラベルの�
 
 ## ビルド
 
+[リリースページ](https://github.com/srz-zumix/cpp-actions/releases)から、
+macOS 15 以降の Apple Silicon 向けビルドをダウンロードできます。
+`.tar.gz` と `.sha256` を取得し、検証して展開してください。
+
+```sh
+shasum -a 256 -c cpp-actions-v0.1.0-macos-arm64.tar.gz.sha256
+tar -xzf cpp-actions-v0.1.0-macos-arm64.tar.gz
+./bin/cpp-actions --help
+```
+
+`v0.1.0` はダウンロードしたバージョンに置き換えてください。
+アーカイブには `share/cpp-actions/scripts/` の hosted Python インストール用スクリプトと
+ライセンス情報も含まれます。署名・公証は行っていません。
+
 CMake 3.24 以降、Ninja、C++20 対応コンパイラ、Git が必要です。
 CMake はインストール済みの依存ライブラリを優先し、見つからなければ定義された依存ライブラリをダウンロードします。
 cpp-actions のソースディレクトリで実行してください。
@@ -48,6 +62,26 @@ cmake --preset debug
 cmake --build --preset debug
 ctest --preset debug
 ```
+
+Release Drafter は `main` への push 時に下書きを更新し、算出バージョンに
+CMake と vcpkg を合わせる単一の PR を作成・更新します。初回の安定版リリースまでは
+現在のプロジェクトバージョンを使い、それ以降は変更内容から次のバージョンを算出します。
+
+バージョン更新 PR には、リポジトリ設定の **Allow GitHub Actions to create and
+approve pull requests** を有効にする必要があります。`GITHUB_TOKEN` による
+PR の作成・更新時は、メンテナーが **Approve workflows to run** を選択して
+PR のワークフロー実行を承認する必要があります。
+
+公開するにはバージョン更新 PR があればマージし、対象コミットで **Release
+drafter** ワークフローを手動実行します。自動算出された `vMAJOR.MINOR.PATCH` は両方の
+プロジェクトバージョンと一致している必要があり、不一致の場合はビルド前に公開を停止します。
+`main` で手動実行した場合も、必要に応じてバージョン更新 PR が更新されます。
+ワークフローは対象コミットをテスト・パッケージ化し、ファイルを下書きに添付して公開します。
+一致するタグを push した場合もリリースワークフローが実行され、
+同じタグの下書きがあればそれを使用します。
+
+ファイルのアップロード後に公開が失敗した場合は、再実行前に下書きから
+アーカイブとチェックサムを削除してください。既存のリリースファイルは上書きしません。
 
 サンドボックス内の Xcode 統合テストは明示的に有効化した場合のみ実行します。
 Xcode、iOS SDK、利用可能な iOS Simulator ランタイムが必要です。

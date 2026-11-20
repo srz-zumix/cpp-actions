@@ -24,6 +24,20 @@ and selecting host labels; use it only for trusted local debugging.
 
 ## Build
 
+Prebuilt Apple Silicon archives for macOS 15 or later are available on the
+[Releases page](https://github.com/srz-zumix/cpp-actions/releases). Download
+the `.tar.gz` and its `.sha256` file, then verify and extract them:
+
+```sh
+shasum -a 256 -c cpp-actions-v0.1.0-macos-arm64.tar.gz.sha256
+tar -xzf cpp-actions-v0.1.0-macos-arm64.tar.gz
+./bin/cpp-actions --help
+```
+
+Replace `v0.1.0` with the downloaded release version. The archive also contains
+the hosted Python installation helper under `share/cpp-actions/scripts/` and
+license information. It is not signed or notarized.
+
 Requires CMake 3.24+, Ninja, a C++20 compiler, and Git. CMake uses installed
 dependencies when available and otherwise downloads the declared dependencies.
 Run these commands from the cpp-actions source directory:
@@ -49,6 +63,27 @@ cmake --preset debug
 cmake --build --preset debug
 ctest --preset debug
 ```
+
+Release Drafter updates a draft when changes are pushed to `main` and maintains
+a single PR updating the CMake and vcpkg versions to the resolved version.
+Until the first stable release, the draft uses the current project version;
+afterward Release Drafter resolves the next version from the changes.
+
+The repository setting **Allow GitHub Actions to create and approve pull
+requests** must be enabled for the version PR. PR workflow runs created or
+updated by `GITHUB_TOKEN` require a maintainer to select **Approve workflows to
+run**.
+
+To publish, merge the version PR if one is open, then run the **Release
+drafter** workflow manually on the intended commit. Its resolved
+`vMAJOR.MINOR.PATCH` version must match both project versions; otherwise
+publication stops before building. When manually run on `main`, it also updates
+the version PR if needed. The workflow tests and packages the selected commit,
+attaches the files to the draft, and publishes it. Pushing a matching tag also
+runs the release workflow and uses an existing draft for that tag, if present.
+
+If publication fails after uploading files, remove the archive and checksum
+from the draft before retrying. Existing release files are never overwritten.
 
 The sandboxed Xcode integration tests are opt-in. They require Xcode, an iOS SDK,
 and an available iOS Simulator runtime; they can start or interact with the
