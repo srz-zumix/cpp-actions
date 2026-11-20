@@ -1,0 +1,123 @@
+name: Release drafter
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: cpp-actions-release
+  queue: max
+
+jobs:
+  release_context:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      current: ${{ steps.context.outputs.current }}
+      cmake_version: ${{ steps.context.outputs.cmake_version }}
+      vcpkg_version: ${{ steps.context.outputs.vcpkg_version }}
+      initial_version: ${{ steps.context.outputs.initial_version }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Determine release context
+        id: context
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: python3 scripts/release-version.py context >> "$GITHUB_OUTPUT"
+
+  draft_release:
+    needs: release_context
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    if: github.event_name == 'push' && needs.release_context.outputs.current == 'true'
+    outputs:
+      tag_name: ${{ steps.release-drafter.outputs.tag_name }}
+    steps:
+      - uses: release-drafter/release-drafter@v7.10.0
+        id: release-drafter
+        with:
+          version: ${{ needs.release_context.outputs.initial_version }}
+          commitish: ${{ github.sha }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  bump_version_pr:
+    if: github.event_name == 'push'
+    needs: draft_release
+    uses: ./.github/workflows/reusable-bump-version-pr.yml
+    permissions:
+      contents: write
+      pull-requests: write
+    with:
+      tag_name: ${{ needs.draft_release.outputs.tag_name }}
+      base_sha: ${{ github.sha }}
+
+  prepare_release:
+    needs: release_context
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    if: github.event_name == 'workflow_dispatch'
+    outputs:
+      tag_name: ${{ steps.release-drafter.outputs.tag_name }}
+      release_id: ${{ steps.release-drafter.outputs.id }}
+    steps:
+      - uses: release-drafter/release-drafter@v7.10.0
+        id: release-drafter
+        with:
+          version: ${{ needs.release_context.outputs.initial_version }}
+          commitish: ${{ github.sha }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  bump_version_dispatch:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    needs: prepare_release
+    uses: ./.github/workflows/reusable-bump-version-pr.yml
+    permissions:
+      contents: write
+      pull-requests: write
+    with:
+      tag_name: ${{ needs.prepare_release.outputs.tag_name }}
+      base_sha: ${{ github.sha }}
+
+  check_release:
+    if: github.event_name == 'workflow_dispatch'
+    needs: [release_context, prepare_release]
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Check release version
+        env:
+          TAG: ${{ needs.prepare_release.outputs.tag_name }}
+          CMAKE_VERSION: ${{ needs.release_context.outputs.cmake_version }}
+          VCPKG_VERSION: ${{ needs.release_context.outputs.vcpkg_version }}
+        shell: bash
+        run: |
+          if [[ -z "$CMAKE_VERSION" || -z "$VCPKG_VERSION" ||
+                "$TAG" != "v$CMAKE_VERSION" || "$CMAKE_VERSION" != "$VCPKG_VERSION" ]]; then
+            echo "::error::Release tag $TAG does not match the project versions; merge the matching version PR first"
+            exit 1
+          fi
+
+  publish_release:
+    if: github.event_name == 'workflow_dispatch'
+    needs: [prepare_release, check_release]
+    uses: ./.github/workflows/release.yml
+    permissions:
+      contents: write
+    with:
+      tag: ${{ needs.prepare_release.outputs.tag_name }}
+      target_sha: ${{ github.sha }}
+      release_id: ${{ needs.prepare_release.outputs.release_id }}

@@ -1,0 +1,72 @@
+name: Bump version PR
+
+on:
+  workflow_call:
+    inputs:
+      tag_name:
+        required: true
+        type: string
+      base_sha:
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  bump_version_pr:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    concurrency:
+      group: cpp-actions-bump-version
+      queue: max
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Check release base
+        id: base
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          EXPECTED_SHA: ${{ inputs.base_sha }}
+        shell: bash
+        run: |
+          if [[ ! "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Expected a full lowercase base commit SHA"
+            exit 1
+          fi
+          if [[ "$(git rev-parse HEAD)" != "$EXPECTED_SHA" ]]; then
+            echo "::notice::Main has moved; skipping the stale version update"
+            echo "current=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          python3 scripts/release-version.py check-main "$EXPECTED_SHA" >> "$GITHUB_OUTPUT"
+      - name: Update project versions
+        if: steps.base.outputs.current == 'true'
+        env:
+          TAG: ${{ inputs.tag_name }}
+        run: python3 scripts/release-version.py update "$TAG"
+      - name: Recheck release base
+        id: recheck
+        if: steps.base.outputs.current == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          EXPECTED_SHA: ${{ inputs.base_sha }}
+        run: python3 scripts/release-version.py check-main "$EXPECTED_SHA" >> "$GITHUB_OUTPUT"
+      - name: Create or update version PR
+        if: steps.recheck.outputs.current == 'true'
+        uses: peter-evans/create-pull-request@v8.1.3
+        with:
+          base: main
+          branch: bump/version
+          sign-commits: true
+          add-paths: |
+            CMakeLists.txt
+            vcpkg.json
+          commit-message: "chore(release): bump version to ${{ inputs.tag_name }}"
+          title: "chore(release): bump version to ${{ inputs.tag_name }}"
+          body: "Update CMake and vcpkg versions to the Release Drafter version ${{ inputs.tag_name }}."
