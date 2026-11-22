@@ -1,0 +1,34 @@
+# typed: false
+# frozen_string_literal: true
+
+class CppActions < Formula
+  desc "Run GitHub Actions workflows locally"
+  homepage "https://github.com/srz-zumix/cpp-actions"
+  version "{{VERSION}}"
+  url "{{URL}}"
+  sha256 "{{SHA256}}"
+  license "MIT"
+
+  depends_on :macos
+  depends_on arch: :arm64
+
+  on_macos do
+    depends_on macos: :sequoia
+  end
+
+  def install
+    bin.install "bin/cpp-actions"
+    pkgshare.install "share/cpp-actions/scripts"
+    (share/"licenses/cpp-actions").install Dir["share/licenses/cpp-actions/*"]
+    prefix.install "LICENSE"
+  end
+
+  test do
+    assert_equal version.to_s, shell_output("#{bin}/cpp-actions --version").strip
+    assert_predicate pkgshare/"scripts/install-hosted-python.sh", :executable?
+    assert_path_exists share/"licenses/cpp-actions/yaml-cpp"
+    assert_path_exists share/"licenses/cpp-actions/CLI11"
+    assert_path_exists share/"licenses/cpp-actions/nlohmann-json"
+    assert_path_exists prefix/"LICENSE"
+  end
+end

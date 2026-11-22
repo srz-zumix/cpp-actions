@@ -121,3 +121,6 @@ jobs:
       tag: ${{ needs.prepare_release.outputs.tag_name }}
       target_sha: ${{ github.sha }}
       release_id: ${{ needs.prepare_release.outputs.release_id }}
+    secrets:
+      MY_ACTIONS_APP_CLIENT_ID: ${{ secrets.MY_ACTIONS_APP_CLIENT_ID }}
+      MY_ACTIONS_APP_PRIVATE_KEY: ${{ secrets.MY_ACTIONS_APP_PRIVATE_KEY }}

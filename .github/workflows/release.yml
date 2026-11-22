@@ -15,6 +15,11 @@ on:
       release_id:
         type: string
         required: true
+    secrets:
+      MY_ACTIONS_APP_CLIENT_ID:
+        required: false
+      MY_ACTIONS_APP_PRIVATE_KEY:
+        required: false
 
 permissions:
   contents: read
@@ -123,6 +128,42 @@ jobs:
             --config "$RUNNER_TEMP/smoke-config.yml" \
             --env "EXPECTED_VERSION=${TAG#v}" \
             --run-dir "$RUNNER_TEMP/smoke-run" --cache-dir "$RUNNER_TEMP/smoke-cache"
+      - name: Test Homebrew package
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+          HOMEBREW_NO_AUTO_UPDATE: '1'
+          HOMEBREW_NO_INSTALL_CLEANUP: '1'
+          HOMEBREW_NO_INSTALL_FROM_API: '1'
+          HOMEBREW_NO_ANALYTICS: '1'
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/release/cpp-actions-${TAG}-macos-arm64.tar.gz"
+          tap="$(brew --repository)/Library/Taps/cpp-actions/homebrew-release-test"
+          mkdir -p "$tap"
+          git -C "$tap" init -q
+          python3 - "$archive" "$tap/cpp-actions.rb" "$TAG" <<'PY'
+          import hashlib
+          from pathlib import Path
+          import runpy
+          import sys
+
+          archive = Path(sys.argv[1]).resolve()
+          output = Path(sys.argv[2])
+          tag = sys.argv[3]
+          template = Path(".github/homebrew/cpp-actions.rb.tmpl").read_text(encoding="utf-8")
+          render = runpy.run_path("scripts/sync-homebrew.py")["render_formula"]
+          output.write_text(
+              render(template, tag[1:], hashlib.sha256(archive.read_bytes()).hexdigest(), archive.as_uri()),
+              encoding="utf-8",
+          )
+          PY
+          brew install --formula cpp-actions/release-test/cpp-actions
+          brew test cpp-actions/release-test/cpp-actions
+          prefix="$(brew --prefix cpp-actions)"
+          test "$("$prefix/bin/cpp-actions" --version)" = "${TAG#v}"
+          test -x "$(brew --prefix)/bin/cpp-actions"
+          test -x "$prefix/share/cpp-actions/scripts/install-hosted-python.sh"
       - name: Upload release files
         uses: actions/upload-artifact@v7.0.2
         with:
@@ -156,3 +197,14 @@ jobs:
           ARTIFACT_DIR: release
         shell: bash
         run: bash scripts/publish-release.sh
+
+  homebrew:
+    needs: publish
+    uses: ./.github/workflows/homebrew.yml
+    permissions:
+      contents: read
+    with:
+      tag: ${{ inputs.tag || github.ref_name }}
+    secrets:
+      MY_ACTIONS_APP_CLIENT_ID: ${{ secrets.MY_ACTIONS_APP_CLIENT_ID }}
+      MY_ACTIONS_APP_PRIVATE_KEY: ${{ secrets.MY_ACTIONS_APP_PRIVATE_KEY }}
