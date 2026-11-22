@@ -24,6 +24,12 @@ and selecting host labels; use it only for trusted local debugging.
 
 ## Build
 
+On Apple Silicon Macs running macOS 15 or later, install with Homebrew:
+
+```sh
+brew install srz-zumix/tap/cpp-actions
+```
+
 Prebuilt Apple Silicon archives for macOS 15 or later are available on the
 [Releases page](https://github.com/srz-zumix/cpp-actions/releases). Download
 the `.tar.gz` and its `.sha256` file, then verify and extract them:
@@ -81,6 +87,14 @@ publication stops before building. When manually run on `main`, it also updates
 the version PR if needed. The workflow tests and packages the selected commit,
 attaches the files to the draft, and publishes it. Pushing a matching tag also
 runs the release workflow and uses an existing draft for that tag, if present.
+
+After publication, the latest release is synchronized to
+[`srz-zumix/homebrew-tap`](https://github.com/srz-zumix/homebrew-tap). Set the
+repository secrets `MY_ACTIONS_APP_CLIENT_ID` and `MY_ACTIONS_APP_PRIVATE_KEY`
+for a GitHub App installed on the tap with Contents write access and permission
+to update its `main` branch. If the tap update fails after publication, run
+**Update Homebrew tap** manually on `main` with the published tag; this does not
+rebuild or republish the release.
 
 If publication fails after uploading files, remove the archive and checksum
 from the draft before retrying. Existing release files are never overwritten.

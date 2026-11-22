@@ -179,6 +179,48 @@ if(NOT status EQUAL 130 OR NOT output MATCHES "Result: cancelled")
   message(FATAL_ERROR "Ctrl-C did not cancel gracefully: ${status}\n${output}\n${error}")
 endif()
 
+file(WRITE "${TEST_ROOT}/repo/.github/workflows/cancel-force.yml" [=[
+on: push
+jobs:
+  wait:
+    runs-on: macos-latest
+    steps:
+      - run: |
+          touch "$FIRST_READY"
+          sleep 30
+      - if: always()
+        run: |
+          touch "$SECOND_READY"
+          sleep 30
+          touch "$CLEANUP_DONE"
+]=])
+execute_process(
+  COMMAND /bin/sh -c [=[
+"$1" run --no-sandbox -C "$2" -w cancel-force.yml --run-dir "$3" --cache-dir "$4" \
+  --host-label macos-latest --env-pass "FIRST_READY=$5" --env-pass "SECOND_READY=$6" \
+  --env-pass "CLEANUP_DONE=$7" --no-color &
+pid=$!
+wait_for_file() {
+  count=0
+  while [ ! -f "$1" ]; do
+    count=$((count + 1))
+    if [ "$count" -ge 200 ]; then kill -KILL "$pid"; wait "$pid"; exit 99; fi
+    sleep 0.05
+  done
+}
+wait_for_file "$5"
+kill -INT "$pid"
+wait_for_file "$6"
+kill -TERM "$pid"
+wait "$pid"
+]=] sh "${CPP_ACTIONS}" "${TEST_ROOT}/repo" "${TEST_ROOT}/cancel-force"
+          "${TEST_ROOT}/cache" "${TEST_ROOT}/first-ready" "${TEST_ROOT}/second-ready"
+          "${TEST_ROOT}/cleanup-done"
+  RESULT_VARIABLE status OUTPUT_VARIABLE output ERROR_VARIABLE error TIMEOUT 20)
+if(NOT status EQUAL 130 OR NOT output MATCHES "Result: cancelled" OR EXISTS "${TEST_ROOT}/cleanup-done")
+  message(FATAL_ERROR "Second signal did not force cancellation: ${status}\n${output}\n${error}")
+endif()
+
 file(WRITE "${TEST_ROOT}/repo/.github/workflows/invalid.yml" "jobs: [not-a-mapping]\n")
 execute_process(
   COMMAND "${CPP_ACTIONS}" run -C "${TEST_ROOT}/repo" -w invalid.yml

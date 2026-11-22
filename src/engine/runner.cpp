@@ -11,6 +11,7 @@
 #include <iomanip>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <system_error>
@@ -23,6 +24,7 @@
 #include "expr/template.hpp"
 #include "sandbox/sandbox.hpp"
 #include "util/fs.hpp"
+#include "util/stoppable_thread.hpp"
 #include "util/strings.hpp"
 #include "workflow/matrix.hpp"
 #include "workflow/parser.hpp"
@@ -148,10 +150,10 @@ class WorkflowExecutor {
                            describe_concurrency(wf_.concurrency, ctx, scope_for(Site::WorkflowConcurrency), wf_.file)),
           Color::Gray));
     }
-    std::jthread cancellation;
+    std::optional<util::StoppableThread> cancellation;
     if (parent_ != nullptr) {
-      cancellation = std::jthread([this](std::stop_token stop) {
-        while (!stop.stop_requested()) {
+      cancellation.emplace([this](const std::atomic<bool>& stop) {
+        while (!stop.load(std::memory_order_relaxed)) {
           {
             std::lock_guard lock(active_mutex_);
             for (auto* inst : active_) inherit_cancellation(*inst);

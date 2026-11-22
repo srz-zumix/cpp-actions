@@ -8,6 +8,7 @@ add_executable(cpa_unit_tests
   unit/glob_test.cpp
   unit/sha256_test.cpp
   unit/process_test.cpp
+  unit/stoppable_thread_test.cpp
   unit/parser_test.cpp
   unit/matrix_test.cpp
   unit/events_test.cpp
@@ -93,6 +94,11 @@ if(CPA_BASH)
       "${CMAKE_CURRENT_SOURCE_DIR}/scripts/release_version_test.py"
       "${PROJECT_SOURCE_DIR}/scripts/release-version.py")
     set_tests_properties(release_version_script PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+    add_test(NAME homebrew_sync_script COMMAND "${CPA_PYTHON3}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/scripts/sync_homebrew_test.py"
+      "${PROJECT_SOURCE_DIR}/scripts/sync-homebrew.py"
+      "${PROJECT_SOURCE_DIR}/.github/homebrew/cpp-actions.rb.tmpl")
+    set_tests_properties(homebrew_sync_script PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
   else()
     message(STATUS "Python 3 is unavailable; release script tests are skipped")
   endif()

@@ -304,6 +304,60 @@ class ReleaseVersionTest(unittest.TestCase):
                 if not expected:
                     self.assertIn("::error::", result.stdout + result.stderr)
 
+    def test_ci_covers_release_runner_and_configuration(self):
+        ci = self.github_config("workflows/ci.yml")
+        release = self.github_config("workflows/release.yml")
+        job = ci["jobs"]["build"]
+        self.assertIn({"os": "macos-15", "preset": "release"}, job["strategy"]["matrix"]["include"])
+        configure = next(step for step in job["steps"] if step.get("name") == "Configure macOS release")
+        release_configure = next(step for step in release["jobs"]["build"]["steps"] if step.get("name") == "Configure")
+        self.assertEqual(configure["if"], "matrix.os == 'macos-15' && matrix.preset == 'release'")
+        self.assertEqual(configure["run"], release_configure["run"])
+
+    def test_homebrew_sync_follows_publication_and_forwards_secrets(self):
+        draft = self.github_config("workflows/release-drafter.yml")
+        release = self.github_config("workflows/release.yml")
+        homebrew = self.github_config("workflows/homebrew.yml")
+        job = release["jobs"]["homebrew"]
+        self.assertEqual(job["needs"], "publish")
+        self.assertEqual(job["uses"], "./.github/workflows/homebrew.yml")
+        self.assertEqual(homebrew["jobs"]["update"]["if"], "github.repository == 'srz-zumix/cpp-actions'")
+        self.assertEqual(homebrew["concurrency"]["group"], "cpp-actions-homebrew")
+        self.assertEqual(homebrew["concurrency"]["queue"], "max")
+        events = homebrew.get("on", homebrew.get("true"))
+        for event in ("workflow_dispatch", "workflow_call"):
+            tag = events[event]["inputs"]["tag"]
+            self.assertTrue(tag["required"])
+            self.assertEqual(tag["type"], "string")
+        secrets = ("MY_ACTIONS_APP_CLIENT_ID", "MY_ACTIONS_APP_PRIVATE_KEY")
+        for secret in secrets:
+            self.assertEqual(draft["jobs"]["publish_release"]["secrets"][secret], f"${{{{ secrets.{secret} }}}}")
+            self.assertEqual(job["secrets"][secret], f"${{{{ secrets.{secret} }}}}")
+            self.assertFalse(events["workflow_call"]["secrets"][secret]["required"])
+        steps = homebrew["jobs"]["update"]["steps"]
+        prepare = next(step for step in steps if step.get("id") == "prepare")
+        token = next(step for step in steps if step.get("id") == "app-token")
+        check = next(step for step in steps if step.get("id") == "recheck")
+        commit = next(step for step in steps if step.get("name") == "Update Homebrew tap")
+        self.assertLess(steps.index(prepare), steps.index(check))
+        self.assertLess(steps.index(check), steps.index(token))
+        self.assertLess(steps.index(token), steps.index(commit))
+        self.assertEqual(check["if"], "steps.prepare.outputs.eligible == 'true'")
+        self.assertEqual(token["if"], "steps.recheck.outputs.current == 'true'")
+        self.assertEqual(commit["if"], "steps.recheck.outputs.current == 'true'")
+        self.assertEqual(commit["env"]["EXPECTED_HEAD"], "${{ steps.recheck.outputs.head_sha }}")
+        self.assertEqual(commit["env"]["GH_TOKEN"], "${{ steps.app-token.outputs.token }}")
+        self.assertEqual(commit["env"]["RELEASE_TOKEN"], "${{ github.token }}")
+        self.assertEqual(token["with"]["owner"], "srz-zumix")
+        self.assertEqual(token["with"]["repositories"], "homebrew-tap")
+        self.assertEqual(token["with"]["permission-contents"], "write")
+        build_steps = release["jobs"]["build"]["steps"]
+        homebrew_test = next(step for step in build_steps if step.get("name") == "Test Homebrew package")
+        upload = next(step for step in build_steps if step.get("name") == "Upload release files")
+        self.assertLess(build_steps.index(homebrew_test), build_steps.index(upload))
+        self.assertIn("brew install --formula", homebrew_test["run"])
+        self.assertIn("brew test ", homebrew_test["run"])
+
     def test_stale_bases_cannot_create_version_pr(self):
         steps = self.github_config("workflows/reusable-bump-version-pr.yml")["jobs"]["bump_version_pr"]["steps"]
         base = next(step for step in steps if step.get("name") == "Check release base")

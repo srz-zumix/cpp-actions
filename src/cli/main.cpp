@@ -19,6 +19,7 @@
 #include "engine/runner.hpp"
 #include "sandbox/sandbox.hpp"
 #include "util/fs.hpp"
+#include "util/stoppable_thread.hpp"
 #include "util/strings.hpp"
 #include "workspace/git.hpp"
 
@@ -331,9 +332,9 @@ int cmd_run(RunCli& o) {
   masker.add(options.github_token);
   engine::Runner runner(std::move(options), console);
   SignalHandlers handlers;
-  std::jthread watcher([&runner](std::stop_token stop) {
+  util::StoppableThread watcher([&runner](const std::atomic<bool>& stop) {
     unsigned handled = 0;
-    while (!stop.stop_requested()) {
+    while (!stop.load(std::memory_order_relaxed)) {
       const auto requested = signal_requests.load(std::memory_order_relaxed);
       while (handled < requested) {
         runner.cancel();

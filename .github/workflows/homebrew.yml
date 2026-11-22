@@ -1,0 +1,71 @@
+name: Update Homebrew tap
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Published release tag
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
+    secrets:
+      MY_ACTIONS_APP_CLIENT_ID:
+        required: false
+      MY_ACTIONS_APP_PRIVATE_KEY:
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cpp-actions-homebrew
+  queue: max
+
+jobs:
+  update:
+    if: github.repository == 'srz-zumix/cpp-actions'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ inputs.tag }}
+      HOMEBREW_TAP_DIR: ${{ github.workspace }}/homebrew-tap
+      HOMEBREW_TEMPLATE: ${{ github.workspace }}/.github/homebrew/cpp-actions.rb.tmpl
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v7.0.1
+        with:
+          repository: srz-zumix/homebrew-tap
+          path: homebrew-tap
+          ref: main
+          persist-credentials: false
+      - name: Prepare Homebrew formula
+        id: prepare
+        run: python3 scripts/sync-homebrew.py prepare
+      - name: Recheck release and tap
+        id: recheck
+        if: steps.prepare.outputs.eligible == 'true'
+        run: python3 scripts/sync-homebrew.py check
+      - uses: actions/create-github-app-token@v3.4.0
+        id: app-token
+        if: steps.recheck.outputs.current == 'true'
+        with:
+          client-id: ${{ secrets.MY_ACTIONS_APP_CLIENT_ID }}
+          private-key: ${{ secrets.MY_ACTIONS_APP_PRIVATE_KEY }}
+          owner: srz-zumix
+          repositories: homebrew-tap
+          permission-contents: write
+      - name: Update Homebrew tap
+        if: steps.recheck.outputs.current == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          RELEASE_TOKEN: ${{ github.token }}
+          EXPECTED_HEAD: ${{ steps.recheck.outputs.head_sha }}
+        run: python3 scripts/sync-homebrew.py commit

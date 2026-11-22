@@ -24,6 +24,12 @@ Linux での実行には隔離の明示的な無効化とホストラベルの�
 
 ## ビルド
 
+macOS 15 以降の Apple Silicon では、Homebrew でインストールできます。
+
+```sh
+brew install srz-zumix/tap/cpp-actions
+```
+
 [リリースページ](https://github.com/srz-zumix/cpp-actions/releases)から、
 macOS 15 以降の Apple Silicon 向けビルドをダウンロードできます。
 `.tar.gz` と `.sha256` を取得し、検証して展開してください。
@@ -79,6 +85,13 @@ drafter** ワークフローを手動実行します。自動算出された `vM
 ワークフローは対象コミットをテスト・パッケージ化し、ファイルを下書きに添付して公開します。
 一致するタグを push した場合もリリースワークフローが実行され、
 同じタグの下書きがあればそれを使用します。
+
+公開後、最新リリースを [`srz-zumix/homebrew-tap`](https://github.com/srz-zumix/homebrew-tap)
+に反映します。Tap に Contents の書き込み権限でインストールされ、`main` を更新できる
+GitHub App の情報を、リポジトリシークレット `MY_ACTIONS_APP_CLIENT_ID` と
+`MY_ACTIONS_APP_PRIVATE_KEY` に設定してください。公開後に Tap の更新が失敗した場合は、
+`main` で **Update Homebrew tap** を公開済みタグを指定して手動実行できます。
+リリースの再ビルド・再公開は行いません。
 
 ファイルのアップロード後に公開が失敗した場合は、再実行前に下書きから
 アーカイブとチェックサムを削除してください。既存のリリースファイルは上書きしません。

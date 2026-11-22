@@ -19,6 +19,8 @@ jobs:
         include:
           - os: macos-latest
             preset: asan
+          - os: macos-15
+            preset: release
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
@@ -30,7 +32,16 @@ jobs:
         if: runner.os == 'macOS'
         run: command -v ninja || brew install ninja
       - name: Configure
+        if: matrix.os != 'macos-15' || matrix.preset != 'release'
         run: cmake --preset ${{ matrix.preset }}
+      - name: Configure macOS release
+        if: matrix.os == 'macos-15' && matrix.preset == 'release'
+        run: >-
+          cmake --preset release
+          -DCMAKE_OSX_ARCHITECTURES=arm64
+          -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0
+          -DFETCHCONTENT_TRY_FIND_PACKAGE_MODE=NEVER
+          -DBUILD_SHARED_LIBS=OFF
       - name: Build
         run: cmake --build --preset ${{ matrix.preset }}
       - name: Test
